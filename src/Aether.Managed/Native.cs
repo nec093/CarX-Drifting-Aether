@@ -6,12 +6,13 @@ using System.Text;
 namespace Aether {
 	/// <summary>The C interface of AetherNative.dll (src/Aether.Native/include/AetherApi.h).</summary>
 	internal static class Native {
-		public const int ApiVersion = 1;
+		public const int ApiVersion = 2;
 		public const string Dll = "AetherNative";
 
 		public const int EventFrameBegin = 1;
 		public const int EventFrameEnd = 2;
 		public const int EventShutdown = 3;
+		public const int EventScene = 4;
 
 		public const int StateNotInitialized = 0;
 		public const int StateWaiting = 1;
@@ -22,6 +23,7 @@ namespace Aether {
 		public const uint RequestScene = 1;
 		public const uint RequestMaterials = 2;
 		public const uint RequestRenderTextures = 4;
+		public const uint RequestSurvey = 8;
 
 		[DllImport(Dll)] public static extern int Aether_GetApiVersion();
 		[DllImport(Dll, CharSet = CharSet.Unicode)] public static extern int Aether_Initialize(string dataDir, string configDir);
@@ -38,6 +40,19 @@ namespace Aether {
 		[DllImport(Dll)] public static extern int Aether_OverlayVisible();
 		[DllImport(Dll)] public static extern void Aether_SetOverlayVisible(int visible);
 		[DllImport(Dll)] public static extern int Aether_OverlayWantsInput();
+
+		// the scene data contract (SceneCapture/Contract.cs)
+		[DllImport(Dll)] public static extern int Aether_SceneContractVersion();
+		[DllImport(Dll)] public static extern int Aether_SceneStructSize(int which);
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneUpsertMesh(AeMeshDesc* desc, AeSubMesh* subMeshes);
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneUpsertTexture(AeTextureDesc* desc);
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneUpsertMaterial(AeMaterialDesc* desc);
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneUpsertInstance(AeInstanceDesc* desc, uint* materials);
+		[DllImport(Dll)] public static extern void Aether_SceneDestroy(int kind, uint handle);
+		[DllImport(Dll)] public static extern void Aether_SceneClear();
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneSubmitFrame(AeFrame* frame, AeFrameInstance* instances, uint instanceCount, AeLight* lights, uint lightCount);
+		[DllImport(Dll)] public static extern int Aether_GetRenderMode();
+		[DllImport(Dll)] public static extern int Aether_DevCaptureFlags();
 
 		[DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr LoadLibraryW(string path);
 

@@ -62,7 +62,7 @@ public static class ToolCatalog {
 
 		new("get_material_info",
 			"The scene's materials grouped by shader: material and renderer counts, render queue range, transparent / alpha-test counts, shader keywords, sample material names. Walks every renderer in the game (a short hitch) unless refresh is false.",
-			"""{"type":"object","properties":{"refresh":{"type":"boolean","description":"Collect now (default true). False returns the last collection."}},"additionalProperties":false}""",
+			"""{"type":"object","properties":{"refresh":{"type":"boolean","description":"Collect now (default true). False returns the last collection."},"detail":{"type":"string","enum":["summary","survey","aether"],"description":"summary (default): materials grouped by shader. survey: every shader's property layout with one material's values, mesh vertex layouts, lights in HDRP units, environment. aether: what Aether's material translation produced (class, flags, bound textures, unmapped properties; needs render mode aether or compare)."},"limit":{"type":"integer","minimum":1,"maximum":600,"description":"detail=aether: how many materials (default 200)."}},"additionalProperties":false}""",
 			"""{"type":"object","properties":{"available":{"type":"boolean"},"ageSeconds":{"type":"number"},"refreshed":{"type":"boolean"},"data":{"type":"object","description":"scene, rendererCount, materialCount, shaderCount, shaders[{shader, materials, rendererSlots, renderQueueMin, renderQueueMax, transparentMaterials, alphaTestMaterials, textureProperties, keywords[], sampleMaterials[]}]"}},"required":["available"]}"""),
 
 		new("get_scene_info",
@@ -101,6 +101,12 @@ public static class ToolCatalog {
 			"[control] Switches a render feature on or off (get_settings lists the features). Needs --allow-control and the game's permission.",
 			"""{"type":"object","properties":{"feature":{"type":"string","description":"One of get_settings.renderFeatures, e.g. testTriangle, gpuTiming."},"enabled":{"type":"boolean"}},"required":["feature","enabled"],"additionalProperties":false}""",
 			"""{"type":"object","properties":{"feature":{"type":"string"},"enabled":{"type":"boolean"}},"required":["feature","enabled"]}""",
+			Control: true, TimeoutSeconds: ControlTimeout),
+
+		new("set_render_mode",
+			"[control] Chooses who draws the scene: hdrp (the game's renderer), aether (Aether's forward+ renderer replaces the picture, the game's UI stays on top), compare (left half HDRP, right half Aether). Optionally a debug view of Aether's renderer. Needs --allow-control and the game's permission.",
+			"""{"type":"object","properties":{"mode":{"type":"string","enum":["hdrp","aether","compare"]},"debugView":{"type":"string","enum":["none","albedo","normal","roughness","metallic","depth","lighting","shadow","materialClass"]}},"additionalProperties":false}""",
+			"""{"type":"object","properties":{"mode":{"type":"string"},"debugView":{"type":"string"},"note":{"type":"string"}},"required":["mode","debugView"]}""",
 			Control: true, TimeoutSeconds: ControlTimeout),
 
 		new("reload_shader",

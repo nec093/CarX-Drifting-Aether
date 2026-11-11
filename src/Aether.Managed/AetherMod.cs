@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using KSL.API;
 using UnityEngine;
@@ -20,9 +21,13 @@ namespace Aether {
 		private Coroutine endOfFrame_;
 		private readonly UnityStats stats_ = new UnityStats();
 		private readonly SceneReporter reporter_ = new SceneReporter();
+		private readonly SceneCapture capture_ = new SceneCapture();
+		private string sceneContract_ = "not checked";
+		private bool sceneContractOk_;
 		private bool suppressingInput_;
 		private float nextManagedPublish_;
 		private bool shutDown_;
+		private bool dropScene_; // the capture stopped: one more scene event lets the native side release what it held
 
 		private void Start() {
 			try {
@@ -47,6 +52,7 @@ namespace Aether {
 			// first of all: without it the game's own renderer does not start on DX12 and the window stays black
 			HdrpDx12Fix.Apply(dataDir, configDir);
 			GameDx12Workarounds.Init(configDir);
+			GameDx12Workarounds.InitVideos(configDir);
 			ApplyWorkarounds();
 			string problem = Native.Prepare(dataDir, configDir, Kino.Paths.GameRoot);
 			if (problem != null) {
@@ -80,6 +86,16 @@ namespace Aether {
 			}
 			renderEvent_ = Native.Aether_GetRenderEventFunc();
 			endOfFrame_ = StartCoroutine(EndOfFrameLoop());
+			// Aether's scene renderer: both sides must agree on the contract's layout before anything is sent
+			string mismatch = SceneContract.Verify();
+			sceneContractOk_ = mismatch == null;
+			sceneContract_ = mismatch ?? "ok (version " + AeConst.ContractVersion + ")";
+			if (!sceneContractOk_) {
+				Kino.Log.Error("[Aether] scene contract mismatch: " + mismatch);
+				Native.Log(3, "Scene contract mismatch, the scene renderer stays off: " + mismatch);
+			} else {
+				RenderPipelineManager.endContextRendering += OnEndContextRendering;
+			}
 			SceneManager.sceneLoaded += OnSceneLoaded;
 			SceneManager.sceneUnloaded += OnSceneUnloaded;
 			running_ = true;
@@ -95,8 +111,47 @@ namespace Aether {
 			nextWorkaround_ = 0;
 		}
 
+		// After the game's render pipeline drew a set of cameras (still inside the render loop, before the overlay UI):
+		// when that set holds the game's screen camera, this is where Aether's scene frame goes.
+		private void OnEndContextRendering(ScriptableRenderContext context, List<Camera> cameras) {
+			if (!running_ || renderEvent_ == IntPtr.Zero || !sceneContractOk_) {
+				return;
+			}
+			try {
+				Camera main = null;
+				for (int i = 0; i < cameras.Count; ++i) {
+					Camera c = cameras[i];
+					if (c != null && c.cameraType == CameraType.Game && c.targetTexture == null && c.isActiveAndEnabled && (main == null || c.depth > main.depth)) {
+						main = c;
+					}
+				}
+				if (main == null) {
+					return; // an off-screen camera (previews, icons): not the frame
+				}
+				if (dropScene_) {
+					dropScene_ = false;
+					GL.IssuePluginEvent(renderEvent_, Native.EventScene); // lets the native side drop its handles
+				}
+				// the capture is started, stopped and kept up to date in Update; here only this frame is described
+				if (capture_.Active && capture_.SubmitFrame(main)) {
+					GL.IssuePluginEvent(renderEvent_, Native.EventScene);
+				}
+			} catch (Exception e) {
+				// never let the capture break the game's render loop
+				sceneContractOk_ = false;
+				sceneContract_ = "stopped after " + e.GetType().Name + ": " + e.Message;
+				Kino.Log.Error("[Aether] scene capture stopped: " + e);
+				Native.Log(3, "Scene capture stopped after an exception: " + e.GetType().Name + ": " + e.Message);
+				try {
+					capture_.Stop();
+				} catch (Exception) {
+				}
+			}
+		}
+
 		private void OnSceneLoaded(Scene scene, LoadSceneMode mode) {
 			ApplyWorkarounds();
+			capture_.SceneChanged();
 			if (running_) {
 				Native.Log(1, "Scene loaded: " + scene.name + " (" + mode + ")");
 				reporter_.SceneChanged();
@@ -104,6 +159,7 @@ namespace Aether {
 		}
 
 		private void OnSceneUnloaded(Scene scene) {
+			capture_.SceneChanged();
 			if (running_) {
 				Native.Log(1, "Scene unloaded: " + scene.name);
 				reporter_.SceneChanged();
@@ -137,11 +193,13 @@ namespace Aether {
 			if (!running_) {
 				return;
 			}
+			GameDx12Workarounds.UpdateVideos();
 			if (renderEvent_ != IntPtr.Zero) {
 				GL.IssuePluginEvent(renderEvent_, Native.EventFrameBegin);
 			}
 			Native.Aether_Update();
 			stats_.Submit();
+			UpdateCapture();
 
 			bool wantsInput = Native.Aether_OverlayWantsInput() != 0;
 			if (wantsInput != suppressingInput_) {
@@ -163,9 +221,36 @@ namespace Aether {
 			}
 		}
 
+		// Outside the render loop: the scene capture's scans and native pointer queries.
+		private void UpdateCapture() {
+			if (!sceneContractOk_ || renderEvent_ == IntPtr.Zero) {
+				return;
+			}
+			try {
+				if (Native.Aether_GetRenderMode() == 0) {
+					if (capture_.Active) {
+						capture_.Stop();
+						dropScene_ = true;
+					}
+					return;
+				}
+				capture_.Start();
+				capture_.Tick();
+			} catch (Exception e) {
+				sceneContractOk_ = false;
+				sceneContract_ = "stopped after " + e.GetType().Name + ": " + e.Message;
+				Kino.Log.Error("[Aether] scene capture stopped: " + e);
+				Native.Log(3, "Scene capture stopped after an exception: " + e.GetType().Name + ": " + e.Message);
+				try {
+					capture_.Stop();
+				} catch (Exception) {
+				}
+			}
+		}
+
 		private void PublishManaged() {
 			try {
-				Native.SetManagedState("managed", reporter_.GameInfo(status_));
+				Native.SetManagedState("managed", reporter_.GameInfo(status_, "contract " + sceneContract_ + (capture_.Active ? "; " + capture_.Status() : "; idle (render mode hdrp)")));
 			} catch (Exception e) {
 				Kino.Log.Error("[Aether] could not publish the game info: " + e.Message);
 			}
@@ -179,6 +264,7 @@ namespace Aether {
 			SceneManager.sceneLoaded -= OnSceneLoaded;
 			SceneManager.sceneUnloaded -= OnSceneUnloaded;
 			GameDx12Workarounds.Shutdown();
+			RenderPipelineManager.endContextRendering -= OnEndContextRendering;
 			if (!running_) {
 				return;
 			}
@@ -190,6 +276,10 @@ namespace Aether {
 				Kino.Input.SetSuppressInput(false);
 			}
 			stats_.Dispose();
+			try {
+				capture_.Stop();
+			} catch (Exception) {
+			}
 			try {
 				if (renderEvent_ != IntPtr.Zero) {
 					// the render thread frees Aether's device objects; Aether_Shutdown waits for it (briefly)
@@ -214,6 +304,8 @@ namespace Aether {
 			GUILayout.Label("Aether " + Meta.Version + ": " + status_);
 			GUILayout.Label("HDRP on DX12: " + HdrpDx12Fix.Status);
 			GUILayout.Label("Game passes on DX12: " + GameDx12Workarounds.Status);
+			GUILayout.Label("Game videos / ads on DX12: " + GameDx12Workarounds.VideoStatus);
+			GUILayout.Label("Scene capture: " + (capture_.Active ? capture_.Status() : "idle (render mode hdrp)"));
 			if (!running_) {
 				return;
 			}

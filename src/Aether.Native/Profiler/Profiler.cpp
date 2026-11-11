@@ -143,6 +143,48 @@ void Profiler::GpuResult(uint64_t frame, double gpuFrameMs, double aetherGpuMs, 
 	}
 }
 
+void Profiler::SceneFrame(const std::vector<PassTiming>& passes, uint32_t drawCalls, uint32_t triangles) {
+	std::lock_guard lock(mutex_);
+	// keep the GPU times of the passes that are still there
+	std::vector<PassTiming> next = passes;
+	for (PassTiming& p : next) {
+		for (const PassTiming& old : scenePasses_) {
+			if (old.name == p.name && p.executed) {
+				p.gpuMs = old.gpuMs;
+			}
+		}
+	}
+	scenePasses_ = std::move(next);
+	sceneDrawCalls_ = drawCalls;
+	sceneTriangles_ = triangles;
+	sceneActive_ = true;
+}
+
+void Profiler::SceneGpuResult(const std::vector<PassTiming>& passes, double totalGpuMs) {
+	std::lock_guard lock(mutex_);
+	for (PassTiming& p : scenePasses_) {
+		for (const PassTiming& r : passes) {
+			if (r.name == p.name && r.executed) {
+				p.gpuMs = r.gpuMs;
+			}
+		}
+	}
+	sceneGpuMs_ = totalGpuMs;
+	if (bench_.running) {
+		benchSceneGpu_.push_back(float(totalGpuMs));
+	}
+}
+
+void Profiler::SceneIdle() {
+	std::lock_guard lock(mutex_);
+	if (sceneActive_) {
+		sceneActive_ = false;
+		scenePasses_.clear();
+		sceneDrawCalls_ = sceneTriangles_ = 0;
+		sceneGpuMs_ = -1;
+	}
+}
+
 void Profiler::SubmitUnityStats(const double* values, int count) {
 	std::lock_guard lock(mutex_);
 	for (int i = 0; i < kUnityStatCount; ++i) {
@@ -260,7 +302,17 @@ json Profiler::Passes() {
 		}
 		list.push_back(j);
 	}
-	return {{"frame", passesFrame_}, {"passes", list}};
+	json scene = json::array();
+	for (const PassTiming& p : scenePasses_) {
+		json j = {{"name", p.name}, {"executed", p.executed}, {"cpuMs", p.cpuMs}, {"drawCalls", p.drawCalls}};
+		j["gpuMs"] = p.gpuMs >= 0 ? json(p.gpuMs) : json(nullptr);
+		if (!p.note.empty()) {
+			j["note"] = p.note;
+		}
+		scene.push_back(j);
+	}
+	return {{"frame", passesFrame_}, {"passes", list}, {"scenePasses", scene},
+		{"scene", {{"active", sceneActive_}, {"drawCalls", sceneDrawCalls_}, {"triangles", sceneTriangles_}, {"gpuMs", sceneGpuMs_ >= 0 ? json(sceneGpuMs_) : json(nullptr)}}}};
 }
 
 std::string Profiler::StartBenchmark(const std::string& label, double seconds, const std::wstring& outputDir, json context) {
@@ -285,6 +337,7 @@ std::string Profiler::StartBenchmark(const std::string& label, double seconds, c
 		bench_.sharedPeak = vm.nonLocalUsage;
 	}
 	benchResult_ = nullptr;
+	benchSceneGpu_.clear();
 	AE_LOG(Info, "Benchmark", "Started '%s' for %.1f s", label.c_str(), seconds);
 	return {};
 }
@@ -318,6 +371,15 @@ void Profiler::FinishBenchmarkLocked() {
 	r["frameTimeMs"] = Stats(bench_.intervals);
 	r["gpuFrameTimeMs"] = Stats(bench_.gpu);
 	r["aetherGpuTimeMs"] = Stats(bench_.aetherGpu);
+	r["aetherSceneGpuTimeMs"] = Stats(benchSceneGpu_);
+	{
+		json scene = json::array();
+		for (const PassTiming& p : scenePasses_) {
+			scene.push_back({{"name", p.name}, {"executed", p.executed}, {"cpuMs", p.cpuMs}, {"gpuMs", p.gpuMs >= 0 ? json(p.gpuMs) : json(nullptr)}, {"drawCalls", p.drawCalls}});
+		}
+		r["aetherScene"] = {{"active", sceneActive_}, {"drawCalls", sceneDrawCalls_}, {"triangles", sceneTriangles_}, {"passes", scene}};
+	}
+	benchSceneGpu_.clear();
 	r["unityDrawCalls"] = Stats(bench_.unityDraws);
 	r["dedicatedVramBytes"] = {{"start", bench_.vramStart}, {"end", bench_.vramEnd}, {"peak", bench_.vramPeak}};
 	r["sharedGpuMemoryPeakBytes"] = bench_.sharedPeak;

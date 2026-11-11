@@ -79,6 +79,52 @@ namespace Aether {
 			}
 		}
 
+		// ---- videos and in-game advertising (Anzu) on Direct3D 12
+		// Found in the stability investigation (docs/development/stability-investigation.md): with the D3D12 debug layer
+		// on, Unity's upload of a video frame (A8_UNORM, 1080x608) goes to a texture that was replaced meanwhile, and the
+		// device is lost or the player crashes. The owner of the project allowed switching these off on DX12.
+		// Opt out with the file kino/config/Aether/keep-game-videos.
+		private static bool videosOff_;
+		private static float nextVideoCheck_;
+		private static readonly HashSet<string> videoTypes_ = new HashSet<string>();
+		private static int videosDisabled_;
+
+		public static string VideoStatus { get; private set; } = "not applied";
+
+		public static void InitVideos(string configDir) {
+			videosOff_ = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 && !File.Exists(Path.Combine(configDir, "keep-game-videos"));
+			VideoStatus = videosOff_ ? "nothing switched off yet" : "not applied";
+		}
+
+		/// <summary>Every two seconds: video players and Anzu's components that are enabled get disabled.</summary>
+		public static void UpdateVideos() {
+			if (!videosOff_ || Time.unscaledTime < nextVideoCheck_) {
+				return;
+			}
+			nextVideoCheck_ = Time.unscaledTime + 2.0f;
+			try {
+				int count = 0;
+				foreach (Behaviour b in UnityEngine.Object.FindObjectsByType<Behaviour>(FindObjectsInactive.Exclude, FindObjectsSortMode.None)) {
+					if (b == null || !b.enabled) {
+						continue;
+					}
+					string type = b.GetType().FullName ?? "";
+					if (type == "UnityEngine.Video.VideoPlayer" || type.IndexOf("Anzu", StringComparison.OrdinalIgnoreCase) >= 0) {
+						b.enabled = false;
+						videoTypes_.Add(type);
+						++count;
+					}
+				}
+				if (count > 0) {
+					videosDisabled_ += count;
+					VideoStatus = "switched off " + videosDisabled_ + " components: " + string.Join(", ", videoTypes_);
+					Native.Log(2, "Game videos / advertising on DX12: " + VideoStatus);
+				}
+			} catch (Exception e) {
+				VideoStatus = "failed: " + e.GetType().Name + ": " + e.Message;
+				videosOff_ = false;
+			}
+		}
 		/// <summary>Looks for the broken passes in the loaded scenes (cheap enough for a few calls after a scene load).</summary>
 		public static int Apply() {
 			if (off_) {

@@ -2,6 +2,7 @@
 // Bump AETHER_API_VERSION on any change; the managed side refuses a DLL with another version.
 #pragma once
 #include <stdint.h>
+#include "SceneContract.h"
 
 #ifdef AETHER_NATIVE_EXPORTS
 #define AETHER_API extern "C" __declspec(dllexport)
@@ -9,12 +10,13 @@
 #define AETHER_API extern "C" __declspec(dllimport)
 #endif
 
-#define AETHER_API_VERSION 1
+#define AETHER_API_VERSION 2
 
 // Render events for GL.IssuePluginEvent(Aether_GetRenderEventFunc(), id)
 #define AETHER_EVENT_FRAME_BEGIN 1 // first thing in the frame (GPU timestamp)
 #define AETHER_EVENT_FRAME_END 2   // after everything Unity draws, before Present (WaitForEndOfFrame)
 #define AETHER_EVENT_SHUTDOWN 3    // releases Aether's device objects on the render thread; issue it right before Aether_Shutdown
+#define AETHER_EVENT_SCENE 4       // Aether's scene renderer: after the game's cameras rendered, before its UI (right after Aether_SceneSubmitFrame)
 
 // Aether_GetState
 #define AETHER_STATE_NOT_INITIALIZED 0
@@ -47,3 +49,23 @@ AETHER_API int Aether_OverlayVisible(void);
 AETHER_API void Aether_SetOverlayVisible(int visible);
 // 1 while the overlay uses the mouse or the keyboard (the game should ignore its input meanwhile).
 AETHER_API int Aether_OverlayWantsInput(void);
+
+// ---- the scene data contract (SceneContract.h, docs/architecture/scene-data-contract.md). Main thread only.
+// Each returns 1 when the description was accepted, 0 when it was refused (logged as E_SCENE_CONTRACT).
+AETHER_API int Aether_SceneContractVersion(void);
+// sizeof of a contract struct (0 mesh, 1 texture, 2 material, 3 instance, 4 frame instance, 5 light, 6 frame, 7 sub mesh):
+// the managed side compares them with its own layouts before it sends anything.
+AETHER_API int Aether_SceneStructSize(int which);
+AETHER_API int Aether_SceneUpsertMesh(const AeMeshDesc* desc, const AeSubMesh* subMeshes);
+AETHER_API int Aether_SceneUpsertTexture(const AeTextureDesc* desc);
+AETHER_API int Aether_SceneUpsertMaterial(const AeMaterialDesc* desc);
+AETHER_API int Aether_SceneUpsertInstance(const AeInstanceDesc* desc, const AeHandle* materials);
+// kind: 0 mesh, 1 texture, 2 material, 3 instance
+AETHER_API void Aether_SceneDestroy(int kind, AeHandle handle);
+// Every handle goes (scene unload, or the capture stops).
+AETHER_API void Aether_SceneClear(void);
+AETHER_API int Aether_SceneSubmitFrame(const AeFrame* frame, const AeFrameInstance* instances, uint32_t instanceCount, const AeLight* lights, uint32_t lightCount);
+// 0 hdrp (the managed side captures nothing), 1 aether, 2 compare
+AETHER_API int Aether_GetRenderMode(void);
+// Experiment switches for the scene capture (Core/DevOptions.h); 0 in normal operation.
+AETHER_API int Aether_DevCaptureFlags();

@@ -8,13 +8,17 @@
 namespace aether {
 
 static const std::vector<std::string> kQualities = {"low", "medium", "high", "ultra"};
-static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming"};
+static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky"};
+static const std::vector<std::string> kRenderModes = {"hdrp", "aether", "compare"};
+static const std::vector<std::string> kTonemaps = {"aces", "neutral", "none"};
 static const std::vector<std::string> kControlModes = {"deny", "ask", "allow"};
 static const std::vector<std::string> kLogLevels = {"debug", "info", "warning", "error"};
-static const std::vector<std::string> kDebugViews = {"none"};
+static const std::vector<std::string> kDebugViews = {"none", "albedo", "normal", "roughness", "metallic", "depth", "lighting", "shadow", "materialClass"};
 
 const std::vector<std::string>& RenderFeatureNames() { return kFeatures; }
 const std::vector<std::string>& QualityNames() { return kQualities; }
+const std::vector<std::string>& RenderModeNames() { return kRenderModes; }
+const std::vector<std::string>& DebugViewNames() { return kDebugViews; }
 
 Settings& Settings::Get() {
 	static Settings* s = new Settings();
@@ -30,6 +34,13 @@ static json ToJsonData(const SettingsData& d) {
 		{"testTriangle", d.testTriangle},
 		{"gpuTiming", d.gpuTiming},
 		{"debugView", d.debugView},
+		{"renderMode", d.renderMode},
+		{"shadows", d.shadows},
+		{"sky", d.sky},
+		{"tonemap", d.tonemap},
+		{"exposureEV", d.exposureEV},
+		{"vramBudgetMB", d.vramBudgetMB},
+		{"vramWarnPercent", d.vramWarnPercent},
 		{"mcpControl", d.mcpControl},
 		{"mcpApprovalTimeoutSec", d.mcpApprovalTimeoutSec},
 		{"logLevel", d.logLevel},
@@ -45,7 +56,14 @@ json Settings::Schema() {
 		{"quality", oneOf(kQualities, "Render quality preset")},
 		{"testTriangle", {{"type", "boolean"}, {"description", "Draw the DX12 integration test triangle"}}},
 		{"gpuTiming", {{"type", "boolean"}, {"description", "Measure GPU time with timestamp queries"}}},
-		{"debugView", oneOf(kDebugViews, "Debug view")},
+		{"debugView", oneOf(kDebugViews, "Debug view of Aether's renderer (used when renderMode is aether or compare)")},
+		{"renderMode", oneOf(kRenderModes, "Who draws the scene: hdrp (the game's renderer), aether (Aether's image replaces it), compare (left half HDRP, right half Aether)")},
+		{"shadows", {{"type", "boolean"}, {"description", "Directional shadow cascades"}}},
+		{"sky", {{"type", "boolean"}, {"description", "Sky background and environment reflections"}}},
+		{"tonemap", oneOf(kTonemaps, "Tone mapping curve")},
+		{"exposureEV", {{"type", "number"}, {"minimum", -10.0}, {"maximum", 10.0}, {"description", "Exposure bias in stops on top of the scene's exposure"}}},
+		{"vramBudgetMB", {{"type", "integer"}, {"minimum", 0}, {"maximum", 65536}, {"description", "Budget for Aether-owned GPU memory in MB (0 = none). Crossing it is reported; nothing is freed automatically"}}},
+		{"vramWarnPercent", {{"type", "integer"}, {"minimum", 1}, {"maximum", 100}, {"description", "Warning threshold in percent of the VRAM budget"}}},
 		{"mcpControl", oneOf(kControlModes, "What a control request from an AI agent needs: deny, ask (in-game approval), allow")},
 		{"mcpApprovalTimeoutSec", {{"type", "integer"}, {"minimum", 5}, {"maximum", 300}, {"description", "Seconds an approval prompt waits before it counts as denied"}}},
 		{"logLevel", oneOf(kLogLevels, "Lowest severity written to the log")},
@@ -105,6 +123,19 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 	if (key == "testTriangle") return wantBool(d.testTriangle);
 	if (key == "gpuTiming") return wantBool(d.gpuTiming);
 	if (key == "debugView") return wantEnum(d.debugView, kDebugViews);
+	if (key == "renderMode") return wantEnum(d.renderMode, kRenderModes);
+	if (key == "shadows") return wantBool(d.shadows);
+	if (key == "sky") return wantBool(d.sky);
+	if (key == "tonemap") return wantEnum(d.tonemap, kTonemaps);
+	if (key == "exposureEV") {
+		if (!value.is_number() || !(value.get<double>() >= -10.0 && value.get<double>() <= 10.0)) {
+			return "exposureEV must be a number between -10 and 10";
+		}
+		d.exposureEV = float(value.get<double>());
+		return {};
+	}
+	if (key == "vramBudgetMB") return wantInt(d.vramBudgetMB, 0, 65536);
+	if (key == "vramWarnPercent") return wantInt(d.vramWarnPercent, 1, 100);
 	if (key == "mcpControl") return wantEnum(d.mcpControl, kControlModes);
 	if (key == "mcpApprovalTimeoutSec") return wantInt(d.mcpApprovalTimeoutSec, 5, 300);
 	if (key == "logLevel") return wantEnum(d.logLevel, kLogLevels);

@@ -8,8 +8,11 @@
 #include "Core/Log.h"
 #include "ImGui/Overlay.h"
 #include "Renderer/Renderer.h"
+#include "Resources/GpuResources.h"
 #include "Runtime.h"
+#include "Scene/SceneStore.h"
 #include "Session.h"
+#include "ValidationScene.h"
 
 #include <d3d12sdklayers.h>
 
@@ -147,6 +150,10 @@ int wmain(int argc, wchar_t** argv) {
 	long long maxFrames = Arg(argc, argv, L"--frames", &text) ? _wtoi64(text) : -1;
 	const bool overlay = Arg(argc, argv, L"--overlay"), resizeTest = Arg(argc, argv, L"--resize"), capture = Arg(argc, argv, L"--capture");
 	const bool warp = Arg(argc, argv, L"--warp"), debugLayer = !Arg(argc, argv, L"--no-debug"), hidden = Arg(argc, argv, L"--hidden");
+	// --scene: the validation scene through the scene data contract, drawn by Aether's scene renderer
+	const bool sceneTest = Arg(argc, argv, L"--scene");
+	const wchar_t* modeText = nullptr;
+	const std::string sceneMode = Arg(argc, argv, L"--mode", &modeText) ? WideToUtf8(modeText) : "aether";
 
 	// ---- window
 	WNDCLASSW wc = {};
@@ -257,6 +264,19 @@ int wmain(int argc, wchar_t** argv) {
 		return true;
 	};
 
+	host::ValidationScene scene;
+	uint64_t sceneCaptures[3] = {0, 0, 0};
+	if (sceneTest) {
+		if (!scene.Create(g.device.Get(), g.queue.Get())) {
+			Die("validation scene", E_FAIL);
+		}
+		Settings::Get().Set("renderMode", sceneMode, "host");
+		Settings::Get().Set("debugView", "none", "host");
+		scene.Register();
+		scene.PrintProbes(g.width, g.height);
+		CreateDirectoryW((data + L"\\captures").c_str(), nullptr);
+	}
+
 	// ---- frames
 	const double start = QpcSeconds();
 	long long frame = 0;
@@ -305,6 +325,24 @@ int wmain(int argc, wchar_t** argv) {
 			g.queue->ExecuteCommandLists(1, lists);
 		}
 
+		if (sceneTest) {
+			// what the managed side does every frame: describe the frame, then let the scene renderer run after the
+			// "game" drew and before its "UI"
+			scene.Churn(uint32_t(frame));
+			scene.SubmitFrame(g.width, g.height, uint32_t(frame), float(elapsed));
+			session::SceneFrame(host);
+			if (frame == 40) {
+				sceneCaptures[0] = Renderer::Get().RequestCapture(data + L"\\captures\\scene-lit.png", false);
+			} else if (frame == 60) {
+				Settings::Get().Set("debugView", "normal", "host");
+			} else if (frame == 80) {
+				sceneCaptures[1] = Renderer::Get().RequestCapture(data + L"\\captures\\scene-normal.png", false);
+			} else if (frame == 90) {
+				Settings::Get().Set("debugView", "none", "host");
+			} else if (frame == 140) {
+				sceneCaptures[2] = Renderer::Get().RequestCapture(data + L"\\captures\\scene-after.png", false);
+			}
+		}
 		if (capture && !captured && frame == 30) {
 			captured = true;
 			captureId = Renderer::Get().RequestCapture(data + L"\\captures\\host-capture.png", true);
@@ -319,7 +357,9 @@ int wmain(int argc, wchar_t** argv) {
 			WaitForGpu(); // the clear list is done before its allocator is reused (a test host, not a fast one)
 			g.allocators[index]->Reset();
 			g.list->Reset(g.allocators[index].Get(), nullptr);
-			Transition(g.list.Get(), backBuffer.Get(), g.backBufferState[index], D3D12_RESOURCE_STATE_PRESENT);
+			if (g.backBufferState[index] != D3D12_RESOURCE_STATE_PRESENT) {
+				Transition(g.list.Get(), backBuffer.Get(), g.backBufferState[index], D3D12_RESOURCE_STATE_PRESENT);
+			}
 			g.backBufferState[index] = D3D12_RESOURCE_STATE_PRESENT;
 			g.list->Close();
 			ID3D12CommandList* lists[] = {g.list.Get()};
@@ -342,10 +382,22 @@ int wmain(int argc, wchar_t** argv) {
 		Sleep(10);
 		captureState = Renderer::Get().CaptureStatus(captureId).value("state", "");
 	}
+	bool sceneCapturesDone = true;
+	for (uint64_t id : sceneCaptures) {
+		for (int i = 0; sceneTest && id && i < 300 && Renderer::Get().CaptureStatus(id).value("state", "") != "done" && Renderer::Get().CaptureStatus(id).value("state", "") != "failed"; ++i) {
+			Sleep(10);
+		}
+		sceneCapturesDone = sceneCapturesDone && (!sceneTest || (id && Renderer::Get().CaptureStatus(id).value("state", "") == "done"));
+	}
+	if (sceneTest) {
+		printf("scene stats: %s\n", Dump(SceneStore::Get().Summary()).c_str());
+		printf("gpu resources: %s\n", Dump(GpuResources::Get().Report()).c_str());
+	}
 	const bool failed = Renderer::Get().Failed() || session::Dead();
 	const uint32_t logErrors = Log::Get().ErrorCount();
 	session::ReleaseOnRenderThread(host, 2000);
 	session::Stop();
+	scene.Release();
 	WaitForGpu();
 	DrainInfoQueue();
 
@@ -371,7 +423,10 @@ int wmain(int argc, wchar_t** argv) {
 	if (capture) {
 		printf("capture: %s\n", captureState.c_str());
 	}
-	const bool ok = g.errors == 0 && !failed && refs == 0 && logErrors == 0 && (!capture || captureState == "done");
+	if (sceneTest) {
+		printf("scene captures: %s\n", sceneCapturesDone ? "done" : "MISSING");
+	}
+	const bool ok = g.errors == 0 && !failed && refs == 0 && logErrors == 0 && (!capture || captureState == "done") && sceneCapturesDone;
 	printf(ok ? "HOST OK\n" : "HOST FAILED\n");
 	return ok ? 0 : 1;
 }

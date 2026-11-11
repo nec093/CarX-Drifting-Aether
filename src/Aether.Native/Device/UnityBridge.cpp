@@ -1,10 +1,13 @@
 // Aether inside Unity: the Unity native plugin interface (IUnityGraphicsD3D12v7) as the HostGfx, the render events,
 // and the DLL's C exports. See docs/architecture/dx12-integration.md for why each call is made where it is.
+#include "../Core/DevOptions.h"
 #include "../Core/Common.h"
 #include "../Core/Log.h"
 #include "../ImGui/Overlay.h"
 #include "../Profiler/Profiler.h"
+#include "../Core/Config.h"
 #include "../Renderer/Renderer.h"
+#include "../Scene/SceneStore.h"
 #include "../Runtime.h"
 #include "../Session.h"
 #include "../include/AetherApi.h"
@@ -31,6 +34,8 @@ HANDLE g_idleEvent = nullptr;
 static_assert(sizeof(HostResourceState) == sizeof(UnityGraphicsD3D12ResourceState), "HostResourceState must match Unity's struct");
 static_assert(offsetof(HostResourceState, expected) == offsetof(UnityGraphicsD3D12ResourceState, expected), "HostResourceState must match Unity's struct");
 static_assert(offsetof(HostResourceState, current) == offsetof(UnityGraphicsD3D12ResourceState, current), "HostResourceState must match Unity's struct");
+
+void ConfigureEvents();
 
 // Render thread. Fills g_host from Unity's interface the first time (and again if the device changed).
 bool EnsureHost() {
@@ -84,6 +89,9 @@ bool EnsureHost() {
 	}
 	g_hostReady = true;
 	AE_LOG(Info, "Unity", "Unity's D3D12 device and command queue acquired (IUnityGraphicsD3D12v7)");
+	if (DevOptions::Get().source != "defaults") {
+		ConfigureEvents(); // the experiment switches were not loaded yet when the device was initialized
+	}
 	return true;
 }
 
@@ -93,7 +101,13 @@ void UNITY_INTERFACE_API OnRenderEvent(int eventId) {
 	}
 	switch (eventId) {
 	case AETHER_EVENT_FRAME_BEGIN: session::FrameBegin(g_host); break;
-	case AETHER_EVENT_FRAME_END: session::FrameEnd(g_host); break;
+	case AETHER_EVENT_FRAME_END:
+		if (DevOptions::Get().sleepMs > 0) {
+			Sleep(DWORD(DevOptions::Get().sleepMs)); // experiment: the render thread is only held up
+		}
+		session::FrameEnd(g_host);
+		break;
+	case AETHER_EVENT_SCENE: session::SceneFrame(g_host); break;
 	case AETHER_EVENT_SHUTDOWN:
 		session::ReleaseOnRenderThread(g_host, 2000);
 		g_idleFence.Reset();
@@ -107,10 +121,14 @@ void ConfigureEvents() {
 	if (!g_d3d12) {
 		return;
 	}
-	// Frame begin: only a timestamp list goes through ExecuteCommandList; nothing of Unity's is touched.
+	// Frame begin: a timestamp list goes through ExecuteCommandList. That is work submitted to Unity's queue, which
+	// Unity only permits in an event configured with queue access ("DontCare" = "no work must be submitted"); its
+	// worker threads are kept off the queue meanwhile. Nothing of Unity's needs to be flushed first.
 	UnityD3D12PluginEventConfig begin = {};
-	begin.graphicsQueueAccess = kUnityD3D12GraphicsQueueAccess_DontCare;
-	begin.flags = 0;
+	begin.graphicsQueueAccess = kUnityD3D12GraphicsQueueAccess_Allow;
+	begin.flags = kUnityD3D12EventConfigFlag_SyncWorkerThreads;
+	const DevOptions& dev = DevOptions::Get();
+	if (dev.beginFlags >= 0) begin.flags = UINT32(dev.beginFlags);
 	begin.ensureActiveRenderTextureIsBound = false;
 	g_d3d12->ConfigureEvent(AETHER_EVENT_FRAME_BEGIN, &begin);
 	// Frame end / shutdown: everything Unity recorded so far must be submitted before Aether's list (the overlay goes on
@@ -120,8 +138,15 @@ void ConfigureEvents() {
 	end.graphicsQueueAccess = kUnityD3D12GraphicsQueueAccess_Allow;
 	end.flags = kUnityD3D12EventConfigFlag_FlushCommandBuffers | kUnityD3D12EventConfigFlag_SyncWorkerThreads;
 	end.ensureActiveRenderTextureIsBound = false;
-	g_d3d12->ConfigureEvent(AETHER_EVENT_FRAME_END, &end);
+	UnityD3D12PluginEventConfig scene = end;
 	g_d3d12->ConfigureEvent(AETHER_EVENT_SHUTDOWN, &end);
+	if (dev.endFlags >= 0) end.flags = UINT32(dev.endFlags);
+	if (dev.sceneFlags >= 0) scene.flags = UINT32(dev.sceneFlags);
+	g_d3d12->ConfigureEvent(AETHER_EVENT_FRAME_END, &end);
+	// The scene event: the host's cameras must be submitted before Aether's image goes onto the back buffer (it
+	// replaces theirs), and Aether's list before the host's UI. Same needs as the frame end.
+	g_d3d12->ConfigureEvent(AETHER_EVENT_SCENE, &scene);
+	AE_LOG(Info, "Unity", "Plugin events configured: begin flags %u, end flags %u, scene flags %u (queue access allowed in all three)", begin.flags, end.flags, scene.flags);
 }
 
 void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType type) {
@@ -187,6 +212,10 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginUnload() {
 
 AETHER_API int Aether_GetApiVersion(void) {
 	return AETHER_API_VERSION;
+}
+
+AETHER_API int Aether_DevCaptureFlags() {
+	return DevOptions::Get().captureFlags;
 }
 
 AETHER_API int Aether_Initialize(const wchar_t* dataDir, const wchar_t* configDir) {
@@ -260,3 +289,23 @@ AETHER_API void Aether_Log(int severity, const char* component, const char* mess
 AETHER_API int Aether_OverlayVisible(void) { return Overlay::Get().Visible() ? 1 : 0; }
 AETHER_API void Aether_SetOverlayVisible(int visible) { Overlay::Get().SetVisible(visible != 0); }
 AETHER_API int Aether_OverlayWantsInput(void) { return Overlay::Get().WantsInput() ? 1 : 0; }
+
+// ---- the scene data contract
+AETHER_API int Aether_SceneContractVersion(void) { return AE_SCENE_CONTRACT_VERSION; }
+AETHER_API int Aether_SceneStructSize(int which) {
+	static const int sizes[] = {int(sizeof(AeMeshDesc)), int(sizeof(AeTextureDesc)), int(sizeof(AeMaterialDesc)), int(sizeof(AeInstanceDesc)), int(sizeof(AeFrameInstance)), int(sizeof(AeLight)), int(sizeof(AeFrame)), int(sizeof(AeSubMesh))};
+	return which >= 0 && which < int(_countof(sizes)) ? sizes[which] : 0;
+}
+AETHER_API int Aether_SceneUpsertMesh(const AeMeshDesc* desc, const AeSubMesh* subMeshes) { return SceneStore::Get().UpsertMesh(desc, subMeshes) ? 1 : 0; }
+AETHER_API int Aether_SceneUpsertTexture(const AeTextureDesc* desc) { return SceneStore::Get().UpsertTexture(desc) ? 1 : 0; }
+AETHER_API int Aether_SceneUpsertMaterial(const AeMaterialDesc* desc) { return SceneStore::Get().UpsertMaterial(desc) ? 1 : 0; }
+AETHER_API int Aether_SceneUpsertInstance(const AeInstanceDesc* desc, const AeHandle* materials) { return SceneStore::Get().UpsertInstance(desc, materials) ? 1 : 0; }
+AETHER_API void Aether_SceneDestroy(int kind, AeHandle handle) { SceneStore::Get().Destroy(kind, handle); }
+AETHER_API void Aether_SceneClear(void) { SceneStore::Get().Clear(); }
+AETHER_API int Aether_SceneSubmitFrame(const AeFrame* frame, const AeFrameInstance* instances, uint32_t instanceCount, const AeLight* lights, uint32_t lightCount) {
+	return SceneStore::Get().SubmitFrame(frame, instances, instanceCount, lights, lightCount) ? 1 : 0;
+}
+AETHER_API int Aether_GetRenderMode(void) {
+	const std::string mode = Settings::Get().Snapshot().renderMode;
+	return mode == "aether" ? 1 : mode == "compare" ? 2 : 0;
+}

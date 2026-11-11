@@ -23,6 +23,8 @@ public:
 	// ---- render thread
 	void FrameBegin(const HostGfx& host);
 	void FrameEnd(const HostGfx& host);
+	// The scene renderer's frame (render mode aether / compare): after the host drew its cameras, before its UI.
+	void SceneFrame(const HostGfx& host);
 	// Releases everything made on the device. waitMs > 0: first waits that long for the host fence to pass the last
 	// submitted value; if it does not, the objects are leaked on purpose (releasing them could crash the GPU process).
 	void ReleaseDeviceObjects(const HostGfx* host, uint32_t waitMs);
@@ -41,9 +43,29 @@ private:
 	struct Context {
 		ComPtr<ID3D12CommandAllocator> allocator;
 		ComPtr<ID3D12GraphicsCommandList> list;
-		UINT64 fence = 0;
+		UINT64 fence = 0; // Aether's submission serial of the list recorded in it
+		uint32_t index = 0;
 		bool submitted = false;
+		UINT64 hostFence = 0;     // what the host's ExecuteCommandList returned for it
+		uint64_t submitTick = 0;  // acquireTick_ when it was submitted
 	};
+	uint64_t acquireTick_ = 0;
+	struct SubmissionStats { uint64_t submissions = 0, reuses = 0, recordedOnly = 0; UINT64 lastHostFence = 0; double nextLog = 0; } stats_;
+	void LogSubmissionStats(const HostGfx& host, double now);
+	// Aether's own completion clock (docs/architecture/dx12-integration.md, "When is a list done"): every list ends
+	// with a copy of its serial number into a readback buffer, so "the GPU has executed list N" is read from memory
+	// the GPU itself wrote. The host's frame fence is not used for lifetimes.
+	UINT64 Completed();
+	bool EnsureMarkers();
+	ComPtr<ID3D12Resource> markerUpload_, markerReadback_;
+	uint64_t* markerSource_ = nullptr;
+	const volatile uint64_t* markerDone_ = nullptr;
+	uint64_t markerIds_[2] = {0, 0};
+	UINT64 nextSerial_ = 1;
+	UINT64 completedSerial_ = 0;
+	UINT64 markedSerial_ = 0; // newest serial whose marker was seen (and signalled on completionFence_)
+	ComPtr<ID3D12Fence> completionFence_;
+	HostGfx clock_; // the host with Aether's clock in place of its fence: what the scene renderer is given
 	struct TimestampFrame {
 		bool pending = false;
 		uint64_t frame = 0;
@@ -86,6 +108,8 @@ private:
 	ID3D12Device* device_ = nullptr; // the host's (not owned; the host outlives the renderer's device objects)
 	std::string hostName_;
 	uint64_t frame_ = 0;
+	uint64_t sceneFrame_ = 0;
+	DWORD debugCookie_ = 0;
 	uint64_t skippedFrames_ = 0;
 	double lastFrameEnd_ = 0;
 	UINT64 lastSubmittedFence_ = 0;

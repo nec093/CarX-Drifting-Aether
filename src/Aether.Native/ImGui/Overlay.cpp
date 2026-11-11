@@ -5,7 +5,10 @@
 #include "../Diagnostics.h"
 #include "../Profiler/Profiler.h"
 #include "../Renderer/Renderer.h"
+#include "../Renderer/SceneRenderer.h"
+#include "../Resources/GpuResources.h"
 #include "../Resources/ResourceRegistry.h"
+#include "../Scene/SceneStore.h"
 #include "../Runtime.h"
 #include "../Shaders/ShaderManager.h"
 
@@ -348,6 +351,7 @@ std::string Bytes(uint64_t b) {
 struct UiCache {
 	double nextSlow = 0, nextLog = 0, nextManaged = 0;
 	json gpu, scene, materials, renderTextures, managed, shaders;
+	json sceneRenderer, sceneGraph, sceneStore, gpuManager; // Aether's own scene path
 	double sceneAge = -1, materialsAge = -1, rtAge = -1;
 	std::vector<LogEntry> logs;
 	VideoMemory vm;
@@ -514,6 +518,9 @@ void VramTab() {
 		UnityRow("Unity graphics driver memory", kUnityGfxDriverBytes, true);
 		ImGui::EndTable();
 	}
+	if (ImGui::CollapsingHeader("Aether GPU resource manager (descriptors, frame memory, budget)")) {
+		JsonTree("manager", g_ui.gpuManager);
+	}
 	if (ImGui::CollapsingHeader("Unity render targets (HDRP side)")) {
 		if (ImGui::Button("Refresh")) {
 			Runtime::Get().RequestManaged(kRequestRenderTextures);
@@ -590,12 +597,65 @@ void PipelineTab() {
 		}
 		ImGui::EndTable();
 	}
-	ImGui::SeparatorText("Debug views");
-	ImGui::BeginDisabled();
-	int view = 0;
-	ImGui::Combo("View", &view, "None\0Albedo\0Normal\0Roughness\0Metallic\0Depth\0Motion vectors\0Shadow map\0Lighting\0Reflection\0");
-	ImGui::EndDisabled();
-	ImGui::TextDisabled("Debug views need Aether's own G-buffer / lighting passes (Phase 2).");
+	ImGui::SeparatorText("Aether scene renderer");
+	Settings& settings = Settings::Get();
+	SettingsData s = settings.Snapshot();
+	if (ImGui::BeginCombo("Render mode", s.renderMode.c_str())) {
+		for (const std::string& m : RenderModeNames()) {
+			if (ImGui::Selectable(m.c_str(), m == s.renderMode)) {
+				settings.Set("renderMode", m, "overlay");
+			}
+		}
+		ImGui::EndCombo();
+	}
+	ImGui::TextDisabled("hdrp: the game's renderer. aether: Aether's image replaces it. compare: left HDRP, right Aether.");
+	if (ImGui::BeginCombo("Debug view", s.debugView.c_str())) {
+		for (const std::string& v : DebugViewNames()) {
+			if (ImGui::Selectable(v.c_str(), v == s.debugView)) {
+				settings.Set("debugView", v, "overlay");
+			}
+		}
+		ImGui::EndCombo();
+	}
+	bool b = s.shadows;
+	if (ImGui::Checkbox("Sun shadows", &b)) {
+		settings.Set("shadows", b, "overlay");
+	}
+	ImGui::SameLine();
+	b = s.sky;
+	if (ImGui::Checkbox("Sky", &b)) {
+		settings.Set("sky", b, "overlay");
+	}
+	float ev = s.exposureEV;
+	ImGui::SetNextItemWidth(200);
+	ImGui::SliderFloat("Exposure bias (EV)", &ev, -5.0f, 5.0f, "%.2f");
+	if (ImGui::IsItemDeactivatedAfterEdit()) {
+		settings.Set("exposureEV", ev, "overlay");
+	}
+	const json& r = g_ui.sceneRenderer;
+	if (r.is_object() && r.contains("drawCalls")) {
+		if (ImGui::BeginTable("scenestats", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+			KeyValue("Visible instances", Format("%u", r.value("visibleInstances", 0u)));
+			KeyValue("Draw calls (opaque / transparent / shadow)", Format("%u (%u / %u / %u)", r.value("drawCalls", 0u), r.value("opaqueDraws", 0u), r.value("transparentDraws", 0u), r.value("shadowCasterDraws", 0u)));
+			KeyValue("Triangles", Format("%u", r.value("triangles", 0u)));
+			KeyValue("Materials in frame", Format("%u (%u draws with an unsupported material)", r.value("materialsInFrame", 0u), r.value("unsupportedMaterialDraws", 0u)));
+			KeyValue("Pipeline states", Format("%u", r.value("pipelineStates", 0u)));
+			if (r.contains("lights")) {
+				const json& l = r["lights"];
+				KeyValue("Lights", Format("%d directional, %u punctual; %u of %u clusters lit, at most %u lights in one", l.value("directional", 0), l.value("punctual", 0u), l.value("clustersWithLights", 0u), l.value("clusters", 0u), l.value("maxLightsInACluster", 0u)));
+			}
+			if (r.contains("shadows")) {
+				const json& sh = r["shadows"];
+				KeyValue("Shadow cascades", Format("%u x %u px (%s)", sh.value("cascades", 0u), sh.value("cascadeSize", 0u), Bytes(sh.value("atlasBytes", uint64_t(0))).c_str()));
+			}
+			ImGui::EndTable();
+		}
+	} else {
+		ImGui::TextDisabled("Not rendering (render mode hdrp, or no scene camera yet).");
+	}
+	if (ImGui::CollapsingHeader("Render graph (scene)")) {
+		JsonTree("sceneGraph", g_ui.sceneGraph);
+	}
 }
 
 void ShadersTab() {
@@ -643,6 +703,9 @@ void SceneTab() {
 			JsonTree("scene", g_ui.scene);
 		}
 	}
+	if (ImGui::CollapsingHeader("Aether scene (what the native renderer holds)", ImGuiTreeNodeFlags_DefaultOpen)) {
+		JsonTree("aetherScene", g_ui.sceneStore);
+	}
 	if (ImGui::CollapsingHeader("Materials")) {
 		if (g_ui.materials.is_null()) {
 			ImGui::TextDisabled("Not collected yet: press Collect materials (walks every renderer once).");
@@ -673,7 +736,7 @@ void SettingsTab() {
 		}
 		ImGui::EndCombo();
 	}
-	ImGui::TextDisabled("The quality preset is stored now and used by Aether's renderer from Phase 2.");
+	ImGui::TextDisabled("Quality sets the shadow cascades' resolution and distance of Aether's scene renderer.");
 	ImGui::SeparatorText("AI agent (MCP)");
 	static const char* modes[] = {"deny", "ask", "allow"};
 	static const char* modeText[] = {"deny: read only", "ask: every change needs approval here", "allow: changes without asking"};
@@ -771,6 +834,10 @@ void Overlay::BuildUi(UINT width, UINT height) {
 		g_ui.materials = rt.ManagedState("materials", &g_ui.materialsAge);
 		g_ui.renderTextures = rt.ManagedState("renderTextures", &g_ui.rtAge);
 		g_ui.managed = rt.ManagedState("managed");
+		g_ui.sceneRenderer = SceneRenderer::Get().Stats();
+		g_ui.sceneGraph = SceneRenderer::Get().GraphDescription();
+		g_ui.sceneStore = SceneStore::Get().Summary();
+		g_ui.gpuManager = GpuResources::Get().Report();
 	}
 
 	ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);

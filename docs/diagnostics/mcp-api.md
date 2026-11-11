@@ -19,15 +19,15 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 
 | ツール | 入力 | 返すもの |
 |---|---|---|
-| `get_status` | なし | バージョン、レンダラーの状態、GPU、エラー数、前回の異常終了の有無、ゲーム側の情報（Unity、グラフィックス API、HDRP の設定、読み込まれている Mod、HDRP の DX12 修正の状態）。最初に呼ぶ |
+| `get_status` | なし | バージョン、レンダラーの状態、GPU、エラー数、前回の異常終了の有無、ゲーム側の情報（Unity、グラフィックス API、HDRP の設定、読み込まれている Mod、HDRP の DX12 修正の状態）。Phase 2：`renderMode`、`sceneRenderer`（可視インスタンス、ドローコール、三角形、ライトとクラスター、シャドウ）、`managed.sceneCapture`。最初に呼ぶ |
 | `get_gpu_info` | なし | アダプター（ベンダー、名前、デバイス ID、ドライバー、専用 / 共有メモリ）と D3D12 の機能（シェーダーモデル、Resource Binding Tier、Resource Heap Tier、Wave Ops、レイトレーシング、メッシュシェーダー、VRS、Enhanced Barriers、BC 形式）、デバイスの状態 |
 | `get_performance` | `historyFrames`（0〜2000） | FPS、フレーム時間（平均、最小、最大、p50 / p95 / p99）、1% low と 0.1% low、GPU フレーム時間、Aether の CPU / GPU 時間とドローコール、パスごとの時間、Unity の値（メイン / 描画スレッド、Present 待ち、ドローコール、バッチ、三角形） |
-| `get_vram_usage` | なし | プロセスの専用 / 共有メモリと予算（DXGI）、Aether のカテゴリー別、Unity の申告値、Aether 以外の分 |
+| `get_vram_usage` | なし | プロセスの専用 / 共有メモリと予算（DXGI）、Aether のカテゴリー別、Unity の申告値、Aether 以外の分。Phase 2：`aetherManager`（ディスクリプター、フレームメモリ、退役待ち、予算）、`shared`（Unity から借りているメッシュ / テクスチャーのバイト数。Aether の使用量には含めない） |
 | `get_resource_list` | `limit`、`category`、`includeUnityRenderTextures` | Aether のリソース（大きい順）、作成 / 解放の回数と直近のイベント。指定すれば Unity のレンダーターゲットも |
-| `get_render_graph` | なし | パス（順序、読み書き、直近の時間）とリソース |
+| `get_render_graph` | なし | パス（順序、読み書き、直近の時間）とリソース。スキーマ `aether.rendergraph/2`：`sceneGraph`（シーンレンダラーのパスごとの読み書きと状態、ドローコール、三角形、CPU / GPU 時間、一時リソースとプール、検証エラー）、`sceneStats` |
 | `get_shader_errors` | `includeAllShaders` | コンパイルに失敗したシェーダーとコンパイラの出力 |
-| `get_material_info` | `refresh`（既定 true） | シェーダーごとのマテリアル数、レンダラー数、レンダーキュー、透明 / アルファテストの数、キーワード |
-| `get_scene_info` | なし | シーン、カメラ（HDRP の設定つき）、ライト、レンダラー、反射プローブ、HDRP のボリュームとその中身、キャンバス、環境 |
+| `get_material_info` | `refresh`（既定 true）、`detail`：`summary`（既定）/ `survey` / `aether` | `summary`：シェーダーごとのマテリアル数、レンダラー数、レンダーキュー、透明 / アルファテストの数、キーワード。`survey`：シェーダーのプロパティ配置、頂点レイアウト、ライト、HDRP のグローバルテクスチャー（マテリアル変換の設計資料。重い）。`aether`：Aether のマテリアル（クラス、フラグ、数値、束縛テクスチャーの形式とサイズ、未対応プロパティ数）とクラス別の集計 |
+| `get_scene_info` | なし | シーン、カメラ（HDRP の設定つき）、ライト、レンダラー、反射プローブ、HDRP のボリュームとその中身、キャンバス、環境。Phase 2：`aetherScene`（ネイティブ側が持つメッシュ / テクスチャー / マテリアル / インスタンスの数とバイト数、契約違反の数と最後の内容）、`aetherRenderer` |
 | `get_logs` | `limit`、`minSeverity`、`afterSeq`、`component` | 構造化ログ。`lastSeq` を次の `afterSeq` に渡すと新しい分だけ |
 | `get_crash_report` | なし | 今回のセッションの障害レポート、前回のレポート、前回が正常終了でなかったか |
 | `get_settings` | なし | 設定値とそのスキーマ、切り替えられる描画機能、画質プリセット |
@@ -37,8 +37,9 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 
 | ツール | 入力 | すること |
 |---|---|---|
-| `set_render_quality` | `quality`：`low` / `medium` / `high` / `ultra` | 画質プリセットを設定（現在は保存のみ。Phase 2 のレンダラーが使う） |
-| `set_render_feature` | `feature`、`enabled` | 描画機能の切り替え（`get_settings` の `renderFeatures`：現在 `testTriangle`、`gpuTiming`） |
+| `set_render_quality` | `quality`：`low` / `medium` / `high` / `ultra` | 画質プリセットを設定（シーンレンダラーのシャドウカスケードの解像度と距離） |
+| `set_render_mode` | `mode`：`hdrp` / `aether` / `compare`、`debugView`（省略可）：`none` / `albedo` / `normal` / `roughness` / `metallic` / `depth` / `lighting` / `shadow` / `materialClass` | 描画モードとデバッグ表示を切り替える。`hdrp`：ゲームのレンダラーのみ（シーンキャプチャ停止）。`aether`：Aether の絵で置き換える（UI は残る）。`compare`：左半分 HDRP、右半分 Aether |
+| `set_render_feature` | `feature`、`enabled` | 描画機能の切り替え（`get_settings` の `renderFeatures`：`testTriangle`、`gpuTiming`、`shadows`、`sky`） |
 | `reload_shader` | なし | シェーダーをディスクから読み直してパイプラインを作り直し、コンパイラの出力を返す |
 | `capture_frame` | `withOverlay`、`includeImage` | 次のフレームを PNG に保存してパスを返す（`includeImage` で画像も） |
 | `capture_render_graph` | なし | レンダーグラフを JSON ファイルに保存 |

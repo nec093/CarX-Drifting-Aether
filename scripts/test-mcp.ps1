@@ -76,7 +76,7 @@ try {
 	$init = Send $mcp 'initialize' @{ protocolVersion = '2025-06-18'; capabilities = @{}; clientInfo = @{ name = 'test'; version = '0' } }
 	Check 'initialize' ($init.result.serverInfo.name -eq 'aether' -and $init.result.protocolVersion -eq '2025-06-18')
 	$tools = (Send $mcp 'tools/list' $null).result.tools
-	Check "tools/list ($($tools.Count) tools, each with input and output schema)" ($tools.Count -eq 19 -and @($tools | Where-Object { -not $_.inputSchema -or -not $_.outputSchema }).Count -eq 0)
+	Check "tools/list ($($tools.Count) tools, each with input and output schema)" ($tools.Count -eq 20 -and @($tools | Where-Object { -not $_.inputSchema -or -not $_.outputSchema }).Count -eq 0)
 
 	$r = Call $mcp 'get_status'
 	Check 'get_status' (-not $r.isError -and $r.structuredContent.renderer.state -eq 'ready') ($r.content[0].text)
@@ -91,7 +91,7 @@ try {
 	$r = Call $mcp 'get_render_graph'
 	Check "get_render_graph ($($r.structuredContent.passes.Count) passes)" (-not $r.isError -and ($r.structuredContent.passes | Where-Object name -eq 'Overlay').lastFrame.executed)
 	$r = Call $mcp 'get_shader_errors' @{ includeAllShaders = $true }
-	Check 'get_shader_errors (none)' (-not $r.isError -and $r.structuredContent.errorCount -eq 0 -and $r.structuredContent.all.shaders.Count -eq 2)
+	Check 'get_shader_errors (none)' (-not $r.isError -and $r.structuredContent.errorCount -eq 0 -and $r.structuredContent.all.shaders.Count -ge 2)
 	$r = Call $mcp 'get_logs' @{ limit = 20; minSeverity = 'info' }
 	Check "get_logs ($($r.structuredContent.count) entries)" (-not $r.isError -and $r.structuredContent.count -gt 3 -and $r.structuredContent.entries[0].timestamp)
 	$r = Call $mcp 'get_crash_report'

@@ -14,7 +14,7 @@
 - Unity のゲームロジック、物理、シーン管理、入力は維持する。Aether が受け持つのは描画と計測・診断。
 - HDRP は最初から止めない。並行で動かして比較し、段階的に置き換える。
 - AI（MCP）には GPU デバイスやリソースの寿命を直接触らせない。操作は検証済みの入口だけを通す。
-- 開発は 4 つの大フェーズ（README と `docs/architecture/overview.md`）。現在は Phase 1。
+- 開発は 4 つの大フェーズ（README と `docs/architecture/overview.md`）。現在は Phase 2（独自のシーンレンダラーが HDRP と並行して動く。結果は `docs/development/phase2-report.md`）。
 
 ## 3. 遵守事項
 
@@ -41,7 +41,7 @@
 | 配置（ゲームを閉じて） | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\deploy.ps1` |
 | テストホスト | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-host.ps1`（`HOST OK`） |
 | MCP の結合テスト | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-mcp.ps1`（`MCP TEST OK`） |
-| ゲームの起動 / 終了 | `scripts\launch-game.ps1`（Steam 経由、`-force-d3d12`）、`scripts\launch-game.ps1 -Stop` |
+| ゲームの起動 / 終了 | `scripts\launch-game.ps1`（Steam 経由、`-force-d3d12`。`-DebugLayer` で D3D12 デバッグレイヤー）、`scripts\launch-game.ps1 -Stop` |
 | ゲーム内の状態を読む | `scripts\mcp-call.ps1 <tool> [key=value ...] [-AllowControl]` |
 
 テストの方針：
@@ -55,9 +55,10 @@
 
 `docs/architecture/dx12-integration.md` の「守っている規則」が正。要点：
 
-- D3D12 のオブジェクトに触るのは Unity の描画スレッドだけ。コマンドリストは `IUnityGraphicsD3D12v7::ExecuteCommandList` で Unity に渡し、Unity のリソースの状態は `states` で宣言する（勝手に遷移させない）。
+- D3D12 のオブジェクトに触るのは Unity の描画スレッドだけ。コマンドリストは `IUnityGraphicsD3D12v7::ExecuteCommandList` で Unity に渡す。**渡すのは、キューへのアクセスを許可した設定（`kUnityD3D12GraphicsQueueAccess_Allow`）のイベントの中だけ。** Unity のリソース（バックバッファー、借りているメッシュやテクスチャー）の状態は変えず、`states` も渡さない。
 - バックバッファーへの参照をフレームをまたいで持たない。
-- コマンドリスト、アロケーター、オーバーレイのバッファーは、フレームフェンスが該当の値を超えてから再利用する。
+- リソースの寿命の時計は Aether 自身の完了マーカー（`Renderer::Completed()`）。Unity のフレームフェンスだけを信用しない（提出が別スレッドなので、返された値が実行の完了を保証しない）。コマンドリストは、完了の確認に加えて Unity のフェンスの通過と一定回数の提出を待ってから再利用する。
+- Scene Data Contract（`include/SceneContract.h` と `SceneCapture/Contract.cs`）を変えたら両方を直し、`AE_SCENE_CONTRACT_VERSION` を上げる。
 - 失敗したら Aether だけが止まり、ゲームは動き続ける。原因はログとクラッシュレポートに残す。
 - 解放は GPU が終わったと確認できてから。確認できなければ解放しない。
 - グローバルなフック（Present、D3D12、DXGI）を入れない。
@@ -81,7 +82,11 @@
 - ImGui の Win32 バックエンドは、実カーソルがウィンドウ外にあると即座にマウス離脱扱いにする。投稿メッセージ（`PostMessage`）でのマウス操作の検証はできない（F10 の `WM_KEYDOWN` は効く）。
 - Unity のビルド用プロジェクトはリポジトリの外（`%USERPROFILE%\Aether-Unity`）。Documents 配下は Unity が書き込めないことがある。
 - ゲームのウィンドウを閉じた後、プロセスが残ることがある（HDRP が構築できていない DX12 の状態で数分動かした後。Aether を読み込んでいない起動でも発生）。HDRP が正常な状態では約 17 秒で終了する。
-- 開発は 4 つの大フェーズ。Phase 1 の結果は `docs/development/phase1-report.md`。
+- 開発は 4 つの大フェーズ。Phase 1 の結果は `docs/development/phase1-report.md`、Phase 2 は `docs/development/phase2-report.md`。
+- D3D12 のデバッグレイヤーのメッセージは Unity の `Player.log` には出ない。Aether がコールバックで自分のログに写す（`E_D3D12_VALIDATION` / `E_D3D12_CORRUPTION`）。ゲーム内の検証は `launch-game.ps1 -DebugLayer` で起動して `get_logs` を読む。
+- Unity のクラッシュダンプは `%LOCALAPPDATA%\Temp\CarX Technologies\Drift Racing Online\Crashes\`。例外コード `0x87D` はデバッグレイヤーが破損を検出して投げた例外。
+- ガレージの HDRP の値：太陽 100 lux、露出は固定、トーンマッピングなし。空は `_SkyTexture`（CubemapArray 512、RGBA16F）、露出は `_ExposureTexture`（1x1）。
+- マテリアルの構成はガレージで 13 シェーダー（`docs/architecture/material-translation.md`）。コースは未調査。
 - .NET Framework のリフレクションではゲームの HDRP アセンブリの型を読み込めない（既定インターフェースメソッド）。メタデータを読む（`System.Reflection.Metadata`）。
 
 ## 7. 場所

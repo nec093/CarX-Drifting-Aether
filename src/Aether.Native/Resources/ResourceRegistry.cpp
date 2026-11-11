@@ -1,4 +1,5 @@
 #include "ResourceRegistry.h"
+#include "../Core/Log.h"
 
 #include <algorithm>
 
@@ -69,6 +70,8 @@ void ResourceRegistry::Unregister(uint64_t id, uint64_t frame) {
 	std::lock_guard lock(mutex_);
 	auto it = std::find_if(records_.begin(), records_.end(), [&](const ResourceRecord& r) { return r.id == id; });
 	if (it == records_.end()) {
+		// every id is handed out once and unregistered once: a second time means two owners released the same resource
+		AE_LOG_CODE(Error, "Resources", "E_LIFETIME", "Resource id %llu was unregistered twice (double release) at frame %llu", static_cast<unsigned long long>(id), static_cast<unsigned long long>(frame));
 		return;
 	}
 	++releases_;

@@ -35,6 +35,11 @@ add_library(aether_core STATIC
 	Core/Config.cpp
 	Device/GpuInfo.cpp
 	Resources/ResourceRegistry.cpp
+	Resources/GpuResources.cpp
+	Scene/SceneStore.cpp
+	Renderer/RenderGraph.cpp
+	Renderer/GpuTimer.cpp
+	Renderer/SceneRenderer.cpp
 	Profiler/Profiler.cpp
 	Shaders/ShaderManager.cpp
 	Renderer/Renderer.cpp
@@ -58,5 +63,5 @@ target_include_directories(AetherNative PRIVATE "${UNITY_PLUGIN_API_DIR}")
 target_link_libraries(AetherNative PRIVATE aether_core)
 
 # the test host: Aether on a window with its own device, no game needed
-add_executable(AetherHost "${AETHER_ROOT}/tests/host/HostMain.cpp")
+add_executable(AetherHost "${AETHER_ROOT}/tests/host/HostMain.cpp" "${AETHER_ROOT}/tests/host/ValidationScene.cpp")
 target_link_libraries(AetherHost PRIVATE aether_core)

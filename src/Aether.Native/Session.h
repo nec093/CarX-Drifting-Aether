@@ -18,6 +18,8 @@ bool Dead();
 // Host render thread. All guarded: a C++ exception or a structured exception inside stops Aether, not the game.
 void FrameBegin(const HostGfx& host);
 void FrameEnd(const HostGfx& host);
+// Host render thread, after the host's cameras and before its UI: Aether's scene renderer.
+void SceneFrame(const HostGfx& host);
 // Host render thread, with the host's pending command lists flushed: frees Aether's device objects once the GPU is idle.
 void ReleaseOnRenderThread(const HostGfx& host, uint32_t waitMs);
 // Any thread: waits until ReleaseOnRenderThread has run since Start (false on timeout).

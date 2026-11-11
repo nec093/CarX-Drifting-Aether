@@ -17,7 +17,7 @@ std::atomic<bool> g_started{false}, g_stopping{false}, g_dead{false};
 std::mutex g_frameMutex; // one frame entry point at a time (and never during Stop)
 HANDLE g_released = nullptr; // manual-reset event: device objects were released on the render thread
 
-enum Entry { kBegin, kEnd, kRelease };
+enum Entry { kBegin, kEnd, kRelease, kScene };
 
 void Body(Entry entry, const HostGfx* host, uint32_t waitMs) {
 	std::lock_guard lock(g_frameMutex);
@@ -33,6 +33,11 @@ void Body(Entry entry, const HostGfx* host, uint32_t waitMs) {
 	case kEnd:
 		if (!g_stopping.load()) {
 			Renderer::Get().FrameEnd(*host);
+		}
+		break;
+	case kScene:
+		if (!g_stopping.load()) {
+			Renderer::Get().SceneFrame(*host);
 		}
 		break;
 	case kRelease:
@@ -149,6 +154,12 @@ void FrameBegin(const HostGfx& host) {
 void FrameEnd(const HostGfx& host) {
 	if (g_started.load() && !g_dead.load() && !g_stopping.load()) {
 		Guarded(kEnd, &host, 0);
+	}
+}
+
+void SceneFrame(const HostGfx& host) {
+	if (g_started.load() && !g_dead.load() && !g_stopping.load()) {
+		Guarded(kScene, &host, 0);
 	}
 }
 

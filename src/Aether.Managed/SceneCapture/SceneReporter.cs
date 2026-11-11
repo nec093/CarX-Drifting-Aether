@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using KSL.API;
@@ -39,6 +39,9 @@ namespace Aether {
 			if ((requests & Native.RequestMaterials) != 0) {
 				Guarded("materials", Materials);
 			}
+			if ((requests & Native.RequestSurvey) != 0) {
+				Guarded("survey", RenderSurvey.Build);
+			}
 			if ((requests & Native.RequestRenderTextures) != 0) {
 				Guarded("renderTextures", RenderTextures);
 			}
@@ -55,9 +58,10 @@ namespace Aether {
 
 		// ---- the game, Unity, the render pipeline, the other mods
 
-		public string GameInfo(string status) {
+		public string GameInfo(string status, string sceneCapture) {
 			var j = new Json().BeginObject();
 			j.Add("aetherStatus", status);
+			j.Add("sceneCapture", sceneCapture);
 			j.Add("nativeLoad", Native.LoadStrategy);
 			j.Add("hdrpDx12Fix", HdrpDx12Fix.Status);
 			j.Add("gamePassesDx12", GameDx12Workarounds.Status);

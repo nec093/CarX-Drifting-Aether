@@ -1,4 +1,4 @@
-﻿// The runtime's API: what an MCP tool call turns into. Read methods answer from snapshots. Control methods go through
+// The runtime's API: what an MCP tool call turns into. Read methods answer from snapshots. Control methods go through
 // Authorize (the MCP server's --allow-control switch, the mcpControl setting, the in-game approval) and then through
 // the same validated entry points the overlay uses. Nothing here touches the device or a resource's lifetime.
 #include "PipeServer.h"
@@ -8,6 +8,9 @@
 #include "../Diagnostics.h"
 #include "../Profiler/Profiler.h"
 #include "../Renderer/Renderer.h"
+#include "../Renderer/SceneRenderer.h"
+#include "../Resources/GpuResources.h"
+#include "../Scene/SceneStore.h"
 #include "../Resources/ResourceRegistry.h"
 #include "../Runtime.h"
 #include "../Shaders/ShaderManager.h"
@@ -181,9 +184,29 @@ json HandleRequest(const json& request) {
 		return Ok(id, out);
 	}
 	if (method == "get_material_info") {
-		bool refresh;
-		if (!GetBool(params, "refresh", true, refresh, error)) {
+		bool refresh = true;
+		std::string detail;
+		if (!GetBool(params, "refresh", true, refresh, error) || !GetString(params, "detail", "summary", detail, error)) {
 			return Fail(id, error);
+		}
+		if (detail == "survey") {
+			// shader property layouts with sample values, vertex layouts, lights, environment (a heavier walk)
+			bool refreshed = refresh && rt.RefreshManaged(kRequestSurvey, "survey", 10000);
+			return Ok(id, WithAge("survey", refreshed));
+		}
+		if (detail == "aether") {
+			// what Aether's translation made of the materials (class, flags, bound textures, unmapped properties)
+			long long limit = 0;
+			if (!GetInt(params, "limit", 1, 600, 200, limit, error)) {
+				return Fail(id, error);
+			}
+			json summary = SceneStore::Get().Summary();
+			return Ok(id, {{"available", summary.contains("materials")}, {"summary", summary.contains("materials") ? summary["materials"] : json(nullptr)},
+				{"materials", SceneStore::Get().MaterialReport(size_t(limit))},
+				{"note", "Filled while the render mode is aether or compare. class unsupported = drawn with the diagnostic material."}});
+		}
+		if (detail != "summary") {
+			return Fail(id, {"E_INVALID_PARAMS", "detail must be summary, survey or aether"});
 		}
 		bool refreshed = refresh && rt.RefreshManaged(kRequestMaterials, "materials", 5000);
 		return Ok(id, WithAge("materials", refreshed));
@@ -192,6 +215,9 @@ json HandleRequest(const json& request) {
 		bool refreshed = rt.RefreshManaged(kRequestScene, "scene", 2000);
 		json out = WithAge("scene", refreshed);
 		out["game"] = rt.ManagedState("managed");
+		// what Aether's own renderer captured and drew (render mode aether / compare)
+		out["aetherScene"] = SceneStore::Get().Summary();
+		out["aetherRenderer"] = SceneRenderer::Get().Stats();
 		return Ok(id, out);
 	}
 	if (method == "get_logs") {
@@ -276,6 +302,34 @@ json HandleRequest(const json& request) {
 			return Fail(id, {"E_INVALID_PARAMS", why});
 		}
 		return Ok(id, {{"feature", feature}, {"enabled", enabled}});
+	}
+	if (method == "set_render_mode") {
+		std::string mode, debugView;
+		if (!GetString(params, "mode", "", mode, error) || !GetString(params, "debugView", "", debugView, error)) {
+			return Fail(id, error);
+		}
+		const auto& modes = RenderModeNames();
+		const auto& views = DebugViewNames();
+		if (!mode.empty() && std::find(modes.begin(), modes.end(), mode) == modes.end()) {
+			return Fail(id, {"E_INVALID_PARAMS", "mode must be one of: hdrp, aether, compare"});
+		}
+		if (!debugView.empty() && std::find(views.begin(), views.end(), debugView) == views.end()) {
+			return Fail(id, {"E_INVALID_PARAMS", "debugView must be one of: none, albedo, normal, roughness, metallic, depth, lighting, shadow, materialClass"});
+		}
+		if (mode.empty() && debugView.empty()) {
+			return Fail(id, {"E_INVALID_PARAMS", "give mode, debugView or both"});
+		}
+		if (!Authorize(request, method, params, error)) {
+			return Fail(id, error);
+		}
+		if (!mode.empty()) {
+			Settings::Get().Set("renderMode", mode, "mcp");
+		}
+		if (!debugView.empty()) {
+			Settings::Get().Set("debugView", debugView, "mcp");
+		}
+		SettingsData now = Settings::Get().Snapshot();
+		return Ok(id, {{"mode", now.renderMode}, {"debugView", now.debugView}, {"note", "hdrp: the game's renderer. aether: Aether's image replaces it (the UI stays). compare: left half HDRP, right half Aether."}});
 	}
 	if (method == "reload_shader") {
 		if (!Authorize(request, method, params, error)) {

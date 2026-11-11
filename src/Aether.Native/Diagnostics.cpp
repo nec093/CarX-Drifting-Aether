@@ -5,6 +5,9 @@
 #include "ImGui/Overlay.h"
 #include "Profiler/Profiler.h"
 #include "Renderer/Renderer.h"
+#include "Renderer/SceneRenderer.h"
+#include "Resources/GpuResources.h"
+#include "Scene/SceneStore.h"
 #include "Resources/ResourceRegistry.h"
 #include "Runtime.h"
 #include "Shaders/ShaderManager.h"
@@ -39,6 +42,9 @@ json BuildStatus() {
 	j["aetherResourceBytes"] = ResourceRegistry::Get().TotalBytes();
 	j["previousSessionEndedUncleanly"] = rt.PreviousSessionCrashed();
 	j["mcpControl"] = Settings::Get().Snapshot().mcpControl;
+	j["phase"] = 2;
+	j["renderMode"] = Settings::Get().Snapshot().renderMode;
+	j["sceneRenderer"] = SceneRenderer::Get().Stats();
 	double age = -1;
 	json managed = rt.ManagedState("managed", &age);
 	j["managed"] = managed; // what the C# mod reported about itself (KSL, Unity, graphics API, HDRP)
@@ -106,6 +112,17 @@ json BuildVramReport() {
 	unity["source"] = "Unity ProfilerRecorder / Texture statistics (only the counters this build of the game exposes)";
 	j["unity"] = unity;
 
+	// Phase 2: the resource manager's own accounting, and what Aether only borrows from Unity
+	j["aetherManager"] = GpuResources::Get().Report();
+	{
+		json scene = SceneStore::Get().Summary();
+		j["shared"] = {
+			{"meaning", "Unity's mesh buffers and textures that Aether's renderer references without copying. Unity's memory: already counted in unity / notAether, not in aether."},
+			{"meshBytes", scene.contains("meshes") ? scene["meshes"].value("sharedBytes", uint64_t(0)) : uint64_t(0)},
+			{"textureBytes", scene.contains("textures") ? scene["textures"].value("sharedBytes", uint64_t(0)) : uint64_t(0)},
+			{"textures", scene.contains("textures") ? scene["textures"] : json(nullptr)},
+		};
+	}
 	if (vm.valid) {
 		j["notAether"] = {
 			{"dedicatedBytes", vm.localUsage > aetherGpu ? vm.localUsage - aetherGpu : 0},

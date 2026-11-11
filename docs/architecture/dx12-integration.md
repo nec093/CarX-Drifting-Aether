@@ -15,7 +15,7 @@ Unity Native Plugin Interface の `IUnityGraphicsD3D12v7`（Unity 2023.2 のエ�
 | `ID3D12CommandQueue` | `GetCommandQueue()` |
 | `IDXGISwapChain` | `GetSwapChain()`（毎フレーム問い合わせる） |
 | コマンドリストの実行と状態の受け渡し | `ExecuteCommandList(list, stateCount, states)` |
-| 実行完了の判定 | `GetFrameFence()` の完了値と、`ExecuteCommandList` が返したフェンス値 |
+| 実行完了の判定 | Aether 自身の完了マーカーとフェンス（下の「完了の判定」。Unity のフレームフェンスは使わない） |
 
 ### Unity にプラグインとして読み込ませる
 
@@ -31,11 +31,16 @@ Mod は起動時、最初の P/Invoke の前に、`kino\mods\Aether\native\Aethe
 ```
 メインスレッド（C#）                         Unity の描画スレッド（AetherNative）
 Update:  GL.IssuePluginEvent(FRAME_BEGIN) ─▶ GPU タイムスタンプ 1 個のリストを ExecuteCommandList
-         （ゲームの 1 フレーム：HDRP のカメラ、UI）
+         （HDRP がゲームのカメラを描く）
+endContextRendering（画面のカメラ）:
+         シーンのフレームを渡す（Scene Data Contract）
+         GL.IssuePluginEvent(SCENE)       ─▶ シーンの変更を適用、Forward+ の 1 フレームを記録（aether / compare のとき）
+                                             ExecuteCommandList(list, 0, null)
+         （ゲームのオーバーレイ UI）
 WaitForEndOfFrame:
          GL.IssuePluginEvent(FRAME_END)   ─▶ バックバッファーを取得
                                              テスト三角形 → オーバーレイ →（要求があれば）キャプチャ
-                                             ExecuteCommandList(list, {backBuffer, RENDER_TARGET, RENDER_TARGET})
+                                             ExecuteCommandList(list, 0, null)
                                            Unity が PRESENT へ遷移して Present
 ```
 
@@ -44,20 +49,44 @@ WaitForEndOfFrame:
 | イベント | `graphicsQueueAccess` | `flags` | 理由 |
 |---|---|---|---|
 | `FRAME_BEGIN` | `DontCare` | 0 | タイムスタンプのリストを渡すだけ |
-| `FRAME_END`、`SHUTDOWN` | `Allow` | `FlushCommandBuffers \| SyncWorkerThreads` | Unity がそれまでに記録した描画（UI を含む）を先に提出させ、Aether のパスがその上に載るようにする。Dear ImGui のバックエンドがフォントのテクスチャーをキューに直接アップロードするあいだ、Unity のワーカーをキューから外す |
+| `FRAME_END`、`SHUTDOWN`、`SCENE` | `Allow` | `FlushCommandBuffers \| SyncWorkerThreads` | Unity がそれまでに記録した描画（UI を含む）を先に提出させ、Aether のパスがその上に載るようにする。Dear ImGui のバックエンドがフォントのテクスチャーをキューに直接アップロードするあいだ、Unity のワーカーをキューから外す |
 
 ゲームの設定は `gfx-threading-mode=6`（`NativeGraphicsJobsSplitThreading`）で、記録と提出が別スレッドです。上の設定で、オーバーレイが HDRP の絵と UI の上に描かれることをゲーム内のキャプチャで確認しています。
 
 ## 守っている規則
 
-1. **Unity のリソースの状態を勝手に変えない。** バックバッファーは `ExecuteCommandList` の `states` で「入口 RENDER_TARGET、出口 RENDER_TARGET」と宣言し、遷移は Unity に任せる。リストの中で一時的に変える場合（キャプチャの `COPY_SOURCE`）は必ず元に戻す。
+1. **Unity のリソースの状態を変えない。宣言もしない。** バックバッファーは、Aether のイベントが来る時点（シーンのイベントもフレーム末尾も）で RENDER_TARGET になっている（デバッグレイヤーで確認）。Aether はそのまま描き、状態を変えずに返す。`ExecuteCommandList` の `states` は使わない（0 個）。リストの中で一時的に変える場合（キャプチャの `COPY_SOURCE`）は必ず元に戻す。Unity から借りているメッシュバッファーとテクスチャーは読むだけ。起動直後の数フレームはバックバッファーがまだ RENDER_TARGET でないことがあるので、最初の 8 フレームは何も描かない。
 2. **バックバッファーへの参照をフレームをまたいで持たない。** 毎フレーム `GetBuffer` し、提出したら手放す（`ResizeBuffers` を妨げない）。テストホストはリサイズで確認している。
-3. **コマンドリストとアロケーターは、返されたフェンス値をフレームフェンスが超えてから再利用する。** 空きがなければ新しく作り（上限 16）、それでも無ければそのフレームは描かない。
+3. **コマンドリストとアロケーターは、(a) Aether 自身がそのリストの完了を確認し（下の「完了の判定」）、(b) Unity のフレームフェンスが `ExecuteCommandList` の返した値を超え、(c) その後 24 回の提出が過ぎてから再利用する。** 空きがなければ新しく作り（上限 48）、それでも無ければそのフレームは描かない。
 4. **オーバーレイのバッファー**（Dear ImGui のバックエンドが `NumFramesInFlight` ごとに使い回す）も同じ規則で、古い描画が終わっていなければそのフレームのオーバーレイを飛ばす。
 5. **失敗したら Aether だけが止まる。** HRESULT の失敗は `Renderer::Fail`（原因、デバイス削除理由、取れれば DRED、GPU 情報、ログの末尾をクラッシュレポートに書く）で以後の描画を止める。描画スレッドの入口は構造化例外と C++ 例外を受け止める（`Session.cpp`）。ゲームは動き続ける。
 6. **解放は GPU が終わってから。** 終了時は `SHUTDOWN` イベント（描画スレッド、Unity の保留分を提出済み）で、Aether 自身のフェンスをキューに `Signal` して待ち、それから解放する。確認できないとき（描画スレッドが応答しない、障害の後）は解放せずに放置する（解放して GPU を落とすよりよい）。
 7. **グローバルなフックを入れない。** 入力はゲームのウィンドウのサブクラス化（終了時に戻す）だけ。Present、D3D12、DXGI のフックは無い。
 
+## 完了の判定（Phase 2 で変更）
+
+Phase 1 は「`ExecuteCommandList` が返したフェンス値を Unity のフレームフェンスが超えたら完了」としていました。
+ゲームの設定（`NativeGraphicsJobsSplitThreading`：記録と提出が別スレッド）では、これが成り立ちません。
+シーンのリストを毎フレーム出すようになって、デバッグレイヤーが
+`ID3D12CommandAllocator::Reset: ... is being reset before previous executions associated with the allocator have completed`
+を報告し、続いてデバイスが `DXGI_ERROR_DEVICE_HUNG` で失われました（Unity が返す値は、そのリストが実際にキューへ入る前に完了扱いになることがある）。
+
+現在の方式（`Renderer::Submit` / `Renderer::Completed`）は 2 段階です。
+
+1. **完了マーカー**：Aether のリストは必ず最後に `CopyBufferRegion` で自分の通し番号を読み戻しバッファーへ書く。CPU がその番号を読めたら、Unity が実際にそのリストをキューへ入れ、GPU が最後まで実行したことになる。
+2. **自前のフェンス**：マーカーを確認した番号を、Unity のキューに対して Aether のフェンスで `Signal` する。この `Signal` はそのリストより後ろに並ぶので、フェンスがその値になれば D3D12 ランタイムから見ても実行は完了している（マーカーだけだと、GPU の書き込みとランタイムの完了通知のわずかな差をデバッグレイヤーに指摘される）。
+
+`Completed()` が返す通し番号が、アロケーターの再利用、アップロードアリーナ、ディスクリプター範囲、退役キュー（Unity から借りた参照を含む）、タイムスタンプとキャプチャの回収、オーバーレイのバッファー、終了時の待機、すべての時計です。Unity のフレームフェンスは、コマンドリストの再利用の追加条件にだけ使います（規則 3）。
+
+## ゲーム内のデバッグレイヤー（未解決の問題あり）
+
+Aether 自身の検証エラーは 0 件ですが、デバッグレイヤーを有効にして Aether がリストを提出していると、起動後 141〜271 秒で Unity が
+`CopyTextureRegion: pResource in the first parameter is corrupt` を出して落ちます。原因は未特定です。実験の一覧と仮説は `docs/development/phase2-report.md` の 1 章。
+
+## デバッグレイヤーのメッセージ
+
+デバイスに `ID3D12InfoQueue1` があれば（デバッグレイヤーが有効なら）メッセージコールバックを登録し、エラーと破損を Aether のログに
+`E_D3D12_VALIDATION` / `E_D3D12_CORRUPTION` として書きます（`get_logs` で読める）。Unity の `Player.log` には D3D12 のメッセージは出ません。
 ## PoC の結果（ゲーム内、2026-11-11、RTX 4070 Ti、1920x1080 ウィンドウ）
 
 | 確認項目 | 結果 |
@@ -74,7 +103,7 @@ WaitForEndOfFrame:
 | 他のフックとの共存 | ゲームのフォルダーに別 Mod の `dxgi.dll`（スワップチェーンのラッパー）がある状態で動作 |
 
 テストホスト（`tests/host`、D3D12 デバッグレイヤー有効）では、同じランタイムで D3D12 のエラー 0、終了後のデバイス参照 0 を確認しています。
-ゲーム内でのデバッグレイヤー（`-force-d3d12-debug`）での確認はまだ行っていません。
+ゲーム内のデバッグレイヤー（`-force-d3d12-debug`、`scripts\launch-game.ps1 -DebugLayer`）での結果は下の「ゲーム内のデバッグレイヤー」。
 
 ## ゲームは DX12 だけでは描画できない（PoC で見つかった問題）
 

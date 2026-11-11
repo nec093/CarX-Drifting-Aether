@@ -1,4 +1,5 @@
 #include "Runtime.h"
+#include "Core/DevOptions.h"
 #include "Core/Config.h"
 #include "Core/Log.h"
 #include "Device/GpuInfo.h"
@@ -63,6 +64,10 @@ void Runtime::Initialize(const std::wstring& dataDir, const std::wstring& config
 	MoveFileExW((logs + L"\\crash-current.json").c_str(), (logs + L"\\crash-previous.json").c_str(), MOVEFILE_REPLACE_EXISTING);
 
 	Settings::Get().Load(configDir + L"\\aether.json");
+	DevOptions::Get().Load(configDir);
+	if (DevOptions::Get().source != "defaults") {
+		Log::Get().Write(Severity::Warning, "Runtime", "W_DEV_OPTIONS", "Experiment switches are active (dev-options.json in the config folder)", {}, DevOptions::Get().ToJson());
+	}
 	{
 		std::lock_guard lock(workerMutex_);
 		workerStop_ = false;

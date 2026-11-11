@@ -1,5 +1,8 @@
 #include "Renderer.h"
+#include "../Core/DevOptions.h"
 #include "Png.h"
+#include "SceneRenderer.h"
+#include "../Scene/SceneStore.h"
 #include "../Core/Log.h"
 #include "../Device/GpuInfo.h"
 #include "../ImGui/Overlay.h"
@@ -8,10 +11,12 @@
 #include "../Shaders/ShaderManager.h"
 
 #include <algorithm>
+#include <d3d12sdklayers.h>
 
 namespace aether {
 
-static const size_t kMaxContexts = 16;
+static const size_t kMaxContexts = 48;
+static const uint64_t kReuseDelay = 24; // submissions (about 8 frames at 3 lists a frame) before a list object is handed to the host again
 static const char* kPassNames[] = {"TestTriangle", "Overlay", "FrameCapture"};
 
 Renderer& Renderer::Get() {
@@ -29,6 +34,17 @@ static DXGI_FORMAT ViewFormat(DXGI_FORMAT f) {
 	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
 	default: return f;
 	}
+}
+
+// With the D3D12 debug layer on (the game started with -force-d3d12-debug, or the test host), its messages go into
+// Aether's log: Unity's Player.log only says that the device was removed, not why.
+static std::atomic<int> g_debugMessages{0};
+static void CALLBACK OnDebugMessage(D3D12_MESSAGE_CATEGORY category, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, LPCSTR description, void*) {
+	if (severity > D3D12_MESSAGE_SEVERITY_ERROR || g_debugMessages.fetch_add(1) >= 60) {
+		return;
+	}
+	Log::Get().Write(Severity::Error, "D3D12", severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "E_D3D12_CORRUPTION" : "E_D3D12_VALIDATION", description ? description : "", {},
+		{{"messageId", int(id)}, {"category", int(category)}});
 }
 
 const SettingsData& Renderer::CurrentSettings() {
@@ -101,6 +117,15 @@ bool Renderer::EnsureDevice(const HostGfx& host) {
 	device_ = host.device;
 	hostName_ = host.name;
 	GpuInfo::Get().Capture(device_);
+	{
+		ComPtr<ID3D12InfoQueue1> infoQueue;
+		if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
+			debugCookie_ = 0;
+			if (SUCCEEDED(infoQueue->RegisterMessageCallback(OnDebugMessage, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &debugCookie_))) {
+				AE_LOG(Info, "Renderer", "The D3D12 debug layer is on: its errors are copied into this log");
+			}
+		}
+	}
 
 	D3D12_DESCRIPTOR_HEAP_DESC rtv = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
 	HRESULT hr = device_->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&rtvHeap_));
@@ -145,6 +170,9 @@ bool Renderer::EnsureDevice(const HostGfx& host) {
 		t = TimestampFrame();
 	}
 	tsCurrent_ = -1;
+	clock_ = host;
+	clock_.completedFenceValue = [this]() -> UINT64 { return Completed(); };
+	clock_.nextFenceValue = [this]() -> UINT64 { return nextSerial_; };
 	ready_.store(true);
 	AE_LOG(Info, "Renderer", "Device objects ready on the %s device (timestamp frequency %llu Hz)", host.name, static_cast<unsigned long long>(tsFrequency_));
 	return true;
@@ -232,12 +260,87 @@ bool Renderer::BuildPipelines() {
 	return true;
 }
 
+bool Renderer::EnsureMarkers() {
+	if (markerDone_) {
+		return true;
+	}
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc.Width = kMaxContexts * sizeof(uint64_t);
+	desc.Height = 1;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	D3D12_HEAP_PROPERTIES upload = {D3D12_HEAP_TYPE_UPLOAD}, readback = {D3D12_HEAP_TYPE_READBACK};
+	HRESULT hr = device_->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&markerUpload_));
+	if (SUCCEEDED(hr)) {
+		hr = device_->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&markerReadback_));
+	}
+	void* source = nullptr;
+	void* done = nullptr;
+	if (SUCCEEDED(hr)) hr = markerUpload_->Map(0, nullptr, &source);
+	if (SUCCEEDED(hr)) hr = markerReadback_->Map(0, nullptr, &done);
+	if (FAILED(hr)) {
+		Fail("E_DEVICE_OBJECTS", "The completion marker buffers could not be created", hr);
+		return false;
+	}
+	memset(source, 0, size_t(desc.Width));
+	hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completionFence_));
+	if (FAILED(hr)) {
+		Fail("E_DEVICE_OBJECTS", "The completion fence could not be created", hr);
+		return false;
+	}
+	markerSource_ = static_cast<uint64_t*>(source);
+	markerDone_ = static_cast<const volatile uint64_t*>(done);
+	markerIds_[0] = ResourceRegistry::Get().Register(device_, markerUpload_.Get(), "Renderer.MarkerUpload", ResourceCategory::Upload, D3D12_HEAP_TYPE_UPLOAD, frame_);
+	markerIds_[1] = ResourceRegistry::Get().Register(device_, markerReadback_.Get(), "Renderer.MarkerReadback", ResourceCategory::Readback, D3D12_HEAP_TYPE_READBACK, frame_);
+	return true;
+}
+
+// The serial of the newest list the GPU has finished. Lists run in the order they were submitted, so everything
+// with a smaller serial is finished too.
+//
+// Two steps, because neither alone is enough on a queue Aether does not own:
+//  1. the marker shows that the host really put the list on the queue and the GPU ran through it (the host's own
+//     fence value does not promise that);
+//  2. only then Aether signals its own fence on the queue. That signal is queued behind the list, so once the fence
+//     shows the serial, the list's execution is complete for the runtime as well (allocators may be reset).
+UINT64 Renderer::Completed() {
+	if (markerDone_ && completionFence_ && clock_.queue) {
+		UINT64 seen = markedSerial_;
+		for (auto& c : contexts_) {
+			if (c->submitted && markerDone_[c->index] == c->fence && c->fence > seen) {
+				seen = c->fence;
+			}
+		}
+		if (seen > markedSerial_ && SUCCEEDED(clock_.queue->Signal(completionFence_.Get(), seen))) {
+			markedSerial_ = seen;
+		}
+		const UINT64 done = completionFence_->GetCompletedValue();
+		if (done != UINT64_MAX && done > completedSerial_) { // UINT64_MAX: device removed
+			completedSerial_ = done;
+		}
+	}
+	return completedSerial_;
+}
+
 Renderer::Context* Renderer::Acquire(const HostGfx& host) {
-	UINT64 completed = host.completedFenceValue();
+	if (!EnsureMarkers()) {
+		return nullptr;
+	}
+	const UINT64 completed = Completed();
+	const UINT64 hostCompleted = host.completedFenceValue ? host.completedFenceValue() : UINT64_MAX;
+	++acquireTick_;
 	for (auto& c : contexts_) {
-		if (c->submitted && c->fence > completed) {
+		// A list is used again only when (1) the GPU finished it (Aether's own clock), (2) the host's frame fence passed
+		// the value the host returned for it and (3) a few submissions went by: the host keeps its own record of a list
+		// it was handed, and handing it the same list object again while that record is alive corrupts its bookkeeping.
+		if (c->submitted && (c->fence > completed || c->hostFence > hostCompleted || acquireTick_ < c->submitTick + kReuseDelay)) {
 			continue;
 		}
+		c->fence = nextSerial_++;
+		++stats_.reuses;
 		HRESULT hr = c->allocator->Reset();
 		if (SUCCEEDED(hr)) {
 			hr = c->list->Reset(c->allocator.Get(), nullptr);
@@ -261,6 +364,8 @@ Renderer::Context* Renderer::Acquire(const HostGfx& host) {
 		Fail("E_COMMAND_LIST", "Command list creation failed", hr);
 		return nullptr;
 	}
+	c->index = uint32_t(contexts_.size());
+	c->fence = nextSerial_++;
 	c->list->SetName(Utf8ToWide(Format("Aether.CommandList%zu", contexts_.size())).c_str());
 	c->allocator->SetName(Utf8ToWide(Format("Aether.CommandAllocator%zu", contexts_.size())).c_str());
 	contexts_.push_back(std::move(c));
@@ -268,16 +373,55 @@ Renderer::Context* Renderer::Acquire(const HostGfx& host) {
 }
 
 UINT64 Renderer::Submit(const HostGfx& host, Context* ctx, int stateCount, HostResourceState* states) {
+	// the last command of every list: its serial, written where Completed() reads it once the GPU got this far
+	markerSource_[ctx->index] = ctx->fence;
+	ctx->list->CopyBufferRegion(markerReadback_.Get(), UINT64(ctx->index) * sizeof(uint64_t), markerUpload_.Get(), UINT64(ctx->index) * sizeof(uint64_t), sizeof(uint64_t));
 	HRESULT hr = ctx->list->Close();
 	if (FAILED(hr)) {
 		Fail("E_COMMAND_LIST", "Command list close failed (a recorded command was invalid)", hr);
 		return 0;
 	}
-	UINT64 fence = host.execute(ctx->list.Get(), stateCount, states);
-	ctx->fence = fence;
+	const DevOptions& dev = DevOptions::Get();
+	if (dev.recordOnly) {
+		// experiment: recorded and closed, never handed to the GPU; the list is free again at once
+		ctx->submitted = false;
+		++stats_.recordedOnly;
+		return ctx->fence;
+	}
+	if (dev.directSubmit && host.queue) {
+		// straight onto the host's queue (the event grants queue access): the host keeps no record of this list
+		ID3D12CommandList* lists[] = {ctx->list.Get()};
+		host.queue->ExecuteCommandLists(1, lists);
+		ctx->hostFence = 0;
+	} else {
+		ctx->hostFence = host.execute(ctx->list.Get(), stateCount, states);
+	}
+	++stats_.submissions;
+	stats_.lastHostFence = ctx->hostFence;
+	ctx->submitTick = acquireTick_;
 	ctx->submitted = true;
-	lastSubmittedFence_ = std::max(lastSubmittedFence_, fence);
-	return fence;
+	lastSubmittedFence_ = std::max(lastSubmittedFence_, ctx->fence);
+	return ctx->fence;
+}
+
+// One line every DevOptions::statsSeconds: enough to see, after a crash, how far the submissions had come.
+void Renderer::LogSubmissionStats(const HostGfx& host, double now) {
+	const int every = DevOptions::Get().statsSeconds;
+	if (every <= 0 || now < stats_.nextLog) {
+		return;
+	}
+	stats_.nextLog = now + every;
+	uint32_t busy = 0;
+	for (auto& c : contexts_) {
+		busy += c->submitted ? 1u : 0u;
+	}
+	json registry = ResourceRegistry::Get().Summary();
+	Log::Get().Write(Severity::Info, "Renderer", "", "Submission statistics", {},
+		{{"frame", frame_}, {"submissions", stats_.submissions}, {"recordedOnly", stats_.recordedOnly}, {"listReuses", stats_.reuses}, {"lists", contexts_.size()}, {"listsBusy", busy},
+			{"nextSerial", nextSerial_}, {"markerSeenSerial", markedSerial_}, {"completedSerial", completedSerial_}, {"lastHostFence", stats_.lastHostFence},
+			{"hostCompletedFence", host.completedFenceValue ? host.completedFenceValue() : 0}, {"skippedFrames", skippedFrames_},
+			{"resourceAllocations", registry["allocations"]}, {"resourceReleases", registry["releases"]}, {"pendingRetirements", GpuResources::Get().PendingRetirements()},
+			{"renderMode", CurrentSettings().renderMode}});
 }
 
 int Renderer::AcquireTimestampFrame() {
@@ -293,10 +437,11 @@ int Renderer::AcquireTimestampFrame() {
 }
 
 void Renderer::CollectGpuResults(const HostGfx& host) {
+	(void)host;
 	if (!tsHeap_ || !tsMapped_) {
 		return;
 	}
-	UINT64 completed = host.completedFenceValue();
+	UINT64 completed = Completed();
 	const double toMs = 1000.0 / double(tsFrequency_);
 	for (uint32_t i = 0; i < kTsFrames; ++i) {
 		TimestampFrame& t = tsFrames_[i];
@@ -408,10 +553,11 @@ void Renderer::SetCaptureStatus(uint64_t id, const char* state, const std::strin
 }
 
 void Renderer::PollCaptures(const HostGfx& host) {
+	(void)host;
 	if (capturePending_.empty()) {
 		return;
 	}
-	UINT64 completed = host.completedFenceValue();
+	UINT64 completed = Completed();
 	for (size_t i = 0; i < capturePending_.size();) {
 		Capture& c = capturePending_[i];
 		if (c.fence > completed) {
@@ -479,6 +625,7 @@ void Renderer::FrameEnd(const HostGfx& host) {
 		finish();
 		return;
 	}
+	LogSubmissionStats(host, start);
 	CollectGpuResults(host);
 	PollCaptures(host);
 	const SettingsData& s = CurrentSettings();
@@ -502,8 +649,11 @@ void Renderer::FrameEnd(const HostGfx& host) {
 			wantCapture = true;
 		}
 	}
-	const bool wantOverlay = overlay.WantsFrame();
-	const bool wantTriangle = s.testTriangle;
+	// the host's very first frames may not have the back buffer bound as a render target yet (seen as a debug layer
+	// error on frame 1): nothing is drawn onto it until the host has presented a few frames
+	const bool settled = frame_ > 8;
+	const bool wantOverlay = settled && overlay.WantsFrame();
+	const bool wantTriangle = settled && s.testTriangle;
 	bool wantDraw = wantTriangle || wantOverlay || wantCapture;
 	int ts = tsCurrent_;
 	const bool hasBegin = tsCurrentHasBegin_ && ts >= 0;
@@ -589,6 +739,10 @@ void Renderer::FrameEnd(const HostGfx& host) {
 	stamp(); // slot 1: start of Aether's passes
 
 	bool overlayDrawn = false, captureRecorded = false;
+	// At the frame end the host's back buffer is still its bound render target (RENDER_TARGET; Unity moves it to
+	// PRESENT afterwards, checked with the D3D12 debug layer). Aether draws into it as it is, changes no state and
+	// declares none: passing the back buffer in ExecuteCommandList's state array every frame corrupted Unity's own
+	// resource bookkeeping after a few thousand frames under the debug layer (docs/architecture/dx12-integration.md).
 	if (backBuffer) {
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
 		D3D12_RENDER_TARGET_VIEW_DESC rd = {};
@@ -653,7 +807,7 @@ void Renderer::FrameEnd(const HostGfx& host) {
 				bindTarget();
 				uint32_t draws = 0;
 				std::string note;
-				overlayDrawn = overlay.Draw(host, hwnd_.load(), viewFormat, UINT(bbDesc.Width), bbDesc.Height, list, host.completedFenceValue(), draws, note);
+				overlayDrawn = overlay.Draw(clock_, hwnd_.load(), viewFormat, UINT(bbDesc.Width), bbDesc.Height, list, Completed(), draws, note);
 				p.note = note;
 				if (overlayDrawn) {
 					p.executed = true;
@@ -678,8 +832,7 @@ void Renderer::FrameEnd(const HostGfx& host) {
 		list->ResolveQueryData(tsHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(ts) * kTsPerFrame + first, tsSlot - first, tsReadback_.Get(), (UINT64(ts) * kTsPerFrame + first) * sizeof(UINT64));
 	}
 
-	HostResourceState state = {backBuffer.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET};
-	UINT64 fence = Submit(host, ctx, backBuffer ? 1 : 0, backBuffer ? &state : nullptr);
+	UINT64 fence = Submit(host, ctx, 0, nullptr);
 	backBuffer.Reset(); // no reference to a back buffer outlives the frame (the swap chain can be resized)
 	if (failed_.load()) {
 		finish();
@@ -707,25 +860,107 @@ void Renderer::FrameEnd(const HostGfx& host) {
 	finish();
 }
 
+void Renderer::SceneFrame(const HostGfx& host) {
+	if (failed_.load() || !EnsureDevice(host)) {
+		return;
+	}
+	if (HRESULT removed = device_->GetDeviceRemovedReason(); removed != S_OK) {
+		// nothing more is recorded on a lost device; the report says what Aether was doing
+		json report = SceneRenderer::Get().Stats();
+		Log::Get().Write(Severity::Error, "Renderer", "E_SCENE_AT_DEVICE_LOSS", "The scene renderer's last frame before the device was lost", {}, report);
+		Fail("E_DEVICE_REMOVED", "The D3D12 device was removed", removed);
+		return;
+	}
+	const SettingsData& s = CurrentSettings();
+	const bool draw = s.renderMode != "hdrp";
+	if (!draw && !SceneStore::Get().HasWork()) {
+		Profiler::Get().SceneIdle();
+		return;
+	}
+	ComPtr<ID3D12Resource> backBuffer;
+	D3D12_RESOURCE_DESC bbDesc = {};
+	DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
+	if (draw) {
+		IDXGISwapChain* sc = host.swapChain ? host.swapChain() : nullptr;
+		ComPtr<IDXGISwapChain3> sc3;
+		if (sc && SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) {
+			sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backBuffer));
+		}
+		if (backBuffer) {
+			bbDesc = backBuffer->GetDesc();
+			viewFormat = ViewFormat(bbDesc.Format);
+			if (bbDesc.SampleDesc.Count != 1) {
+				backBuffer.Reset();
+			}
+		}
+	}
+	Context* ctx = Acquire(host);
+	if (!ctx) {
+		++skippedFrames_;
+		return;
+	}
+	SceneRenderer::Target target;
+	if (backBuffer) {
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+		D3D12_RENDER_TARGET_VIEW_DESC rd = {};
+		rd.Format = viewFormat;
+		rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+		device_->CreateRenderTargetView(backBuffer.Get(), &rd, rtv);
+		target.backBuffer = backBuffer.Get();
+		target.backBufferRtv = rtv;
+		target.backBufferFormat = viewFormat;
+		target.width = UINT(bbDesc.Width);
+		target.height = bbDesc.Height;
+	}
+	// what this frame retires must outlive the list recorded now: this list's own serial
+	const UINT64 retireFence = ctx->fence;
+	const bool wrote = SceneRenderer::Get().Render(clock_, ctx->list.Get(), target, draw && backBuffer, retireFence, ++sceneFrame_, s);
+	// Between the game's cameras and its overlay UI the back buffer is the bound render target (RENDER_TARGET): the
+	// scene list uses it as it is and leaves it as it is. No states are declared to the host (see FrameEnd).
+	const UINT64 fence = Submit(host, ctx, 0, nullptr);
+	backBuffer.Reset();
+	if (failed_.load()) {
+		return;
+	}
+	SceneRenderer::Get().EndFrame(clock_, fence);
+	if (!wrote) {
+		Profiler::Get().SceneIdle();
+	}
+}
+
 void Renderer::ReleaseDeviceObjects(const HostGfx* host, uint32_t waitMs) {
 	bool leak = false;
 	if (ready_.load() && lastSubmittedFence_ != 0) {
 		// Releasing is only safe once the GPU is done with Aether's lists. Without a way to know, nothing is released.
 		if (!host) {
 			leak = true;
-		} else if (host->completedFenceValue && host->completedFenceValue() >= lastSubmittedFence_) {
+		} else if (Completed() >= lastSubmittedFence_) {
 			leak = false;
-		} else if (host->waitIdle && waitMs > 0) {
-			leak = !host->waitIdle(waitMs);
 		} else {
-			leak = true;
+			// the markers tell when the GPU got through Aether's last list; the host's idle wait only helps it along
+			if (host->waitIdle && waitMs > 0) {
+				host->waitIdle(waitMs);
+			}
+			const double deadline = QpcSeconds() + waitMs / 1000.0;
+			while (Completed() < lastSubmittedFence_ && QpcSeconds() < deadline) {
+				Sleep(1);
+			}
+			leak = Completed() < lastSubmittedFence_;
 		}
 		if (leak) {
 			Log::Get().Write(Severity::Warning, "Renderer", "W_SHUTDOWN_LEAK", "The GPU could not be confirmed idle on Aether's last submission: device objects are left unreleased instead of being freed under the GPU", {},
 				{{"lastSubmittedFence", lastSubmittedFence_}, {"waitMs", waitMs}, {"hostAvailable", host != nullptr}});
 		}
 	}
+	if (debugCookie_ && device_ && !leak) {
+		ComPtr<ID3D12InfoQueue1> infoQueue;
+		if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
+			infoQueue->UnregisterMessageCallback(debugCookie_);
+		}
+	}
+	debugCookie_ = 0;
 	Overlay::Get().ReleaseDeviceObjects(leak);
+	SceneRenderer::Get().Release(leak);
 	if (tsReadback_ && tsMapped_ && !leak) {
 		tsReadback_->Unmap(0, nullptr);
 	}
@@ -745,6 +980,21 @@ void Renderer::ReleaseDeviceObjects(const HostGfx* host, uint32_t waitMs) {
 			c.readback.Detach();
 		}
 	}
+	if (leak) {
+		markerUpload_.Detach();
+		markerReadback_.Detach();
+	} else {
+		if (markerUpload_ && markerSource_) markerUpload_->Unmap(0, nullptr);
+		if (markerReadback_ && markerDone_) markerReadback_->Unmap(0, nullptr);
+	}
+	markerUpload_.Reset();
+	markerReadback_.Reset();
+	markerSource_ = nullptr;
+	markerDone_ = nullptr;
+	completedSerial_ = 0;
+	markedSerial_ = 0;
+	completionFence_.Reset();
+	nextSerial_ = 1;
 	contexts_.clear();
 	rtvHeap_.Reset();
 	triRoot_.Reset();
@@ -824,8 +1074,20 @@ json Renderer::RenderGraph() {
 	for (const ResourceRecord& r : ResourceRegistry::Get().Snapshot()) {
 		resources.push_back({{"name", r.name}, {"owner", "aether"}, {"lifetime", "persistent"}, {"category", CategoryName(r.category)}, {"bytes", r.bytes}});
 	}
-	return {{"schema", "aether.rendergraph/1"}, {"phase", 1}, {"frame", timings["frame"]}, {"renderer", state}, {"passes", passes}, {"resources", resources},
-		{"note", "Phase 1 graph: fixed pass order on top of the host's frame. The scheduling render graph (transient resources, aliasing, barriers) arrives with the Phase 2 renderer."}};
+	json scene = SceneRenderer::Get().GraphDescription();
+	if (scene.contains("passes")) {
+		// last frame's timings next to the scene graph's passes
+		for (auto& pass : scene["passes"]) {
+			for (const auto& t : timings["scenePasses"]) {
+				if (t.value("name", "") == pass.value("name", "")) {
+					pass["lastFrame"] = t;
+				}
+			}
+		}
+	}
+	return {{"schema", "aether.rendergraph/2"}, {"phase", 2}, {"frame", timings["frame"]}, {"renderer", state}, {"renderMode", Settings::Get().Snapshot().renderMode},
+		{"passes", passes}, {"resources", resources}, {"sceneGraph", scene}, {"sceneStats", SceneRenderer::Get().Stats()},
+		{"note", "passes / resources: the frame-end list on the host's back buffer (test triangle, overlay, capture). sceneGraph: Aether's scene renderer (render mode aether / compare), a render graph with transient resources and explicit states; it runs after the host's cameras and before the host's UI."}};
 }
 
 } // namespace aether

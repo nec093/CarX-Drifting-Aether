@@ -16,6 +16,7 @@ enum ManagedRequest : uint32_t {
 	kRequestScene = 1,          // key "scene"
 	kRequestMaterials = 2,      // key "materials"
 	kRequestRenderTextures = 4, // key "renderTextures" (Unity's render targets: the HDRP side of the VRAM)
+	kRequestSurvey = 8,         // key "survey" (shader property layouts, vertex layouts, lights, environment)
 };
 
 struct ApprovalPrompt {

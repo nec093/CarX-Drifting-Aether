@@ -64,6 +64,10 @@ public:
 	// ---- render thread
 	void EndFrame(const FrameSample& sample, std::vector<PassTiming> passes);
 	void GpuResult(uint64_t frame, double gpuFrameMs, double aetherGpuMs, const std::vector<double>& passGpuMs);
+	// The scene renderer's frame: its passes (CPU side), draw calls and triangles; GPU times follow a few frames later.
+	void SceneFrame(const std::vector<PassTiming>& passes, uint32_t drawCalls, uint32_t triangles);
+	void SceneGpuResult(const std::vector<PassTiming>& passes, double totalGpuMs);
+	void SceneIdle(); // the scene renderer drew nothing this frame
 	// ---- main thread
 	void SubmitUnityStats(const double* values, int count);
 	// ---- any thread
@@ -89,6 +93,11 @@ private:
 	uint64_t frames_ = 0;
 	std::vector<PassTiming> passes_;
 	std::vector<double> lastPassGpuMs_;
+	std::vector<PassTiming> scenePasses_;
+	uint32_t sceneDrawCalls_ = 0, sceneTriangles_ = 0;
+	double sceneGpuMs_ = -1;
+	bool sceneActive_ = false;
+	std::vector<float> benchSceneGpu_;
 	uint64_t passesFrame_ = 0;
 	double unity_[kUnityStatCount];
 	bool unityValid_ = false;
