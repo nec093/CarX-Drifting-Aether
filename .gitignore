@@ -1,0 +1,16 @@
+# build output
+build/
+bin/
+obj/
+
+# KSL SDK binaries (https://github.com/trbflxr/ksl_sdk/releases, see lib/README.md)
+lib/*
+!lib/README.md
+tools/maykr.exe
+
+# KSL build keys: never commit
+*.kmc
+
+# local captures / logs
+captures/
+*.log

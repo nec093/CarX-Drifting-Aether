@@ -1,0 +1,556 @@
+{
+  "aetherGpuTimeMs": {
+    "avg": 0.0026416809854872647,
+    "max": 0.016383999958634377,
+    "min": 0.0010239999974146485,
+    "p50": 0.0030720001086592674,
+    "p95": 0.0030720001086592674,
+    "p99": 0.0071680000983178616
+  },
+  "aetherResources": {
+    "allocations": 3,
+    "categories": {
+      "buffer": {
+        "bytes": 65536,
+        "count": 1
+      },
+      "depthBuffer": {
+        "bytes": 0,
+        "count": 0
+      },
+      "history": {
+        "bytes": 0,
+        "count": 0
+      },
+      "other": {
+        "bytes": 0,
+        "count": 0
+      },
+      "readback": {
+        "bytes": 65536,
+        "count": 1
+      },
+      "reflection": {
+        "bytes": 0,
+        "count": 0
+      },
+      "renderTarget": {
+        "bytes": 0,
+        "count": 0
+      },
+      "shadowMap": {
+        "bytes": 0,
+        "count": 0
+      },
+      "texture": {
+        "bytes": 0,
+        "count": 0
+      },
+      "upload": {
+        "bytes": 0,
+        "count": 0
+      }
+    },
+    "recentEvents": [
+      {
+        "bytes": 65536,
+        "frame": 0,
+        "id": 1,
+        "name": "Profiler.TimestampReadback",
+        "secondsAgo": 107.78029640001478,
+        "type": "allocation"
+      },
+      {
+        "bytes": 65536,
+        "frame": 1,
+        "id": 2,
+        "name": "TestTriangle.VertexBuffer",
+        "secondsAgo": 106.90299589995993,
+        "type": "allocation"
+      },
+      {
+        "bytes": 8323072,
+        "frame": 2249,
+        "id": 3,
+        "name": "FrameCapture.Readback",
+        "secondsAgo": 65.26997620001202,
+        "type": "allocation"
+      },
+      {
+        "bytes": 8323072,
+        "frame": 2250,
+        "id": 3,
+        "name": "FrameCapture.Readback",
+        "secondsAgo": 65.2511164000025,
+        "type": "release"
+      }
+    ],
+    "releases": 1,
+    "resourceCount": 2,
+    "totalBytes": 131072
+  },
+  "averageFps": 59.99437465389243,
+  "context": {
+    "game": {
+      "aetherStatus": "running",
+      "colorSpace": "Linear",
+      "fullScreenMode": "Windowed",
+      "gamePassesDx12": "switched off (no Direct3D 12 kernels): GpuCulling.GpuCullingPass on HDRPCustomPasses (AfterOpaqueDepthAndNormal); ParticleRenderPass on HDRPCustomPasses (BeforePostProcess)",
+      "gameVersion": "2.28.3",
+      "graphicsDeviceName": "NVIDIA GeForce RTX 4070 Ti",
+      "graphicsDeviceType": "Direct3D12",
+      "graphicsDeviceVersion": "Direct3D 12 [level 12.1]",
+      "graphicsMemoryMB": 11996,
+      "graphicsShaderLevel": 50,
+      "hdrDisplayActive": false,
+      "hdrpDx12Fix": "replaced 118 HDRP compute shaders with Direct3D 12 builds (119 in the bundle)",
+      "loader": "KSL v1.0.14",
+      "mods": [
+        {}
+      ],
+      "nativeLoad": "Unity plugin folder",
+      "qualityLevel": "Default",
+      "renderPipeline": {
+        "asset": "HDRenderPipelineAsset",
+        "hdrp": {
+          "areaShadowFilteringQuality": "Medium",
+          "colorBufferFormat": "R11G11B10",
+          "cookieAtlasSize": "CookieResolution512",
+          "directionalShadowFilteringQuality": "Low",
+          "directionalShadowsDepthBits": "Depth32",
+          "dynamicResolutionEnabled": false,
+          "dynamicResolutionUpsampleFilter": "CatmullRom",
+          "gradingLutSize": 32,
+          "lightProbeSystem": "LegacyLightProbes",
+          "litShaderMode": "Both",
+          "maxAreaLightsOnScreen": 64,
+          "maxDecalsOnScreen": 512,
+          "maxDirectionalLightsOnScreen": 16,
+          "maxPunctualLightsOnScreen": 512,
+          "maxShadowRequests": 128,
+          "msaaSampleCount": "None",
+          "postProcessBufferFormat": "R11G11B10",
+          "probeVolumeSHBands": "SphericalHarmonicsL1",
+          "punctualShadowFilteringQuality": "Low",
+          "qualityLevelCount": 1,
+          "reflectionCacheCompressed": false,
+          "shadowAtlasResolutionArea": 128,
+          "shadowAtlasResolutionCached": 2048,
+          "shadowAtlasResolutionPunctual": 2048,
+          "supportCustomPass": true,
+          "supportDecalLayers": false,
+          "supportDecals": false,
+          "supportDistortion": false,
+          "supportHighQualityLineRendering": false,
+          "supportMotionVectors": true,
+          "supportRayTracing": false,
+          "supportRuntimeAOVAPI": false,
+          "supportSSAO": true,
+          "supportSSGI": true,
+          "supportSSR": true,
+          "supportSSRTransparent": true,
+          "supportScreenSpaceShadows": false,
+          "supportSubsurfaceScattering": false,
+          "supportTransparentBackface": false,
+          "supportTransparentDepthPrepass": true,
+          "supportVolumetricClouds": true,
+          "supportVolumetrics": true,
+          "supportWater": false
+        },
+        "type": "UnityEngine.Rendering.HighDefinition.HDRenderPipelineAsset"
+      },
+      "renderingThreadingMode": "NativeGraphicsJobsSplitThreading",
+      "screenHeight": 1080,
+      "screenWidth": 1920,
+      "streamingMipmapsActive": true,
+      "streamingMipmapsMemoryBudgetMB": 1536,
+      "targetFrameRate": -1,
+      "unityVersion": "2023.2.22f1",
+      "vSyncCount": 1
+    },
+    "renderGraph": {
+      "frame": 4364,
+      "note": "Phase 1 graph: fixed pass order on top of the host's frame. The scheduling render graph (transient resources, aliasing, barriers) arrives with the Phase 2 renderer.",
+      "passes": [
+        {
+          "description": "GPU timestamp at the start of the host's frame",
+          "name": "FrameBeginMarker",
+          "reads": [],
+          "type": "marker",
+          "writes": [
+            "Profiler.TimestampHeap"
+          ]
+        },
+        {
+          "description": "The game's whole frame (HDRP cameras, UI). Not controlled by Aether in Phase 1.",
+          "name": "HostFrame",
+          "owner": "Unity HDRP",
+          "reads": [],
+          "type": "external",
+          "writes": [
+            "BackBuffer"
+          ]
+        },
+        {
+          "description": "DX12 integration test triangle",
+          "lastFrame": {
+            "cpuMs": 0.008600007276982069,
+            "dispatchCalls": 0,
+            "drawCalls": 1,
+            "executed": true,
+            "gpuMs": 0.002048,
+            "name": "TestTriangle"
+          },
+          "name": "TestTriangle",
+          "owner": "Aether",
+          "reads": [
+            "TestTriangle.VertexBuffer"
+          ],
+          "type": "raster",
+          "writes": [
+            "BackBuffer"
+          ]
+        },
+        {
+          "description": "Dear ImGui overlay",
+          "lastFrame": {
+            "cpuMs": 0.000100000761449337,
+            "dispatchCalls": 0,
+            "drawCalls": 0,
+            "executed": false,
+            "gpuMs": null,
+            "name": "Overlay",
+            "note": "hidden"
+          },
+          "name": "Overlay",
+          "owner": "Aether",
+          "reads": [
+            "ImGui buffers and font atlas"
+          ],
+          "type": "raster",
+          "writes": [
+            "BackBuffer"
+          ]
+        },
+        {
+          "description": "Copies the back buffer to a readback buffer (PNG)",
+          "lastFrame": {
+            "cpuMs": 0.0,
+            "dispatchCalls": 0,
+            "drawCalls": 0,
+            "executed": false,
+            "gpuMs": null,
+            "name": "FrameCapture",
+            "note": "no capture requested"
+          },
+          "name": "FrameCapture",
+          "owner": "Aether",
+          "reads": [
+            "BackBuffer"
+          ],
+          "type": "raster",
+          "writes": [
+            "FrameCapture.Readback"
+          ]
+        },
+        {
+          "description": "Unity transitions the back buffer to PRESENT and presents",
+          "name": "HostPresent",
+          "owner": "Unity",
+          "reads": [
+            "BackBuffer"
+          ],
+          "type": "external",
+          "writes": []
+        }
+      ],
+      "phase": 1,
+      "renderer": {
+        "backBuffer": {
+          "bufferCount": 3,
+          "dxgiFormat": 28,
+          "height": 1080,
+          "swapEffect": 3,
+          "viewDxgiFormat": 28,
+          "width": 1920
+        },
+        "frame": 4364,
+        "graphicsApi": "Direct3D 12",
+        "host": "Unity",
+        "lastError": null,
+        "mainRenderer": "HDRP (Unity). Aether runs alongside it and composites its passes onto the back buffer.",
+        "state": "ready"
+      },
+      "resources": [
+        {
+          "info": {
+            "bufferCount": 3,
+            "dxgiFormat": 28,
+            "height": 1080,
+            "swapEffect": 3,
+            "viewDxgiFormat": 28,
+            "width": 1920
+          },
+          "lifetime": "external",
+          "name": "BackBuffer",
+          "owner": "host",
+          "stateOnEntry": "RENDER_TARGET",
+          "stateOnExit": "RENDER_TARGET"
+        },
+        {
+          "bytes": 65536,
+          "category": "readback",
+          "lifetime": "persistent",
+          "name": "Profiler.TimestampReadback",
+          "owner": "aether"
+        },
+        {
+          "bytes": 65536,
+          "category": "buffer",
+          "lifetime": "persistent",
+          "name": "TestTriangle.VertexBuffer",
+          "owner": "aether"
+        }
+      ],
+      "schema": "aether.rendergraph/1"
+    },
+    "scene": {
+      "activeScene": "SelectCar",
+      "cameras": [
+        {
+          "allowHDR": false,
+          "cameraType": "Game",
+          "clearFlags": "SolidColor",
+          "cullingMask": -335569129,
+          "depth": -1,
+          "far": 1000,
+          "fieldOfView": 50,
+          "hdAllowDlss": true,
+          "hdAllowDynamicResolution": false,
+          "hdAntialiasing": "TemporalAntialiasing",
+          "hdClearColorMode": "Sky",
+          "hdCustomFrameSettings": false,
+          "hdVolumeLayerMask": -1,
+          "near": 0.3,
+          "orthographic": false,
+          "path": "Environment/CameraHelper/GarageCamera",
+          "pixelHeight": 1080,
+          "pixelWidth": 1920,
+          "tag": "MainCamera",
+          "targetTexture": null
+        }
+      ],
+      "canvases": [
+        {
+          "path": "KeepAlive(Clone)/UGUI/Root",
+          "renderMode": "ScreenSpaceOverlay",
+          "sortingOrder": 0
+        },
+        {
+          "path": "KeepAlive(Clone)/UGUI/Root-GodVoice",
+          "renderMode": "ScreenSpaceOverlay",
+          "sortingOrder": 34
+        },
+        {
+          "path": "KeepAlive(Clone)/UGUI/[Graphy]-DRO",
+          "renderMode": "ScreenSpaceOverlay",
+          "sortingOrder": 30000
+        }
+      ],
+      "environment": {
+        "ambientMode": "Skybox",
+        "fog": false,
+        "skybox": "Skybox/Cubemap",
+        "sun": "DefaultGarage/sunlight"
+      },
+      "lights": {
+        "active": 5,
+        "byType": {
+          "Directional": 1,
+          "Spot": 4
+        },
+        "castingShadows": 1,
+        "strongest": [
+          {
+            "color": "#FFFFFF",
+            "intensity": 1726.5013,
+            "path": "Environment/LevelObjects/Shared/Lights/LightCenter2",
+            "range": 10,
+            "shadows": "None",
+            "type": "Spot"
+          },
+          {
+            "color": "#FFFFFF",
+            "intensity": 1726.5013,
+            "path": "Environment/LevelObjects/Shared/Lights/LightCenter1",
+            "range": 16.12,
+            "shadows": "None",
+            "type": "Spot"
+          },
+          {
+            "color": "#FFFFFF",
+            "intensity": 100,
+            "path": "DefaultGarage/sunlight",
+            "range": 10,
+            "shadows": "Soft",
+            "type": "Directional"
+          },
+          {
+            "color": "#FFFFFF",
+            "intensity": 74.7196,
+            "path": "Environment/LevelObjects/Shared/Lights/Light (2)",
+            "range": 6.38,
+            "shadows": "None",
+            "type": "Spot"
+          },
+          {
+            "color": "#FFFFFF",
+            "intensity": 74.7196,
+            "path": "Environment/LevelObjects/Shared/Lights/Light (5)",
+            "range": 6.38,
+            "shadows": "None",
+            "type": "Spot"
+          }
+        ]
+      },
+      "loadedScenes": [
+        {
+          "isLoaded": true,
+          "name": "SelectCar",
+          "path": "Assets/Scenes/SelectCar.unity",
+          "rootCount": 9
+        },
+        {
+          "isLoaded": true,
+          "name": "SelectCarAnzuPlacement",
+          "path": "Assets/Scenes/AnzuPlacements/SelectCarAnzuPlacement.unity",
+          "rootCount": 3
+        },
+        {
+          "isLoaded": true,
+          "name": "IconGenerator",
+          "path": "Assets/Scenes/IconGenerator.unity",
+          "rootCount": 7
+        },
+        {
+          "isLoaded": true,
+          "name": "vp_showroom",
+          "path": "Assets/Scenes/Tracks/LightingScenes/vp_showroom.unity",
+          "rootCount": 2
+        }
+      ],
+      "reflectionProbeCount": 1,
+      "reflectionProbes": [
+        {
+          "mode": "Custom",
+          "path": "ReflectionProbe",
+          "refreshMode": "ViaScripting",
+          "resolution": 128
+        }
+      ],
+      "renderers": {
+        "active": 536,
+        "byType": {
+          "MeshRenderer": 527,
+          "ParticleSystemRenderer": 1,
+          "SkinnedMeshRenderer": 8
+        },
+        "shadowCasters": 508,
+        "staticBatched": 0,
+        "visible": 128
+      },
+      "volumeCount": 1,
+      "volumes": [
+        {
+          "components": [
+            "HDRISky",
+            "VisualEnvironment",
+            "Fog",
+            "Exposure"
+          ],
+          "isGlobal": false,
+          "path": "DefaultGarage",
+          "priority": 0,
+          "weight": 1
+        }
+      ]
+    },
+    "settings": {
+      "debugView": "none",
+      "gpuTiming": true,
+      "logLevel": "info",
+      "mcpApprovalTimeoutSec": 30,
+      "mcpControl": "allow",
+      "overlayHotkey": 121,
+      "overlayScale": 1.0,
+      "overlayVisibleAtStart": true,
+      "quality": "high",
+      "testTriangle": true
+    },
+    "startedBy": "mcp"
+  },
+  "dedicatedVramBytes": {
+    "end": 1956945920,
+    "peak": 1956945920,
+    "start": 1956945920
+  },
+  "elapsedSeconds": 30.011592600028962,
+  "file": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\CarX Drift Racing Online\\kino\\mods\\Aether\\benchmarks\\phase1-baseline-garage-hdrp-dx12-20261111-180452.json",
+  "frameTimeMs": {
+    "avg": 16.6682294093238,
+    "max": 20.555200576782227,
+    "min": 12.510600090026855,
+    "p50": 16.6545991897583,
+    "p95": 17.944379997253417,
+    "p99": 18.754341526031496
+  },
+  "frames": 1800,
+  "gpu": {
+    "driver": "32.0.16.2114",
+    "name": "NVIDIA GeForce RTX 4070 Ti",
+    "vendor": "NVIDIA"
+  },
+  "gpuFrameTimeMs": {
+    "avg": 9.33219582481872,
+    "max": 13.337599754333496,
+    "min": 8.252415657043457,
+    "p50": 9.279487609863281,
+    "p95": 10.097356510162353,
+    "p99": 10.6970725440979
+  },
+  "label": "phase1-baseline-garage-hdrp-dx12",
+  "onePercentLowFps": 52.371816844682144,
+  "pointOnePercentLowFps": 48.64948878823069,
+  "requestedSeconds": 30.0,
+  "schema": "aether.benchmark/1",
+  "sharedGpuMemoryPeakBytes": 343232512,
+  "timestamp": "20261111-180452",
+  "unityAtEnd": {
+    "batches": 968.0,
+    "deltaTimeMs": 16.70040376484394,
+    "drawCalls": 967.0,
+    "renderTexturesBytes": 658475144.0,
+    "renderTexturesCount": 242.0,
+    "screenHeight": 1080.0,
+    "screenWidth": 1920.0,
+    "setPassCalls": 244.0,
+    "shadowCasters": 610.0,
+    "textureStreamingCurrentBytes": 599538304.0,
+    "textureTargetBytes": 599538304.0,
+    "textureTotalBytes": 610343552.0,
+    "totalAllocatedBytes": 659042108.0,
+    "triangles": 513115.0,
+    "usedBuffersBytes": 64188688.0,
+    "usedBuffersCount": 1366.0,
+    "vertices": 541574.0,
+    "visibleSkinnedMeshes": 2.0
+  },
+  "unityDrawCalls": {
+    "avg": 904.2561111111111,
+    "max": 1019.0,
+    "min": 709.0,
+    "p50": 934.0,
+    "p95": 993.0,
+    "p99": 1004.01
+  }
+}

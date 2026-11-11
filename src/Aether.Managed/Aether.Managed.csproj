@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net472</TargetFramework>
+		<LangVersion>9</LangVersion>
+		<AssemblyName>Aether</AssemblyName>
+		<RootNamespace>Aether</RootNamespace>
+		<Version>0.1.0</Version>
+		<Nullable>disable</Nullable>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<GenerateDocumentationFile>false</GenerateDocumentationFile>
+		<OutputPath>$(MSBuildThisFileDirectory)..\..\build\managed\$(Configuration)\</OutputPath>
+
+		<!-- Override on the command line: dotnet build -p:GameDir="D:\SteamLibrary\steamapps\common\CarX Drift Racing Online" -->
+		<GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\CarX Drift Racing Online</GameDir>
+		<ManagedDir>$(GameDir)\Drift Racing Online_Data\Managed</ManagedDir>
+		<!-- KSL.API.dll and 0Harmony.dll from https://github.com/trbflxr/ksl_sdk/releases (lib/README.md) -->
+		<KslApiDir Condition="'$(KslApiDir)' == ''">$(MSBuildThisFileDirectory)..\..\lib</KslApiDir>
+
+		<!-- Copy the raw .dll into kino/mods after the build (KSL loads raw dlls for mod developers only). -->
+		<DeployToGame Condition="'$(DeployToGame)' == ''">false</DeployToGame>
+
+		<!-- Build a .ksm with KSL maykr after a Release build when maykr.exe and the mod's build key exist.
+		     Key: KSL control panel > Aether > generate; Aether_maykr.kmc in the game's kino\dev folder or the repository root
+		     (never commit it: *.kmc is in .gitignore). -->
+		<MaykrExe Condition="'$(MaykrExe)' == ''">$(MSBuildThisFileDirectory)..\..\tools\maykr.exe</MaykrExe>
+		<MaykrKey Condition="'$(MaykrKey)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\Aether_maykr.kmc')">$(MSBuildThisFileDirectory)..\..\Aether_maykr.kmc</MaykrKey>
+		<!-- the usual place on the developer's machine: the game's KSL dev folder (outside the repository) -->
+		<MaykrKey Condition="'$(MaykrKey)' == ''">$(GameDir)\kino\dev\Aether_maykr.kmc</MaykrKey>
+		<MaykrOutDir Condition="'$(MaykrOutDir)' == ''">$(GameDir)\kino\mods</MaykrOutDir>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Reference Include="KSL.API" HintPath="$(KslApiDir)\KSL.API.dll" Private="false" />
+		<Reference Include="UnityEngine.CoreModule" HintPath="$(ManagedDir)\UnityEngine.CoreModule.dll" Private="false" />
+		<Reference Include="UnityEngine.AssetBundleModule" HintPath="$(ManagedDir)\UnityEngine.AssetBundleModule.dll" Private="false" />
+		<Reference Include="UnityEngine.IMGUIModule" HintPath="$(ManagedDir)\UnityEngine.IMGUIModule.dll" Private="false" />
+		<Reference Include="UnityEngine.UIModule" HintPath="$(ManagedDir)\UnityEngine.UIModule.dll" Private="false" />
+		<Reference Include="Unity.RenderPipelines.Core.Runtime" HintPath="$(ManagedDir)\Unity.RenderPipelines.Core.Runtime.dll" Private="false" />
+		<Reference Include="Unity.RenderPipelines.HighDefinition.Runtime" HintPath="$(ManagedDir)\Unity.RenderPipelines.HighDefinition.Runtime.dll" Private="false" />
+	</ItemGroup>
+
+	<Target Name="DeployRawDll" AfterTargets="Build" Condition="'$(DeployToGame)' == 'true'">
+		<Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\kino\mods" />
+		<Message Importance="high" Text="Aether.dll deployed to $(GameDir)\kino\mods" />
+	</Target>
+
+	<!-- Signing asks the KSL server (which can refuse a request, e.g. "Build request denied" when asked again right away):
+	     Inputs / Outputs make it run only when Aether.dll is newer than the .ksm. -->
+	<Target Name="MaykrBuild" AfterTargets="Build" Inputs="$(TargetPath)" Outputs="$(MaykrOutDir)\Aether.ksm" Condition="'$(Configuration)' == 'Release' And Exists('$(MaykrExe)') And Exists('$(MaykrKey)')">
+		<Exec Command="&quot;$(MaykrExe)&quot; &quot;$(TargetPath)&quot; -c &quot;$(MaykrKey)&quot; -o &quot;$(MaykrOutDir)&quot; -np" />
+		<Message Importance="high" Text="Aether.ksm built into $(MaykrOutDir)" />
+	</Target>
+</Project>

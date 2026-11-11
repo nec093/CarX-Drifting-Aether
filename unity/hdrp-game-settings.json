@@ -1,0 +1,12 @@
+{
+  "comment": "The game's HDRP asset settings that HDRP's build stripper selects compute shader variants by. Read from the running game (MCP get_status > managed.renderPipeline.hdrp) on 2026-11-11, game version 2.28.3, Unity 2023.2.22f1, one quality level. If the game changes them, the kernels of the other combination are missing: update this file and rebuild the bundle (scripts/build-hdrp-bundle.ps1).",
+  "punctualShadowFilteringQuality": "Low",
+  "directionalShadowFilteringQuality": "Low",
+  "areaShadowFilteringQuality": "Medium",
+  "supportScreenSpaceShadows": false,
+  "lightProbeSystem": "LegacyLightProbes",
+  "probeVolumeSHBands": "SphericalHarmonicsL1",
+  "litShaderMode": "Both",
+  "colorBufferFormat": "R11G11B10",
+  "hdrDisplay": false
+}

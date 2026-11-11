@@ -1,0 +1,12 @@
+{
+  "overlayHotkey": 121,
+  "overlayVisibleAtStart": false,
+  "overlayScale": 1.0,
+  "quality": "high",
+  "testTriangle": true,
+  "gpuTiming": true,
+  "debugView": "none",
+  "mcpControl": "ask",
+  "mcpApprovalTimeoutSec": 30,
+  "logLevel": "info"
+}
