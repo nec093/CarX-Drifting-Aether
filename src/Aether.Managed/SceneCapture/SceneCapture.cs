@@ -1483,6 +1483,25 @@ namespace Aether {
 			geometrySent_ = geometryFailed_ = 0;
 		}
 
+		private readonly Dictionary<int, bool> headlamps_ = new Dictionary<int, bool>();
+
+		/// <summary>Whether a spot light is a car's head lamp (by its name, looked at once per light).</summary>
+		private bool IsHeadlamp(Light l) {
+			int id = l.GetInstanceID();
+			if (!headlamps_.TryGetValue(id, out bool head)) {
+				string name = l.name.ToLowerInvariant();
+				head = name.Contains("headlight") || name.Contains("head_light") || name.Contains("frontlight");
+				if (headlamps_.Count > 4096) {
+					headlamps_.Clear();
+				}
+				headlamps_[id] = head;
+				if (headlamps_.Count <= 48) {
+					Native.Log(0, "Spot light \"" + l.name + "\": " + (head ? "a head lamp (low beam pattern)" : "as it is") + ", " + l.spotAngle.ToString("F0") + " degrees, range " + l.range.ToString("F0") + ", intensity " + l.intensity.ToString("F0"));
+				}
+			}
+			return head;
+		}
+
 		private unsafe void UpdateGeometry() {
 			while (geometryInFlight_ < GeometryAtOnce && geometryQueue_.Count > 0) {
 				uint handle = geometryQueue_.Dequeue();
@@ -1883,6 +1902,11 @@ namespace Aether {
 						*o = default;
 						o->type = type;
 						o->flags = l.shadows != LightShadows.None ? AeConst.LightCastsShadows : 0u;
+						// (a car's head lamp: the game makes them from its prefab "headlight"; Aether draws them with a
+						// low beam's pattern)
+						if (type == AeConst.LightSpot && IsHeadlamp(l)) {
+							o->flags |= AeConst.LightHeadlamp;
+						}
 						// HDRP light layers: the light's layers are the low byte of Light.renderingLayerMask
 						o->layerMask = lightLayers_ ? ((uint)l.renderingLayerMask & 0xFFu) : 0xFFFFFFFFu;
 						Transform tr = l.transform;

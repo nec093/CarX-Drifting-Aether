@@ -24,7 +24,7 @@ float4 PSSky(FullscreenOutput input) : SV_Target {
 	if (g_Atmosphere.w > 0.5) {
 		// the physical sky: the air (g_SceneColor: its sky view LUT), the sun's disc, and the clouds in front of both
 		// (g_PostAux: marched at half resolution by PSClouds)
-		color = PhysicalSkyAir(dir) + PhysicalSunDisc(dir);
+		color = PhysicalSkyAir(dir) + PhysicalSunDisc(dir) + PhysicalSunGlow(dir) + PhysicalStars(dir);
 		if (g_Clouds.w > 0.5) {
 			float4 cloud = g_PostAux.SampleLevel(s_LinearClamp, input.uv, 0.0);
 			color = color * cloud.a + cloud.rgb;
@@ -464,53 +464,58 @@ float4 PSSkyViewLut(FullscreenOutput input) : SV_Target {
 }
 
 // ---- clouds (aether_clouds.hlsli)
-uint CloudHash(int2 p) {
-	uint n = uint(p.x) * 1597334677u ^ uint(p.y) * 3812015801u;
+uint CloudHash(int3 p) {
+	uint n = uint(p.x) * 1597334677u ^ uint(p.y) * 3812015801u ^ uint(p.z) * 2798796415u;
 	n = (n ^ (n >> 15)) * 2747636419u;
 	return n ^ (n >> 13);
 }
 
-int2 CloudWrap(int2 p, int period) {
+int3 CloudWrap(int3 p, int period) {
 	return ((p % period) + period) % period;
 }
 
-// smooth noise that repeats every `period` cells
-float CloudValueNoise(float2 p, int period) {
-	int2 i = int2(floor(p));
-	float2 f = frac(p);
+// smooth noise that repeats every `period` cells, in all three directions
+float CloudValueNoise(float3 p, int period) {
+	int3 i = int3(floor(p));
+	float3 f = frac(p);
 	f = f * f * (3.0 - 2.0 * f);
-	float a = float(CloudHash(CloudWrap(i, period)) & 0xFFFFu) / 65535.0;
-	float b = float(CloudHash(CloudWrap(i + int2(1, 0), period)) & 0xFFFFu) / 65535.0;
-	float c = float(CloudHash(CloudWrap(i + int2(0, 1), period)) & 0xFFFFu) / 65535.0;
-	float d = float(CloudHash(CloudWrap(i + int2(1, 1), period)) & 0xFFFFu) / 65535.0;
-	return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+	float v[8];
+	for (int k = 0; k < 8; ++k) {
+		v[k] = float(CloudHash(CloudWrap(i + int3(k & 1, (k >> 1) & 1, k >> 2), period)) & 0xFFFFu) / 65535.0;
+	}
+	return lerp(lerp(lerp(v[0], v[1], f.x), lerp(v[2], v[3], f.x), f.y), lerp(lerp(v[4], v[5], f.x), lerp(v[6], v[7], f.x), f.y), f.z);
 }
 
 // cells (1 at a cell's point, falling off around it), repeating every `period` cells
-float CloudWorley(float2 p, int period) {
-	int2 i = int2(floor(p));
-	float2 f = frac(p);
+float CloudWorley(float3 p, int period) {
+	int3 i = int3(floor(p));
+	float3 f = frac(p);
 	float nearest = 4.0;
-	for (int y = -1; y <= 1; ++y) {
-		for (int x = -1; x <= 1; ++x) {
-			uint h = CloudHash(CloudWrap(i + int2(x, y), period));
-			float2 site = float2(float(h & 0xFFFFu), float(h >> 16)) / 65535.0;
-			float2 d = float2(x, y) + site - f;
-			nearest = min(nearest, dot(d, d));
+	for (int z = -1; z <= 1; ++z) {
+		for (int y = -1; y <= 1; ++y) {
+			for (int x = -1; x <= 1; ++x) {
+				uint h = CloudHash(CloudWrap(i + int3(x, y, z), period));
+				float3 site = float3(float(h & 0x3FFu), float((h >> 10) & 0x3FFu), float((h >> 20) & 0x3FFu)) / 1023.0;
+				float3 d = float3(x, y, z) + site - f;
+				nearest = min(nearest, dot(d, d));
+			}
 		}
 	}
 	return 1.0 - saturate(sqrt(nearest));
 }
 
-// the tiling noise the clouds' shape comes from: R the big shapes, G the detail
+// The noise volume the clouds' shape comes from, as 64 slices of 128 x 128 laid out 8 x 8: R the big shapes (a smooth
+// noise swollen by cells: billows), G the detail (small cells).
 float4 PSCloudNoise(FullscreenOutput input) : SV_Target {
-	float2 uv = input.uv;
-	float value = CloudValueNoise(uv * 4.0, 4) * 0.5 + CloudValueNoise(uv * 8.0, 8) * 0.25 + CloudValueNoise(uv * 16.0, 16) * 0.125 + CloudValueNoise(uv * 32.0, 32) * 0.0625;
-	value /= 0.9375;
-	float cells = CloudWorley(uv * 5.0, 5) * 0.55 + CloudWorley(uv * 11.0, 11) * 0.3 + CloudWorley(uv * 23.0, 23) * 0.15;
-	// (spread over the whole 0 .. 1 range: the coverage setting is then about the share of the sky the clouds take)
-	float shape = saturate((value * 0.62 + cells * 0.58 - 0.30) / 0.42);
-	float detail = CloudWorley(uv * 16.0, 16) * 0.5 + CloudWorley(uv * 32.0, 32) * 0.3 + CloudWorley(uv * 64.0, 64) * 0.2;
+	float2 tile = floor(input.position.xy / 128.0);
+	float3 uvw = float3(frac(input.position.xy / 128.0), (tile.y * 8.0 + tile.x + 0.5) / 64.0);
+	float value = CloudValueNoise(uvw * 4.0, 4) * 0.5 + CloudValueNoise(uvw * 8.0, 8) * 0.28 + CloudValueNoise(uvw * 16.0, 16) * 0.14 + CloudValueNoise(uvw * 32.0, 32) * 0.08;
+	float cells = CloudWorley(uvw * 4.0, 4) * 0.6 + CloudWorley(uvw * 8.0, 8) * 0.27 + CloudWorley(uvw * 16.0, 16) * 0.13;
+	// (the smooth noise with its floor raised by the cells: round masses where the cells are, hollows between them;
+	// then spread over the whole 0 .. 1 range, so that the coverage setting is about the share of sky the clouds take)
+	float shape = saturate((value - (1.0 - cells) * 0.55) / max(1.0 - (1.0 - cells) * 0.55, 1e-3));
+	shape = saturate((shape - 0.08) / 0.62);
+	float detail = CloudWorley(uvw * 8.0, 8) * 0.5 + CloudWorley(uvw * 16.0, 16) * 0.3 + CloudWorley(uvw * 32.0, 32) * 0.2;
 	return float4(shape, detail, 0.0, 1.0);
 }
 
@@ -518,7 +523,7 @@ float4 PSCloudNoise(FullscreenOutput input) : SV_Target {
 float4 PSSkyCloudsLut(FullscreenOutput input) : SV_Target {
 	float3 dir = SkyViewDirection(input.uv);
 	float3 air = g_SceneColor.SampleLevel(s_Aniso, float2(input.uv.x, clamp(input.uv.y, 0.5 / 108.0, 1.0 - 0.5 / 108.0)), 0.0).rgb;
-	float4 cloud = MarchClouds(dir, g_Atmosphere.z, 12, 0.5);
+	float4 cloud = MarchClouds(dir, g_Atmosphere.z, 16, 0.5);
 	return float4(air * cloud.a + cloud.rgb / max(g_Atmosphere.x, 1e-6), 1.0);
 }
 
@@ -529,7 +534,7 @@ float4 PSClouds(FullscreenOutput input) : SV_Target {
 	float3 dir = normalize(world.xyz / world.w - g_CameraPos.xyz);
 	float2 noiseAt = input.position.xy + (g_PostParams.w > 0.5 ? frac(g_CameraPos.w * 5.17) * float2(31.0, 59.0) : float2(0.0, 0.0));
 	float jitter = frac(52.9829189 * frac(dot(noiseAt, float2(0.06711056, 0.00583715))));
-	return MarchClouds(dir, g_Atmosphere.z, 24, jitter);
+	return MarchClouds(dir, g_Atmosphere.z, 56, jitter);
 }
 
 // ---- volumetric fog. For every pixel (at half resolution): the way from the camera to the surface, in steps; at
@@ -1006,4 +1011,99 @@ float4 PSBvhDebug(FullscreenOutput input) : SV_Target {
 	}
 	float light = 0.25 + 0.75 * saturate(dot(hit.normal, g_SunDirection.xyz));
 	return float4((hit.normal * 0.5 + 0.5) * light, 1.0);
+}
+
+// ---- probe grid GI (aether_scene.hlsli: GiDiffuse)
+// The probe whose tile a pixel of the GI textures belongs to: its grid cell.
+float3 GiCellOfPixel(int2 p) {
+	int2 tile = p / 8;
+	float3 s = float3(tile.x % 24, tile.x / 24, tile.y);
+	// (the one cell of the volume that is kept at this place)
+	return g_GiGrid.xyz + GiStorage(s - g_GiGrid.xyz);
+}
+
+// The direction this frame's ray of a pixel takes: somewhere in the pixel's own patch of directions.
+float3 GiRayDirection(int2 p) {
+	uint h = CloudHash(int3(p, int(g_GiParams.z)));
+	float2 j = float2(float(h & 0xFFFFu), float(h >> 16)) / 65536.0;
+	return OctDecode((float2(p % 8) + j) / 8.0);
+}
+
+// Whether a probe was outside the volume the frame before: what its tile holds belongs to another place.
+bool GiFresh(float3 cell) {
+	float3 rel = cell - g_GiPrev.xyz;
+	return g_GiPrev.w < 0.5 || any(rel < 0.0) || any(rel >= kGiCounts);
+}
+
+// Whether a probe sends its rays this frame: a quarter of them do, in turn (all 4608 every frame took 2.2 ms), and
+// the ones that have nothing yet.
+bool GiUpdates(float3 cell) {
+	int3 c = int3(cell);
+	return GiFresh(cell) || ((c.z + int(g_GiParams.z)) & 3) == 0; // (whole rows of the texture: probes that trace lie together, which the GPU needs to gain from the others' rest)
+}
+
+// One ray per probe and direction. rgb: the light it brings back, a: how far it went (a fifth of that where it met
+// the inside of something: a probe in a wall, or under the ground, must not be believed by what stands outside).
+float4 PSGiRays(FullscreenOutput input) : SV_Target {
+	int2 p = int2(input.position.xy);
+	float3 cell = GiCellOfPixel(p);
+	if (!GiUpdates(cell)) {
+		return 0.0;
+	}
+	float3 o = GiProbePosition(cell);
+	float3 d = GiRayDirection(p);
+	s_GiOff = g_GiPrev.w < 0.5;
+	float travelled = 0.0;
+	for (int attempt = 0; attempt < 2; ++attempt) {
+		// (60 m: what shuts out the sky or lights a place is nearer than that; the few rays that went 300 m through
+		// everything took most of the pass's time)
+		BvhHit hit = BvhTraceEx(o, d, 60.0 - travelled, false, true, 300u);
+		if (hit.t < 0.0) {
+			break;
+		}
+		float3 P = o + d * hit.t;
+		float4 surface = BvhHitSurfaceLit(P, hit, travelled + hit.t, d, true);
+		if (surface.a > 0.5) {
+			float far = travelled + hit.t;
+			return hit.back != 0u ? float4(0.0, 0.0, 0.0, far * 0.2) : float4(min(surface.rgb, 60000.0), far);
+		}
+		travelled += hit.t + 0.02;
+		o = P + d * 0.02;
+	}
+	return float4(min(SkyRadiance(d, 0.0) * g_Misc.w, 60000.0), 1000.0);
+}
+
+// The light round each direction of a probe's tile: this frame's rays weighted by the cosine, a step towards them.
+float4 PSGiIrradiance(FullscreenOutput input) : SV_Target {
+	int2 p = int2(input.position.xy);
+	int2 texel = p % 8;
+	int2 origin = p - texel;
+	float3 cell = GiCellOfPixel(p);
+	if (!GiUpdates(cell)) {
+		return 0.0; // (a step of nothing: the probe keeps what it has)
+	}
+	float3 n = OctDecode((float2(texel) + 0.5) / 8.0);
+	float3 sum = 0.0;
+	float weight = 0.0;
+	for (int y = 0; y < 8; ++y) {
+		for (int x = 0; x < 8; ++x) {
+			int2 q = origin + int2(x, y);
+			float w = saturate(dot(n, GiRayDirection(q)));
+			sum += g_SceneColor.Load(int3(q, 0)).rgb * w;
+			weight += w;
+		}
+	}
+	float3 result = min(max(sum / max(weight, 1e-4), 0.0), 60000.0);
+	return float4(result, GiFresh(cell) ? 1.0 : 0.06);
+}
+
+// How far a probe sees in each direction of its tile (capped: only the nearness of walls matters), and that squared.
+float4 PSGiDepth(FullscreenOutput input) : SV_Target {
+	int2 p = int2(input.position.xy);
+	float3 cell = GiCellOfPixel(p);
+	if (!GiUpdates(cell)) {
+		return 0.0;
+	}
+	float far = min(g_SceneColor.Load(int3(p, 0)).a, 1.5 * length(g_GiParams.xyx));
+	return float4(far, far * far, 0.0, GiFresh(cell) ? 1.0 : 0.1);
 }

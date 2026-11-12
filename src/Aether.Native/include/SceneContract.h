@@ -202,7 +202,7 @@ typedef struct AeFrameInstance {
 } AeFrameInstance;
 
 enum AeLightType { kAeLightDirectional = 0, kAeLightPoint = 1, kAeLightSpot = 2 };
-enum AeLightFlags { kAeLightCastsShadows = 1 << 0 };
+enum AeLightFlags { kAeLightCastsShadows = 1 << 0, kAeLightHeadlamp = 1 << 1 /* a car's head lamp: drawn with a low beam pattern */ };
 
 typedef struct AeLight {
 	uint32_t type;

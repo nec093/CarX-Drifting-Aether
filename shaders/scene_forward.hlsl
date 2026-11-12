@@ -227,6 +227,35 @@ float3 DirectLight(Surface s, float3 V, float3 L, float3 radiance) {
 	return base * radiance;
 }
 
+// A head lamp's low beam, for traffic that keeps to the left (a right-hand drive car): how much of the lamp's
+// strength goes in a direction. `d`: from the lamp to the lit place, `forward`: where the lamp points.
+// What makes a low beam: a sharp cut-off just under the horizontal, so that nothing goes into the eyes of who comes
+// the other way (on the right); on the near side (the left) the cut-off rises at 15 degrees, to light the verge and
+// the signs; the brightest part sits right under the cut-off, a little to the left; below it the light spreads wide
+// and fades towards the car.
+float HeadlampBeam(float3 d, float3 forward) {
+	float along = dot(d, forward);
+	if (along <= 0.05) {
+		return 0.0;
+	}
+	float3 right = normalize(cross(float3(0.0, 1.0, 0.0), forward));
+	float3 up = cross(forward, right);
+	float h = atan2(dot(d, right), along); // to the right: positive
+	float v = atan2(dot(d, up), along);
+	// the cut-off: 0.57 degrees under the horizontal (1 %), rising on the left
+	float cutoff = -0.010 + max(-h - 0.010, 0.0) * 0.268;
+	cutoff = min(cutoff, 0.06);
+	float below = smoothstep(cutoff + 0.004, cutoff - 0.006, v);
+	// under the cut-off: the hot spot, the spread to both sides, the foreground
+	float dv = cutoff - v;
+	float spot = exp(-pow((h + 0.03) / 0.16, 2.0)) * exp(-pow(dv / 0.045, 2.0));
+	float spread = 0.28 * exp(-pow(h / 0.55, 2.0)) * exp(-pow(dv / 0.16, 2.0));
+	float near = 0.05 * exp(-pow(h / 0.8, 2.0)) * saturate(1.0 - dv / 0.9);
+	// above it: the little that a real lamp's lens scatters upwards
+	float stray = 0.012 * exp(-pow(h / 0.6, 2.0)) * exp(-pow(max(v - cutoff, 0.0) / 0.25, 2.0));
+	return (spot + spread + near) * below + stray;
+}
+
 float3 PunctualLights(Surface s, float3 worldPos, float3 V, float2 pixel, float viewDepth, uint layers, out uint lightCount) {
 	lightCount = 0;
 	float3 result = 0.0;
@@ -255,7 +284,9 @@ float3 PunctualLights(Surface s, float3 worldPos, float3 V, float2 pixel, float 
 		// inverse square with a smooth window to zero at the range
 		float w = saturate(1.0 - (d2 * d2) / (range * range * range * range));
 		float attenuation = w * w / max(d2, 0.0001);
-		if (light.typeFlags.x > 1.5) {
+		if (light.typeFlags.z > 0.5) {
+			attenuation *= HeadlampBeam(-L, light.directionOuter.xyz);
+		} else if (light.typeFlags.x > 1.5) {
 			float cosAngle = dot(-L, light.directionOuter.xyz);
 			float outer = light.directionOuter.w, inner = light.colorInner.w;
 			attenuation *= smoothstep(outer, max(inner, outer + 1e-4), cosAngle);
@@ -351,6 +382,14 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		// one light group per channel of the mask texture, switched by the material's four intensities
 		float4 groups = g_EmissiveMap.Sample(s_Aniso, input.uv);
 		s.emissive = base.rgb * dot(groups, max(mat.secondaryColor, 0.0)) * mat.emissiveMetallic.rgb;
+		if (AE_MATERIALS) {
+			// A lamp is behind a lens: smooth clear plastic or glass over everything the texture shows. (Without it a
+			// head lamp and a tail lamp were matt painted shapes.) A little more than a lens returns head on, like the
+			// car's lacquer.
+			s.clearCoat = 1.0;
+			s.clearCoatRoughness = 0.03;
+			s.coatF0 = 0.10;
+		}
 	} else if (materialClass == CLASS_VEHICLE_STITCHES) {
 		// the body's panel seams (door and bonnet gaps, the filler cap): a strip lying over the body, seen through by its
 		// pack texture. In the game's own picture (same view, side by side) a seam is a dark groove in the paint, in the
@@ -496,7 +535,7 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 	}
 	direct += PunctualLights(s, input.worldPos, V, input.position.xy, input.viewDepth, layers, lightCount);
 
-	float3 ambientDiffuse = AmbientDiffuse(N) * g_Misc.w * s.albedo * (1.0 - s.metallic);
+	float3 ambientDiffuse = AmbientLight(input.worldPos, N) * s.albedo * (1.0 - s.metallic);
 	float3 R = reflect(-V, N);
 	// a rough surface reflects mostly what lies around its normal, not around the mirror direction
 	// (the base layer's normal: on metallic paint each flake mirrors its own part of the surroundings)
@@ -542,7 +581,7 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		float tint = max(mat.baseColor.a, 0.12);
 		// (the direct term is mostly the diffuse response of the glass colour, which glass does not have: a small part of
 		// it stands in for the sun's highlight)
-		float3 body = s.albedo * (AmbientDiffuse(N) * g_Misc.w) * 0.05;
+		float3 body = s.albedo * AmbientLight(input.worldPos, N) * 0.05;
 		// what the pane mirrors: a ray through the scene's triangles where those are there to trace (the pane is not in
 		// the reflection pass: that pass works on the opaque picture), else the sky and the probes
 		float3 mirroredFrom;

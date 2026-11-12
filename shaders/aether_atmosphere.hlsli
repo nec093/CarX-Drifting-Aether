@@ -218,3 +218,38 @@ float3 PhysicalSunDisc(float3 dir) {
 	// illuminance / solid angle of the disc (6.8e-5 sr); kept below what the temporal passes can handle
 	return min(g_SunColor.rgb * (limb / 6.8e-5), 4000.0 * max(g_SunColor.r, max(g_SunColor.g, g_SunColor.b)));
 }
+
+// How much of the night it is: 0 by day and through the twilight, 1 when the light in the sky is the moon's (the
+// renderer then runs the atmosphere at the moon's strength, which shows in the two numbers' ratio).
+float NightShare() {
+	return smoothstep(1e-4, 0.05, g_Atmosphere.y / max(g_Atmosphere.x, 1e-9));
+}
+
+// The glow round the sun (or the moon): the light the haze scatters at small angles. The sky view LUT has it too,
+// but spread over texels a couple of degrees wide: the bright core is added here.
+float3 PhysicalSunGlow(float3 dir) {
+	if (g_SunDirection.w < 0.5 || dir.y < -0.01) {
+		return 0.0;
+	}
+	float c = saturate(dot(dir, g_SunDirection.xyz));
+	return g_SunColor.rgb * (pow(c, 4000.0) * 6.0 + pow(c, 350.0) * 0.5 + pow(c, 30.0) * 0.03);
+}
+
+// The stars: points in cells of the sky, a few bright, most faint, some warm and some blue. In the scene's units,
+// only at night.
+float3 PhysicalStars(float3 dir) {
+	float night = NightShare();
+	if (night <= 0.0 || dir.y < 0.0) {
+		return 0.0;
+	}
+	float3 p = dir * 180.0;
+	float3 cell = floor(p);
+	float3 h = frac(sin(float3(dot(cell, float3(127.1, 311.7, 74.7)), dot(cell, float3(269.5, 183.3, 246.1)), dot(cell, float3(113.5, 271.9, 124.6)))) * 43758.5453);
+	float3 site = cell + 0.25 + 0.5 * h;
+	float d = length(p - site);
+	float bright = pow(frac(h.x * 17.0 + h.y * 5.0), 9.0); // (most cells: next to nothing)
+	float star = bright * smoothstep(0.12, 0.0, d);
+	float3 tint = lerp(float3(1.0, 0.82, 0.65), float3(0.75, 0.85, 1.0), h.z);
+	// (dimmer towards the horizon: more air in the way)
+	return tint * (star * night * saturate(dir.y * 4.0) * 900.0 * g_Atmosphere.y);
+}

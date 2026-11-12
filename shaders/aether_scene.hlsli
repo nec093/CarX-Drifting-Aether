@@ -52,6 +52,9 @@ cbuffer FrameConstants : register(b0) {
 	float4 g_ProbeGrid;          // x the probes' spacing on the ground, y in height, z a different number every frame, w 1 = probes on
 	float4 g_ProbePositions[8];  // xyz where the probe stands, w 1 = usable
 	float4 g_ReflectionBasis[18]; // per cube face (+X -X +Y -Y +Z -Z): the directions of its tile's centre, right edge and top edge (w of the first two: near, far)
+	float4 g_GiGrid;             // xyz the grid cell of the GI volume's lowest corner, w 1 = probe grid GI on
+	float4 g_GiPrev;             // xyz the same the frame before, w 1 = the probes hold something
+	float4 g_GiParams;           // x metres between probes on the ground, y in height, z a different number every frame, w number of punctual lights
 };
 
 cbuffer DrawConstants : register(b1) {
@@ -84,7 +87,7 @@ struct LightData {
 	float4 positionRange;  // xyz world position, w range
 	float4 directionOuter; // xyz the way the light travels, w cos(outer half angle)
 	float4 colorInner;     // rgb candela, w cos(inner half angle)
-	float4 typeFlags;      // x type (1 point, 2 spot), y rendering layers the light reaches (asuint)
+	float4 typeFlags;      // x type (1 point, 2 spot), y rendering layers the light reaches (asuint), z 1 = a head lamp (low beam pattern)
 };
 
 #ifdef AE_PARTICLES
@@ -126,6 +129,8 @@ Texture2D g_Transmittance : register(t1, space4); // the physical sky's transmit
 Texture2D g_MultiScatter : register(t2, space4);  // ... and its multiple scattering LUT
 Texture2D g_ProbeAtlas : register(t4, space4);      // the reflection probes: per probe six tiles, 3 x 2; the probes 4 x 2 (a: 0 = sky)
 Texture2D g_ProbeAtlasBlur : register(t5, space4);  // ... blurred, for rough surfaces
+Texture2D g_GiIrradiance : register(t7, space4);    // probe grid GI: per probe a tile of 8 x 8 directions (octahedral), the light arriving round each
+Texture2D g_GiDepth : register(t8, space4);         // ... r how far the probe sees that way on average (capped), g the same squared
 Texture2D g_ProbeAtlasDepth : register(t6, space4); // ... and their depth (reversed Z per tile)
 Texture2D g_CloudNoise : register(t3, space4);    // tiling noise the clouds' shape comes from (PSCloudNoise)
 
@@ -396,6 +401,87 @@ float3 AmbientDiffuse(float3 n) {
 		return g_Irradiance.SampleLevel(s_LinearClamp, uv, 0.0).rgb;
 	}
 	return AmbientSH(n);
+}
+
+// ---- probe grid GI (in the manner of "Dynamic Diffuse Global Illumination", Majercik et al. 2019)
+// Probes stand on a grid fixed in the world, one in the middle of each cell; the volume of 24 x 8 x 24 of them
+// follows the camera a cell at a time. A probe keeps its place in the textures whatever the volume does: its cell
+// modulo the counts. Each has a tile of 8 x 8 directions (octahedral) in g_GiIrradiance and in g_GiDepth, which
+// PSGiRays / PSGiIrradiance / PSGiDepth (scene_post.hlsl) keep up to date.
+static const float3 kGiCounts = float3(24.0, 8.0, 24.0);
+static const float kGiTile = 8.0;
+static bool s_GiOff = false; // set by the pass that must not read the probes (they hold nothing yet)
+
+float3 GiStorage(float3 cell) {
+	return cell - kGiCounts * floor(cell / kGiCounts);
+}
+
+float3 GiProbePosition(float3 cell) {
+	return (cell + 0.5) * g_GiParams.xyx;
+}
+
+float2 GiTileUv(float3 cell, float3 dir) {
+	float3 s = GiStorage(cell);
+	float2 tile = float2(s.x + s.y * kGiCounts.x, s.z);
+	// (half a texel inside the tile: the next tile is another probe)
+	float2 inTile = clamp(OctEncode(dir) * kGiTile, 0.5, kGiTile - 0.5);
+	return (tile * kGiTile + inTile) / (float2(kGiCounts.x * kGiCounts.y, kGiCounts.z) * kGiTile);
+}
+
+// The indirect light on a surface at P facing n, from the eight probes round it (irradiance / PI, like
+// AmbientDiffuse). a: how far the answer holds (0 outside the volume, fading in over its outer cells).
+// A probe counts by how near it is, less when it is behind the surface, and hardly when it does not see the place:
+// when the place is further from it than what the probe sees in that direction (walls between them).
+float4 GiDiffuse(float3 P, float3 n) {
+	if (g_GiGrid.w < 0.5 || s_GiOff) {
+		return 0.0;
+	}
+	float3 spacing = g_GiParams.xyx;
+	float3 biased = P + n * 0.3; // (off the surface: a place on a wall is not behind that wall for the probe)
+	float3 g = biased / spacing - 0.5;
+	float3 rel = g - g_GiGrid.xyz;
+	float3 edge = min(rel, (kGiCounts - 1.0) - rel);
+	float fade = saturate(min(edge.x, edge.z) * 0.5) * saturate(edge.y);
+	if (fade <= 0.0) {
+		return 0.0;
+	}
+	float3 base = floor(g);
+	float3 f = g - base;
+	float3 sum = 0.0;
+	float weight = 0.0;
+	for (int i = 0; i < 8; ++i) {
+		float3 o = float3(i & 1, (i >> 1) & 1, i >> 2);
+		float3 cell = base + o;
+		float3 probe = GiProbePosition(cell);
+		float3 tri = lerp(1.0 - f, f, o);
+		float w = tri.x * tri.y * tri.z + 0.001;
+		float wrap = (dot(normalize(probe - P), n) + 1.0) * 0.5;
+		w *= wrap * wrap + 0.2;
+		float3 pd = biased - probe;
+		float r = length(pd);
+		float2 m = g_GiDepth.SampleLevel(s_LinearClamp, GiTileUv(cell, pd / max(r, 1e-4)), 0.0).rg;
+		if (r > m.x) {
+			// (Chebyshev: the share of what the probe sees that way that lies at least this far)
+			float variance = abs(m.y - m.x * m.x);
+			float c = variance / (variance + (r - m.x) * (r - m.x));
+			w *= max(c * c * c, 0.0);
+		}
+		w = max(w, 1e-6);
+		if (w < 0.2) {
+			w *= w * w * 25.0; // (small shares are made smaller still: a probe that hardly counts should not tint)
+		}
+		sum += g_GiIrradiance.SampleLevel(s_LinearClamp, GiTileUv(cell, n), 0.0).rgb * w;
+		weight += w;
+	}
+	return float4(sum / max(weight, 1e-8), fade);
+}
+
+// The light that reaches a surface from all round it, not straight from a lamp: the probes where they stand, the
+// open sky beyond them.
+float3 AmbientLight(float3 P, float3 n) {
+	float3 sky = AmbientDiffuse(n) * g_Misc.w;
+	float4 gi = GiDiffuse(P, n);
+	return lerp(sky, gi.rgb, gi.a);
 }
 
 #endif

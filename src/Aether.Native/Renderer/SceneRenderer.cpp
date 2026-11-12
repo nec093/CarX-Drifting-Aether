@@ -13,12 +13,17 @@ namespace {
 const DXGI_FORMAT kSceneColorFormat = DXGI_FORMAT_R11G11B10_FLOAT;
 const uint32_t kClusterX = 16, kClusterY = 9, kClusterZ = 24;
 const uint32_t kMaxLightsPerCluster = 64;
-const uint32_t kGlobalsTableSize = 11; // (8: the reflection probes' atlas, 9: its blurred copy, 10: its depth) shadow atlas, sky, sky irradiance, ambient occlusion | physical sky: sky (with clouds), transmittance LUT, multiple scattering LUT, cloud noise
+// probe grid GI: probes around the camera on a grid fixed in the world (aether_scene.hlsli has the same numbers)
+const int kGiCounts[3] = {24, 8, 24};
+const float kGiSpacing = 3.0f, kGiSpacingY = 2.5f; // metres between probes on the ground / in height
+const uint32_t kGiTile = 8;                         // a probe's tile: 8 x 8 directions
+// (11: the GI probes' irradiance, 12: their distances)
+const uint32_t kGlobalsTableSize = 13; // (8: the reflection probes' atlas, 9: its blurred copy, 10: its depth) shadow atlas, sky, sky irradiance, ambient occlusion | physical sky: sky (with clouds), transmittance LUT, multiple scattering LUT, cloud noise
 const uint32_t kPostTableSize = 4;    // per full screen pass: colour / main input, depth, two auxiliary inputs
 const float kExposureAdaptationRate = 2.0f; // per second: the automatic exposure covers 63 % of a change in half a second
 const uint32_t kPostTables = 64;     // 0..3: ambient occlusion, its blur, composite, exposure metering; the rest handed out per pass (Fullscreen)
 const uint32_t kIrradianceSize = 32;  // octahedral map of the sky's diffuse light
-const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace"};
+const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace", "PSGiRays", "PSGiIrradiance", "PSGiDepth"};
 // reflection probes: each is six square tiles (3 x 2: +X -X +Y | -Y +Z -Z); the atlas holds them 4 x 2
 const uint32_t kProbeFace = 128, kProbeBlurFace = 32;
 const float kProbeCell = 12.0f;      // the grid's spacing on the ground (m)
@@ -80,6 +85,9 @@ struct FrameConstants {
 	float probeGrid[4];          // x: the grid's spacing, y: its spacing in height, z: a different number every frame, w: 1 = probes on
 	float probePositions[8][4];  // xyz: where the probe stands, w: 1 = usable
 	float reflectionBasis[6][3][4]; // per cube face: the directions of the tile's centre, its right edge and its top edge (w of the first two: near, far)
+	float giGrid[4];             // xyz: the grid cell of the GI volume's lowest corner, w: 1 = probe grid GI on
+	float giPrev[4];             // xyz: the same the frame before, w: 1 = the probes hold something
+	float giParams[4];           // x: metres between probes on the ground, y: in height, z: a different number every frame, w: number of punctual lights
 };
 
 // HDRP's "Custom" tone mapping is John Hable's piecewise filmic curve (toe, linear part, shoulder), with the parameters
@@ -278,7 +286,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 		D3D12_DESCRIPTOR_RANGE materialRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kAeSlotCount, 0, 1, 0};
 		// space2: t0 shadow atlas, t1 sky, t2 exposure, t3 ambient occlusion | t4..t6 the inputs of a full screen pass
 		// (two ranges in one table: t0..t3 of space2, then t0..t3 of space4 for the physical sky's textures)
-		D3D12_DESCRIPTOR_RANGE globalsRange[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 2, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7, 0, 4, 4}}; // (space4 t4..t6: the reflection probes)
+		D3D12_DESCRIPTOR_RANGE globalsRange[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 2, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 9, 0, 4, 4}}; // (space4 t4..t6: the reflection probes)
 		D3D12_DESCRIPTOR_RANGE postRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kPostTableSize, 4, 2, 0};
 		D3D12_DESCRIPTOR_RANGE probesRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxProbes, 0, 3, 0}; // space3: reflection probe cubes
 		D3D12_ROOT_PARAMETER params[18] = {};
@@ -624,6 +632,17 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI
 		blend.DestBlendAlpha = D3D12_BLEND_ONE;
 		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 	}
+	if (kind == kFullscreenGiIrradiance || kind == kFullscreenGiDepth) {
+		// what the probes held, moved a step towards this frame's rays (the shader gives the step in a: 1 = start anew)
+		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
+		blend.BlendEnable = TRUE;
+		blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+		blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+		blend.BlendOp = D3D12_BLEND_OP_ADD;
+		blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+		blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	}
 	if (kind == kFullscreenSsr) {
 		// added to the picture (the shader returns the reflection minus what the surface already shows there)
 		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
@@ -932,15 +951,19 @@ void SceneRenderer::UpdateProbes(const SceneFrame& scene, uint64_t frame) {
 	for (uint32_t j = 0; j < _countof(probeJobs_); ++j) {
 		int best = -1;
 		float bestScore = 0;
-		for (int k = 0; k < 8; ++k) {
-			if (wanted[k] < 0) {
+		// (Every probe that holds a picture, not only the ones wanted this frame: the others are still read where
+		// they stand near enough, and left alone they kept showing the light of the hour they were drawn in. With the
+		// camera at rest the daylight stayed in the reflections after night fell, until the view moved.)
+		for (uint32_t s = 0; s < kProbeSlots; ++s) {
+			const LightProbe& p = lightProbes_[s];
+			if (!p.used) {
 				continue;
 			}
-			const LightProbe& p = lightProbes_[wanted[k]];
 			const bool whole = p.facesDone == 0x3Fu;
-			const float score = whole ? float(frame - p.lastDrawn) : 1e9f - Length(p.position - camera);
+			const bool wantedNow = p.lastWanted == frame;
+			const float score = whole ? float(frame - p.lastDrawn) : (wantedNow ? 1e9f : 1e8f) - Length(p.position - camera);
 			if (best < 0 || score > bestScore) {
-				best = wanted[k];
+				best = int(s);
 				bestScore = score;
 			}
 		}
@@ -1046,9 +1069,44 @@ void SceneRenderer::BuildCascades(const SceneFrame& scene, const SettingsData& s
 			sunShadows_ = true;
 			sunLayerMask_ = ~0u;
 		}
+		// (the scene at night while the time of day setting says day: the sky's hour is midnight)
+		const bool sceneNight = settings.followSceneNight && sceneNight_.load();
+		sceneSunLum_ = hasSun_ ? best : 0.0f;
 		sunDirection_ = SunDirectionAt(settings.timeOfDay, settings.sunHeading);
+		if (sceneNight && sunDirection_.y > -0.21f) {
+			sunDirection_ = SunDirectionAt(0.0f, settings.sunHeading);
+		}
+		// Night: once the twilight is over (the sun 7 to 12 degrees under the horizon) the light in the sky is the
+		// moon's. A full moon, which stands opposite the sun. Everything that knows of "the sun" (shadows, the sky's
+		// scattering, the clouds, the disc in the sky) then works with the moon, at the moon's strength: the same
+		// physics, dimmer. The strength is not the real one (a full moon gives 2.5 millionths of the sun's light): it
+		// is set so that the moon's light and its shadows read against the night sky's own glow.
+		moonShare_ = std::min(std::max((-sunDirection_.y - 0.12f) / 0.09f, 0.0f), 1.0f);
+		const float kMoonLight = 1.6e-4f;
+		Vec3 tint = {1.06f, 0.99f, 0.90f}; // the sun above the air is a little warmer than the white the picture is balanced for (same luminance)
+		float strength = atmosphereScale_;
+		if (moonShare_ > 0.0f) {
+			sunDirection_ = sunDirection_ * -1.0f;
+			tint = {0.80f, 0.90f, 1.08f}; // (moonlight is sunlight off grey rock, slightly warm in truth: it is the dark adapted eye that sees it blue)
+			strength = atmosphereScale_ * kMoonLight * moonShare_ * settings.moonlight * 2.0f;
+			if (sceneNight && sceneSunLum_ > 0.0f) {
+				// The scene's night lighting has a light for the moon of its own, and its lamps are set against that
+				// light. So the moon is as bright as the scene's: a moon scaled from the day's sun was far dimmer, and
+				// next to it every lamp of the map was a glare.
+				const Vec3 at = AtmosphereTransmittance(sunDirection_.y);
+				strength = sceneSunLum_ / std::max(at.x * tint.x * 0.2126f + at.y * tint.y * 0.7152f + at.z * tint.z * 0.0722f, 1e-3f) * moonShare_;
+				// (The scene's own night light is a strong one, a twenty-fourth of its sun, where a full moon gives
+				// a four hundred thousandth: used as it is, the night was an overcast afternoon. The user's wish is a
+				// real night: the moon gives a sixth of the scene's night light. What that light meant, how
+				// bright the scene's lamps are against it, is kept by the exposure: see UploadFrameData.)
+				// (0.04 at first: with no lamp near, the garage was black. Tried through the exposure setting: two stops
+				// more is a night one can still see the yard in.)
+				strength *= 0.16f * settings.moonlight; // (the user found 0.16 still too bright: the setting's default is half)
+			}
+			moonStrength_ = strength;
+		}
 		const Vec3 through = AtmosphereTransmittance(sunDirection_.y);
-		sunColor_ = {through.x * atmosphereScale_, through.y * atmosphereScale_, through.z * atmosphereScale_};
+		sunColor_ = {through.x * tint.x * strength, through.y * tint.y * strength, through.z * tint.z * strength};
 		hasSun_ = sunDirection_.y > -0.02f && (sunColor_.x + sunColor_.y + sunColor_.z) > 0.0f;
 		if (!hasSun_) {
 			sunColor_ = {0, 0, 0};
@@ -1156,9 +1214,19 @@ void SceneRenderer::BuildClusters(const SceneFrame& scene) {
 		d.colorInner[3] = l.spotInnerCos;
 		d.typeFlags[0] = float(l.type);
 		memcpy(&d.typeFlags[1], &l.layerMask, sizeof(uint32_t)); // rendering layers the light reaches (asuint)
+		float range = l.range;
+		if ((l.flags & kAeLightHeadlamp) && l.type == kAeLightSpot) {
+			// a head lamp: the shader shapes the beam itself (a low beam's pattern), inside a wide cone and as far
+			// as a low beam reaches
+			d.typeFlags[2] = 1.0f;
+			d.directionOuter[3] = 0.5f; // cos 60 degrees
+			d.colorInner[3] = 0.6f;
+			range = std::max(range, 90.0f);
+			d.positionRange[3] = range;
+		}
 		lightData_.resize(size_t(punctualCount_ + 1) * sizeof(LightData));
 		memcpy(lightData_.data() + size_t(punctualCount_) * sizeof(LightData), &d, sizeof(d));
-		viewLights.push_back({TransformPoint(view, {l.position[0], l.position[1], l.position[2]}), l.range});
+		viewLights.push_back({TransformPoint(view, {l.position[0], l.position[1], l.position[2]}), range});
 		++punctualCount_;
 	}
 	if (punctualCount_ == 0) {
@@ -1295,6 +1363,39 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 			fc.probePositions[s][3] = p.used && done == 0x3Fu && p.wholeSince ? std::min(float(frame_ - p.wholeSince) / 30.0f, 1.0f) : 0.0f;
 		}
 	}
+	// ---- probe grid GI: the volume follows the camera a whole cell at a time (the probes stay where they are in the
+	// world, and each keeps its place in the textures: its cell modulo the counts)
+	gi_ = bvhReady_ && settings.probeGi;
+	if (gi_ && !giRays_) {
+		GpuTextureDesc g;
+		g.width = uint32_t(kGiCounts[0] * kGiCounts[1]) * kGiTile;
+		g.height = uint32_t(kGiCounts[2]) * kGiTile;
+		g.format = g.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		g.renderTarget = true;
+		giRays_ = gpu.CreateTexture(g, "Gi.Rays", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		giIrradiance_ = gpu.CreateTexture(g, "Gi.Irradiance", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		giDepth_ = gpu.CreateTexture(g, "Gi.Distance", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		giHistory_ = false;
+	}
+	gi_ = gi_ && giRays_ && giIrradiance_ && giDepth_;
+	if (gi_) {
+		const float spacing[3] = {kGiSpacing, kGiSpacingY, kGiSpacing};
+		for (int k = 0; k < 3; ++k) {
+			fc.giPrev[k] = float(giMin_[k]);
+			// (a probe stands in the middle of its cell: the camera between the two middle probes)
+			giMin_[k] = int(std::floor(scene.frame.cameraPosition[k] / spacing[k] - 0.5f)) - kGiCounts[k] / 2 + 1;
+			fc.giGrid[k] = float(giMin_[k]);
+		}
+		fc.giGrid[3] = 1.0f;
+		fc.giPrev[3] = giHistory_ ? 1.0f : 0.0f;
+		fc.giParams[0] = kGiSpacing;
+		fc.giParams[1] = kGiSpacingY;
+		fc.giParams[2] = float(frame_ % 4096);
+		fc.giParams[3] = float(punctualCount_);
+		giHistory_ = true;
+	} else {
+		giHistory_ = false;
+	}
 	indirect_ = settings.indirectLight && settings.ssao && taa_ && historyValid_;
 	fc.qualityParams[2] = indirect_ ? settings.indirectStrength : 0.0f;
 	memcpy(fc.prevViewProj, prevViewProj_.m, 64);
@@ -1375,6 +1476,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		exposureTime_ = now;
 		fc.exposureParams[3] = exposureValid_ ? 1.0f - std::exp(-dt * kExposureAdaptationRate) : 1.0f;
 	}
+	// (Night is exposed darker than the meter asks: metered to the usual middle grey a moonlit yard looked like an
+	// overcast afternoon. 1.2 stops under, tried against 2.2: dark, with the lamps as the bright things in it.)
 	fc.exposure[2] = std::pow(2.0f, settings.exposureEV + f.postExposure);
 	// tone mapping: 0 none, 1 ACES, 2 neutral, 3 the host's custom curve
 	float tone = settings.tonemap == "aces" ? 1.0f : settings.tonemap == "neutral" ? 2.0f : settings.tonemap == "agx" ? 4.0f : 0.0f;
@@ -1394,8 +1497,11 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.misc[0] = float(std::find(views.begin(), views.end(), settings.debugView) - views.begin());
 	const bool skyTexture = sky && sky->srv != UINT32_MAX;
 	fc.misc[1] = skyTexture || physicalSky_ ? 1.0f : 0.0f; // (a sky there is: its texture, or the physical one)
-	fc.atmosphere[0] = atmosphereScale_;
-	fc.atmosphere[1] = atmosphereScale_ * 2.0e-5f; // what a moonless night leaves (airglow, stars): keeps the night from being black
+	// (at night the air is lit by the moon: the sky's scattering at the moon's strength)
+	fc.atmosphere[0] = moonShare_ > 0.0f ? moonStrength_ : atmosphereScale_;
+	// what a moonless night leaves (airglow, stars): keeps the night from being black. (An eighth of the moon's unit
+	// when that is what the scene's own night light sets.)
+	fc.atmosphere[1] = std::max(atmosphereScale_ * 2.0e-5f, moonShare_ >= 1.0f ? moonStrength_ * 0.125f : 0.0f); // what a moonless night leaves (airglow, stars): keeps the night from being black
 	fc.atmosphere[2] = std::min(std::max(f.cameraPosition[1], 0.0f) * 0.001f + 0.05f, 60.0f);
 	fc.atmosphere[3] = physicalSky_ ? 1.0f : 0.0f;
 	if (physicalSky_) {
@@ -1405,6 +1511,17 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		fc.sunDirection[2] = sunDirection_.z;
 		// the scene's exposure range is made for its own sky: evenings and nights need far more room
 		fc.exposureParams[0] -= 14.0f;
+		if (moonShare_ > 0.0f && sceneSunLum_ > 0.0f) {
+			// Night: the meter must not open up until the dark is a grey afternoon (it did, and every lamp was a
+			// glare in it). It stops where a matt grey surface in the scene's own light would be a middle grey:
+			// at the scene's night light when the scene is at night (its lamps are set against that), eight stops
+			// under its daylight otherwise. What the moon lights is then some stops darker than that, as at night.
+			const bool sceneNight = settings.followSceneNight && sceneNight_.load();
+			const float reference = std::log2(std::max(sceneSunLum_ * 0.2f / 3.14159265f * 8.0f, 1e-6f));
+			const float floorEv = sceneNight ? reference - 0.5f : reference - 8.0f;
+			fc.exposureParams[0] = std::max(fc.exposureParams[0], fc.exposureParams[0] * (1.0f - moonShare_) + floorEv * moonShare_);
+			fc.exposureParams[1] = std::max(fc.exposureParams[1], fc.exposureParams[0]);
+		}
 		GpuTextureDesc d;
 		d.format = d.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 		d.renderTarget = true;
@@ -1426,7 +1543,7 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		}
 		if (!cloudNoise_) {
 			GpuTextureDesc n;
-			n.width = n.height = 512;
+			n.width = n.height = 1024; // 64 slices of 128 x 128, laid out 8 x 8: a noise volume (aether_clouds.hlsli)
 			n.format = n.targetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 			n.renderTarget = true;
 			cloudNoise_ = gpu.CreateTexture(n, "Sky.CloudNoise", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
@@ -1603,6 +1720,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	gpu.CopySrv(globalsTable_ + 8, reflection_ && reflectionAtlas_[0] ? reflectionAtlas_[0]->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 9, reflection_ && reflectionAtlas_[1] ? reflectionAtlas_[1]->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 10, reflection_ && reflectionDepth_ ? reflectionDepth_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 11, gi_ ? giIrradiance_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 12, gi_ ? giDepth_->srv : nullTextureSrv_);
 	// (the table the cube's own faces are drawn with: the same, without the cube and without screen space occlusion)
 	probeGlobalsTable_ = reflection_ ? gpu.AllocSrv(kGlobalsTableSize) : UINT32_MAX;
 	if (probeGlobalsTable_ != UINT32_MAX) {
@@ -1617,6 +1736,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		for (uint32_t i = 0; i < 3; ++i) {
 			gpu.CopySrv(probeGlobalsTable_ + 8 + i, nullTextureSrv_);
 		}
+		gpu.CopySrv(probeGlobalsTable_ + 11, gi_ ? giIrradiance_->srv : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 12, gi_ ? giDepth_->srv : nullTextureSrv_);
 	} else {
 		reflection_ = false;
 	}
@@ -1862,7 +1983,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	}
 	// ---- ray tracing: the trees that arrived; the tree over this frame's instances is filled while the draw lists are
 	// built (the same walk over the instances) and built after it
-	raysWanted_ = settings.rayTracedReflections || settings.debugView == "bvh" || settings.debugView == "bvhCost";
+	raysWanted_ = settings.rayTracedReflections || settings.probeGi || settings.debugView == "bvh" || settings.debugView == "bvhCost";
 	SceneBvh::Get().BeginFrame(device_, list, retireFence, frame);
 	SceneBvh::Get().BeginInstances();
 	raysWanted_ = raysWanted_ && SceneBvh::Get().HasTrees();
@@ -2039,6 +2160,42 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		gpu.CopySrv(postTable_ + kPostTableSize + 1, ctx.Texture(depth)->srv);
 		fullscreenAo(ctx, kFullscreenAoBlur, aoFinal, postTable_ + kPostTableSize);
 	});
+	// ---- probe grid GI: every probe sends 64 rays (one per direction of its tile, moved about inside it from frame
+	// to frame); what they bring back is gathered into the probes' irradiance and distances, a small step per frame
+	if (gi_) {
+		const RenderGraph::ResourceId giRays = graph_.Import(giRays_), giIrradiance = graph_.Import(giIrradiance_), giDepth = graph_.Import(giDepth_);
+		graph_.AddPass("GiRays", true, [&, giRays, giIrradiance, giDepth](RenderGraph::Builder& b) {
+			// (a hit is lit by the probes of the frame before as well: light bounces on, a bounce per frame)
+			b.Read(giIrradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(giDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			if (shadow != RenderGraph::kInvalid) {
+				b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			if (skyLight) {
+				b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			b.Write(giRays, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, giRays](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenGiRays, ctx.Texture(giRays), nullptr);
+			ctx.note = Format("%d probes, %u rays each", kGiCounts[0] * kGiCounts[1] * kGiCounts[2], kGiTile * kGiTile);
+		});
+		graph_.AddPass("GiIrradiance", true, [&, giRays, giIrradiance](RenderGraph::Builder& b) {
+			b.Read(giRays, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(giIrradiance, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, giRays, giIrradiance](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenGiIrradiance, ctx.Texture(giIrradiance), ctx.Texture(giRays));
+		});
+		graph_.AddPass("GiDistance", true, [&, giRays, giDepth](RenderGraph::Builder& b) {
+			b.Read(giRays, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(giDepth, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, giRays, giDepth](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenGiDepth, ctx.Texture(giDepth), ctx.Texture(giRays));
+		});
+		graph_.AddPass("GiReady", true, [&, giIrradiance, giDepth](RenderGraph::Builder& b) {
+			b.Read(giIrradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(giDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}, [](RenderGraph::PassContext&) {});
+	}
 	// ---- reflection probes: this frame's faces, then the blurred copy of the atlas
 	RenderGraph::ResourceId reflectionId[3] = {RenderGraph::kInvalid, RenderGraph::kInvalid, RenderGraph::kInvalid};
 	const RenderGraph::ResourceId reflectionDepth = reflection_ ? graph_.Import(reflectionDepth_) : RenderGraph::kInvalid;
@@ -2575,6 +2732,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 			{"maxLightsInACluster", maxPerCluster}, {"lightIndexEntries", lightIndices_.size()}, {"clusterGrid", {kClusterX, kClusterY, kClusterZ}}}},
 		{"shadows", {{"cascades", cascades_.size()}, {"cascadeSize", shadowCascadeSize_}, {"atlasBytes", shadowAtlas_ ? shadowAtlas_->bytes : 0}}},
 		{"reflectionProbes", {{"host", scene.probes.size()}, {"inFrame", probesInFrame_}}},
+		{"sky", {{"sceneNight", sceneNight_.load()}, {"moonShare", moonShare_}, {"sceneSunLuminance", sceneSunLum_}, {"lightLuminance", sunColor_.x * 0.2126f + sunColor_.y * 0.7152f + sunColor_.z * 0.0722f}, {"atmosphereScale", atmosphereScale_}}},
 		{"particles", {{"submitted", scene.particles.size()}, {"batches", scene.particleBatches.size()}, {"drawn", particlesDrawn_}}},
 		{"sceneColorFormat", int(kSceneColorFormat)},
 	};
@@ -2638,6 +2796,10 @@ void SceneRenderer::Release(bool leak) {
 	multiScatterLut_.reset();
 	skyViewLut_.reset();
 	cloudNoise_.reset();
+	giRays_.reset();
+	giIrradiance_.reset();
+	giDepth_.reset();
+	gi_ = giHistory_ = false;
 	skyCloudsLut_.reset();
 	for (auto& t : reflectionAtlas_) {
 		t.reset();

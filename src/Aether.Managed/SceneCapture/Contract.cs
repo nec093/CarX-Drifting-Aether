@@ -217,6 +217,7 @@ namespace Aether {
 		public const uint FrameInstanceShadowOnly = 2;
 		public const uint LightDirectional = 0, LightPoint = 1, LightSpot = 2;
 		public const uint LightCastsShadows = 1;
+		public const uint LightHeadlamp = 2;
 		public const uint FrameCameraValid = 1;
 
 		public const int KindMesh = 0, KindTexture = 1, KindMaterial = 2, KindInstance = 3;

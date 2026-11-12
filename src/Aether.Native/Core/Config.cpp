@@ -8,7 +8,7 @@
 namespace aether {
 
 static const std::vector<std::string> kQualities = {"low", "medium", "high", "ultra"};
-static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections"};
+static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections", "followSceneNight", "probeGi"};
 static const std::vector<std::string> kRenderModes = {"hdrp", "aether", "compare", "standalone"};
 static const std::vector<std::string> kSkyModes = {"physical", "scene"};
 static const std::vector<std::string> kTonemaps = {"host", "agx", "aces", "neutral", "none"};
@@ -47,9 +47,12 @@ static json ToJsonData(const SettingsData& d) {
 		{"volumetricFog", d.volumetricFog},
 		{"indirectLight", d.indirectLight},
 		{"reflectionProbe", d.reflectionProbe},
+		{"probeGi", d.probeGi},
+		{"followSceneNight", d.followSceneNight},
 		{"rayTracedReflections", d.rayTracedReflections},
 		{"indirectStrength", d.indirectStrength},
 		{"fogStrength", d.fogStrength},
+		{"moonlight", d.moonlight},
 		{"skinnedRayUpdates", d.skinnedRayUpdates},
 		{"tonemap", d.tonemap},
 		{"skyMode", d.skyMode},
@@ -93,7 +96,10 @@ json Settings::Schema() {
 		{"volumetricFog", {{"type", "boolean"}, {"description", "Fog lit by the sun through the shadow map (light shafts), where the scene has fog"}}},
 		{"indirectLight", {{"type", "boolean"}, {"description", "Light bounced off nearby surfaces (screen space)"}}},
 		{"reflectionProbe", {{"type", "boolean"}, {"description", "Reflections of the surroundings, also of what is off screen: a cube drawn around the camera every frame"}}},
+		{"followSceneNight", {{"type", "boolean"}, {"description", "The physical sky turns to night (about midnight, moon up) while the game's own day / night switch is on night"}}},
+		{"probeGi", {{"type", "boolean"}, {"description", "Indirect light from a grid of probes around the camera: each traces rays through the scene's triangles every frame (roofs shut out the sky, lit surfaces light their surroundings)"}}},
 		{"rayTracedReflections", {{"type", "boolean"}, {"description", "Reflections on smooth surfaces from rays traced through the scene's triangles (what is off screen too)"}}},
+		{"moonlight", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "The moon's light at night, as a factor"}}},
 		{"fogStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 20.0}, {"description", "Factor on the scene's fog density"}}},
 		{"skinnedRayUpdates", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "Skinned meshes whose pose is read back from the GPU per frame for ray traced reflections (0 = none, the default: reading every frame makes the game skip frames after a while)"}}},
 		{"indirectStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 3.0}, {"description", "Factor on the bounced light"}}},
@@ -186,12 +192,21 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 	if (key == "volumetricFog") return wantBool(d.volumetricFog);
 	if (key == "indirectLight") return wantBool(d.indirectLight);
 	if (key == "reflectionProbe") return wantBool(d.reflectionProbe);
+	if (key == "probeGi") return wantBool(d.probeGi);
+	if (key == "followSceneNight") return wantBool(d.followSceneNight);
 	if (key == "rayTracedReflections") return wantBool(d.rayTracedReflections);
 	if (key == "skinnedRayUpdates") {
 		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= 4.0)) {
 			return "skinnedRayUpdates must be a number between 0 and 4";
 		}
 		d.skinnedRayUpdates = float(value.get<double>());
+		return {};
+	}
+	if (key == "moonlight") {
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= 4.0)) {
+			return "moonlight must be a number between 0 and 4";
+		}
+		d.moonlight = float(value.get<double>());
 		return {};
 	}
 	if (key == "fogStrength") {

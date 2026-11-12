@@ -779,7 +779,7 @@ void SettingsTab() {
 		{"antialiasing", "Antialiasing (temporal)", s.antialiasing}, {"shadows", "Sun shadows", s.shadows}, {"ssao", "Ambient occlusion", s.ssao},
 		{"ssr", "Screen space reflections", s.ssr}, {"bloom", "Bloom", s.bloom}, {"motionBlur", "Motion blur", s.motionBlur},
 		{"particles", "Particles and tyre smoke", s.particles}, {"volumetricFog", "Volumetric fog (light shafts)", s.volumetricFog},
-		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections},
+		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections}, {"probeGi", "Global illumination (probe grid, ray traced)", s.probeGi}, {"followSceneNight", "Night when the game's scene is at night", s.followSceneNight},
 	};
 	for (Toggle& t : toggles) {
 		if (ImGui::Checkbox(t.label, &t.value)) {
@@ -791,6 +791,7 @@ void SettingsTab() {
 		{"shadowSoftness", "Shadow softness (texels)", s.shadowSoftness, 0.0f, 4.0f, "%.1f"},
 		{"indirectStrength", "Indirect light strength", s.indirectStrength, 0.0f, 3.0f, "%.2f"},
 		{"fogStrength", "Fog density (factor)", s.fogStrength, 0.0f, 20.0f, "%.1f"},
+		{"moonlight", "Moonlight at night (factor)", s.moonlight, 0.0f, 4.0f, "%.2f"},
 		{"skinnedRayUpdates", "Skinned poses read per frame (reflections)", s.skinnedRayUpdates, 0.0f, 4.0f, "%.0f"},
 		{"motionBlurStrength", "Motion blur strength", s.motionBlurStrength, 0.0f, 2.0f, "%.2f"},
 		{"bloomStrength", "Bloom strength", s.bloomStrength, 0.0f, 2.0f, "%.2f"},

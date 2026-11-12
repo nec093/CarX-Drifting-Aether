@@ -1,6 +1,7 @@
 // Aether inside Unity: the Unity native plugin interface (IUnityGraphicsD3D12v7) as the HostGfx, the render events,
 // and the DLL's C exports. See docs/architecture/dx12-integration.md for why each call is made where it is.
 #include "../Renderer/Bvh.h"
+#include "../Renderer/SceneRenderer.h"
 #include "../Core/DevOptions.h"
 #include "../Core/Common.h"
 #include "../Core/Log.h"
@@ -320,6 +321,7 @@ AETHER_API void Aether_SceneDestroy(int kind, AeHandle handle) {
 		SceneBvh::Get().Forget(handle); // (a mesh: its ray tracing tree goes with it)
 	}
 }
+AETHER_API void Aether_SetSceneNight(int night) { SceneRenderer::Get().SetSceneNight(night != 0); }
 AETHER_API void Aether_SceneMeshChanging(AeHandle mesh) { SceneBvh::Get().MarkChanging(mesh); }
 AETHER_API void Aether_SceneMeshAlias(AeHandle alias, AeHandle mesh) { SceneBvh::Get().Alias(alias, mesh); }
 AETHER_API void Aether_SceneMeshForget(AeHandle mesh) { SceneBvh::Get().Forget(mesh); }

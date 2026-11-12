@@ -10,7 +10,7 @@
 #define AETHER_API extern "C" __declspec(dllimport)
 #endif
 
-#define AETHER_API_VERSION 5
+#define AETHER_API_VERSION 6
 
 // Render events for GL.IssuePluginEvent(Aether_GetRenderEventFunc(), id)
 #define AETHER_EVENT_FRAME_BEGIN 1 // first thing in the frame (GPU timestamp)
@@ -89,6 +89,8 @@ AETHER_API void Aether_SceneMeshAlias(AeHandle alias, AeHandle mesh);
 AETHER_API void Aether_SceneMeshForget(AeHandle mesh);
 // Every tree goes (the set of loaded scenes changed): the caller sends the geometry of what is still there again.
 AETHER_API void Aether_SceneBvhReset(void);
+// The game's own day / night switch as the managed side finds it: 1 night, 0 day or unknown.
+AETHER_API void Aether_SetSceneNight(int night);
 AETHER_API int Aether_GetRenderMode(void);
 // Experiment switches for the scene capture (Core/DevOptions.h); 0 in normal operation.
 AETHER_API int Aether_DevCaptureFlags();

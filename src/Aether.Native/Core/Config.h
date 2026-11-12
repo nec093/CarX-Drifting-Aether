@@ -27,6 +27,8 @@ struct SettingsData {
 	bool particles = true;           // the game's particle systems and tyre smoke
 	bool ssr = true;                 // screen space reflections as the game's volumes set them
 	bool volumetricFog = true;       // fog lit by the sun through the shadow map (light shafts), where the scene has fog
+	bool followSceneNight = true;    // the physical sky turns to night when the game's scene does (its day / night switch)
+	bool probeGi = true;             // indirect light from a grid of probes around the camera that trace rays (needs the ray tracing geometry)
 	bool reflectionProbe = true;     // the surroundings drawn into a cube around the camera every frame, for reflections
 	bool rayTracedReflections = true; // smooth surfaces mirror what rays through the scene's triangles find (also off screen)
 	bool indirectLight = true;       // light bounced off nearby surfaces (screen space, with the ambient occlusion pass)
@@ -45,6 +47,7 @@ struct SettingsData {
 	// reflections). 0 by default: read back every frame, Unity's frame fence falls further and further behind (measured:
 	// after about 45 s forty of Aether's 48 command lists wait for it and most frames are skipped: the picture flickers).
 	float skinnedRayUpdates = 0.0f;
+	float moonlight = 0.5f;        // 0 .. 4: the moon's light at night, as a factor (1: a night one can see the yard in; 0.25: nearly black)
 	float fogStrength = 1.0f;      // 0 .. 20: factor on the scene's fog density
 	float smokeOpacity = 1.0f; // Tyre smoke opacity factor
 	float lodBias = 2.8f; // Unity's LOD bias: higher keeps detailed models up to a greater distance

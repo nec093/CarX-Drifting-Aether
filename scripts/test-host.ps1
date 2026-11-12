@@ -4,13 +4,13 @@
 #      captures checked pixel by pixel (where things are, what is in front, which side of a face is drawn, a mirrored
 #      instance, shadows, blending, the diagnostic material, a scene unload and reload).
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-host.ps1 [-Config RelWithDebInfo] [-Seconds 12] [-Warp] [-Show] [-Keep] [-SceneOnly]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-host.ps1 [-Config RelWithDebInfo] [-Seconds 25] [-Warp] [-Show] [-Keep] [-SceneOnly]
 #
 # Passes when both runs print HOST OK (no D3D12 errors, no Aether errors, no leaked device objects) and every pixel
 # check holds. -Show: visible, focused windows. -Keep: keep the data folders (logs, captures) and print where they are.
 param(
 	[string]$Config = 'RelWithDebInfo',
-	[double]$Seconds = 12,
+	[double]$Seconds = 25,
 	[switch]$Warp,
 	[switch]$Show,
 	[switch]$Keep,

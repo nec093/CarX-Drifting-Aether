@@ -42,6 +42,7 @@ struct BvhHit {
 	float3 normal;  // the triangle's normal in the world, facing the ray's origin
 	float2 bary;    // where in the triangle: the second and third vertex's shares
 	uint steps;     // boxes and triangles tested (the ray's cost)
+	uint back;      // 1: the triangle was met from behind (only asked for by BvhTraceEx)
 };
 
 // Where the ray enters the box, or a huge number when it misses it or the box lies beyond tMax.
@@ -57,7 +58,11 @@ float3 BvhSafeInverse(float3 d) {
 }
 
 // The nearest triangle along o + d t for t in (0, tMax). `anyHit`: stop at the first one found (shadow rays).
-BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
+// `backFaces`: single sided triangles met from behind count too (hit.back says so): for the GI probes, which must
+// know when they look at the inside of something.
+// `maxSteps`: the ray gives up after that many boxes and triangles and returns what it has (a pass takes as long as
+// its slowest ray: a few rays through clutter held the GI pass at over a millisecond however few rays there were).
+BvhHit BvhTraceEx(float3 o, float3 d, float tMax, bool anyHit, bool backFaces, uint maxSteps) {
 	BvhHit hit;
 	hit.t = -1.0;
 	hit.instance = 0;
@@ -65,6 +70,7 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 	hit.normal = 0.0;
 	hit.bary = 0.0;
 	hit.steps = 0;
+	hit.back = 0;
 	float best = tMax;
 	float3 inv = BvhSafeInverse(d);
 	uint topStack[24];
@@ -75,7 +81,7 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 	if (BvhBox(o, inv, g_TlasNodes[0].bmin, g_TlasNodes[0].bmax, best) > 1e29) {
 		return hit;
 	}
-	[loop] while (top >= 0) {
+	[loop] while (top >= 0 && hit.steps < maxSteps) {
 		BvhNode node = g_TlasNodes[topStack[top--]];
 		if (node.b == 0) {
 			// the nearer child first: what it finds shortens the ray for the other
@@ -103,7 +109,7 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 		if (BvhBox(lo, linv, g_BvhNodes[inst.root].bmin, g_BvhNodes[inst.root].bmax, best) > 1e29) {
 			continue;
 		}
-		[loop] while (sp >= 0) {
+		[loop] while (sp >= 0 && hit.steps < maxSteps) {
 			BvhNode n = g_BvhNodes[meshStack[sp--]];
 			if (n.b == 0) {
 				BvhNode l = g_BvhNodes[n.a], r = g_BvhNodes[n.a + 1];
@@ -135,7 +141,8 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 				// sided). Left in, single sided things (ground planes, backdrops) blocked rays from below and behind.
 				// (det > 0: the ray meets the front, the side Unity's winding faces. This is asked in the mesh's own space,
 				// where a mirrored instance's triangles are what they always were: mirroring changes nothing here.)
-				if (det < 0.0 && (tri.subMesh >= 32u || ((inst.doubleSided >> tri.subMesh) & 1u) == 0u)) {
+				bool behind = det < 0.0 && (tri.subMesh >= 32u || ((inst.doubleSided >> tri.subMesh) & 1u) == 0u);
+				if (behind && !backFaces) {
 					continue;
 				}
 				float invDet = 1.0 / det;
@@ -150,6 +157,7 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 					hit.instance = node.a;
 					hit.tri = n.a + i;
 					hit.bary = float2(u, v);
+					hit.back = behind ? 1u : 0u;
 				}
 			}
 			if (anyHit && hit.t > 0.0) {
@@ -168,6 +176,10 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 	return hit;
 }
 
+BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
+	return BvhTraceEx(o, d, tMax, anyHit, false, 100000u);
+}
+
 // What a ray hit, where the screen cannot tell (the caller looks there first, if it can): the surface's own colour
 // from its material and base texture, lit by the sun (through the shadow map where that reaches, and the clouds) and
 // the sky. rgb: the light it sends back, a: 0 = nothing there after all (the texture's alpha cuts it away: the caller
@@ -176,7 +188,8 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 // not see was coloured without its texture: the mirrored ground came out as a pale band.)
 // `t`: how far the ray went (the further, the coarser the texture level read: there are no derivatives here).
 // `d`: the ray's direction.
-float4 BvhHitSurface(float3 P, BvhHit hit, float t, float3 d) {
+// `punctual`: lit by the scene's lamps as well (all of them that reach it, without shadows): for the GI probes.
+float4 BvhHitSurfaceLit(float3 P, BvhHit hit, float t, float3 d, bool punctual) {
 	TlasInstance inst = g_TlasInstances[hit.instance];
 	BvhTri tri = g_BvhTris[hit.tri];
 	uint2 entry = g_RayMaterials[(inst.materialOffset & 0x7FFFFFFFu) + tri.subMesh];
@@ -202,12 +215,37 @@ float4 BvhHitSurface(float3 P, BvhHit hit, float t, float3 d) {
 		albedo = tex.rgb * mat.baseColor.rgb;
 	}
 	float3 n = hit.normal;
-	float3 light = AmbientDiffuse(n) * g_Misc.w;
+	float3 light = AmbientLight(P, n);
 	float sun = 0.0;
 	if (g_SunDirection.w > 0.5) {
 		uint cascade = 0;
 		sun = SunShadow(P, n, 0.0, cascade) * CloudShadow(P);
 		light += g_SunColor.rgb * (saturate(dot(n, g_SunDirection.xyz)) * sun / PI);
+	}
+	if (punctual) {
+		uint count = min((uint)g_GiParams.w, 128u);
+		[loop] for (uint li = 0; li < count; ++li) {
+			LightData lamp = g_Lights[li];
+			float3 toLight = lamp.positionRange.xyz - P;
+			float d2 = dot(toLight, toLight);
+			float range = lamp.positionRange.w;
+			float nl = dot(n, toLight);
+			if (d2 >= range * range || nl <= 0.0) {
+				continue;
+			}
+			float3 L = toLight * rsqrt(max(d2, 1e-6));
+			float w = saturate(1.0 - (d2 * d2) / (range * range * range * range));
+			// (no nearer than half a metre: a lamp set into a wall would make one texel of a probe blaze)
+			float attenuation = w * w / max(d2, 0.25);
+			if (lamp.typeFlags.x > 1.5) {
+				float outer = lamp.directionOuter.w, inner = lamp.colorInner.w;
+				attenuation *= smoothstep(outer, max(inner, outer + 1e-4), dot(-L, lamp.directionOuter.xyz));
+				if (lamp.typeFlags.z > 0.5) {
+					attenuation *= 0.15; // (a head lamp's cone is wide and mostly dim: see HeadlampBeam)
+				}
+			}
+			light += lamp.colorInner.rgb * (dot(n, L) * attenuation / PI);
+		}
 	}
 	float3 lit = saturate(albedo) * light;
 	// Metal has no colour of its own to light: it shows what it mirrors in turn. (Lit like paint, a chromed wheel
@@ -223,4 +261,8 @@ float4 BvhHitSurface(float3 P, BvhHit hit, float t, float3 d) {
 		lit = lerp(lit, f0 * mirrored * 0.5, saturate(metal));
 	}
 	return float4(lit, 1.0);
+}
+
+float4 BvhHitSurface(float3 P, BvhHit hit, float t, float3 d) {
+	return BvhHitSurfaceLit(P, hit, t, d, false);
 }

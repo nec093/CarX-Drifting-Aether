@@ -3,6 +3,7 @@
 // Everything is recorded into the one command list the caller hands in; the passes are declared in the render graph.
 // docs/architecture/forward-plus.md. Render thread only, except Stats().
 #pragma once
+#include <atomic>
 #include <chrono>
 #include "../Core/Common.h"
 #include "../Core/Config.h"
@@ -39,6 +40,7 @@ public:
 
 	// ---- any thread
 	json Stats();
+	void SetSceneNight(bool night) { sceneNight_.store(night); }
 	json GraphDescription() { return graph_.Describe(); }
 
 private:
@@ -65,7 +67,7 @@ private:
 	void UploadDefaults(ID3D12GraphicsCommandList* list);
 	ID3D12PipelineState* Pipeline(uint32_t layoutId, PassKind kind, uint32_t cull);
 	// full screen passes: one pixel shader each (scene_post.hlsl), named in kFullscreenEntry (SceneRenderer.cpp)
-	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenKindCount };
+	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenGiRays, kFullscreenGiIrradiance, kFullscreenGiDepth, kFullscreenKindCount };
 	// draws a full screen pass into `output` (its whole size) with up to three inputs; `params` reach the shader as g_PassParams
 	bool Fullscreen(RenderGraph::PassContext& ctx, FullscreenKind kind, GpuTexture* output, GpuTexture* in0, GpuTexture* in1 = nullptr, GpuTexture* in2 = nullptr, const float* params = nullptr, GpuTexture* in3 = nullptr);
 	uint32_t postNext_ = 0; // the next free table of this frame's post tables
@@ -84,6 +86,10 @@ private:
 	bool physicalSky_ = false;
 	bool atmosphereLutsValid_ = false;
 	float atmosphereScale_ = 1.0f; // the atmosphere's unit (sun illuminance 1 above the air) in scene units
+	std::atomic<bool> sceneNight_{false}; // the game's own day / night switch is on night
+	float moonStrength_ = 0.0f;    // the atmosphere's unit while the moon is the light (scene units)
+	float sceneSunLum_ = 0.0f;     // the scene's own brightest directional light (its sun by day, its moon at night)
+	float moonShare_ = 0.0f;       // 0: the light in the sky is the sun; up to 1: it is the moon (night)
 	std::shared_ptr<GpuTexture> transmittanceLut_, multiScatterLut_, skyViewLut_;
 	// clouds (physical sky): the noise their shape comes from (made once), and the sky with the clouds in it, which
 	// is what reflections and the sky's diffuse light read
@@ -118,6 +124,10 @@ private:
 	std::vector<DrawItem> probeItems_;
 	const float (*cullPlanes_)[4] = nullptr; // DrawItems: only what these planes let through
 	uint32_t probeGlobalsTable_ = UINT32_MAX;
+	// probe grid GI: this frame's rays, the probes' irradiance and their distances (each probe a tile of 8 x 8)
+	std::shared_ptr<GpuTexture> giRays_, giIrradiance_, giDepth_;
+	bool gi_ = false, giHistory_ = false;
+	int giMin_[3] = {0, 0, 0}; // the grid cell of the volume's lowest corner
 	bool bvhReady_ = false;      // this frame: rays can be traced through the scene's triangles (Bvh.h)
 	bool raysWanted_ = false;    // this frame: something traces rays (reflections, a debug view)
 	bool rayReflections_ = false; // this frame: smooth surfaces mirror what rays find
