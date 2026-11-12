@@ -49,6 +49,10 @@ AETHER_API int Aether_OverlayVisible(void);
 AETHER_API void Aether_SetOverlayVisible(int visible);
 // 1 while the overlay uses the mouse or the keyboard (the game should ignore its input meanwhile).
 AETHER_API int Aether_OverlayWantsInput(void);
+// bit 0: the overlay uses the mouse, bit 1: the keyboard (0 while it is hidden)
+AETHER_API int Aether_OverlayInputFlags(void);
+// 1 while a benchmark that asked for it is running: the managed side switches VSync and the frame rate cap off, and back after.
+AETHER_API int Aether_BenchmarkWantsUncapped(void);
 
 // ---- the scene data contract (SceneContract.h, docs/architecture/scene-data-contract.md). Main thread only.
 // Each returns 1 when the description was accepted, 0 when it was refused (logged as E_SCENE_CONTRACT).
@@ -64,8 +68,14 @@ AETHER_API int Aether_SceneUpsertInstance(const AeInstanceDesc* desc, const AeHa
 AETHER_API void Aether_SceneDestroy(int kind, AeHandle handle);
 // Every handle goes (scene unload, or the capture stops).
 AETHER_API void Aether_SceneClear(void);
+// The host's reflection probes (the whole list; structSize = sizeof(AeProbe)). Kept until the next call.
+AETHER_API int Aether_SceneSetProbes(const AeProbe* probes, uint32_t count, uint32_t structSize);
+// This frame's particles (replaces the ones of the frame before; call it before Aether_SceneSubmitFrame, with 0 batches when there are none).
+AETHER_API int Aether_SceneSubmitParticles(const AeParticleBatch* batches, uint32_t batchCount, const AeParticle* particles, uint32_t particleCount, uint32_t particleSize);
 AETHER_API int Aether_SceneSubmitFrame(const AeFrame* frame, const AeFrameInstance* instances, uint32_t instanceCount, const AeLight* lights, uint32_t lightCount);
 // 0 hdrp (the managed side captures nothing), 1 aether, 2 compare
 AETHER_API int Aether_GetRenderMode(void);
 // Experiment switches for the scene capture (Core/DevOptions.h); 0 in normal operation.
 AETHER_API int Aether_DevCaptureFlags();
+// One of Aether's settings as a number (booleans as 0 / 1). Returns `fallback` for a name that is not a numeric setting.
+AETHER_API double Aether_SettingNumber(const char* key, double fallback);

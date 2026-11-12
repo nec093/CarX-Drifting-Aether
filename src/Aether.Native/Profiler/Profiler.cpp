@@ -432,3 +432,19 @@ json Profiler::BenchmarkStatus() {
 }
 
 } // namespace aether
+
+namespace aether {
+
+bool Profiler::BenchmarkWantsUncapped() {
+	if (!benchmarkUncapped_.load()) {
+		return false;
+	}
+	std::lock_guard lock(mutex_);
+	if (!bench_.running) {
+		benchmarkUncapped_.store(false); // the run is over: the host gets its frame cap back
+		return false;
+	}
+	return true;
+}
+
+} // namespace aether

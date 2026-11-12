@@ -17,10 +17,14 @@ struct VSOutput {
 	float4 tangent : TANGENT;
 	float2 uv : TEXCOORD0;
 	float4 color : COLOR;
+	nointerpolation uint instance : INSTANCE; // index in g_Instances
+	float4 clipNow : CLIPNOW;       // this frame's clip position without the sub pixel offset
+	float4 clipBefore : CLIPBEFORE; // where the vertex was in the frame before (its own motion and the camera's)
 };
 
-VSOutput VSMain(VSInput input) {
-	InstanceData inst = g_Instances[g_InstanceIndex];
+VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID) {
+	const uint instance = g_InstanceMap[g_InstanceIndex + instanceId];
+	InstanceData inst = g_Instances[instance];
 	MaterialData mat = g_Materials[g_MaterialIndex];
 	VSOutput o;
 	float4 world = mul(inst.world, float4(input.position, 1.0));
@@ -33,12 +37,15 @@ VSOutput VSMain(VSInput input) {
 	o.tangent = float4(mul((float3x3)inst.world, input.tangent.xyz), input.tangent.w * inst.normalRow0.w);
 	o.uv = input.uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
 	o.color = input.color;
+	o.instance = instance;
+	o.clipNow = float4(o.position.xy - g_Jitter.xy * o.position.w, o.position.zw);
+	o.clipBefore = mul(g_PrevViewProj, mul(inst.prevWorld, float4(input.position, 1.0)));
 	return o;
 }
 
 // Shadow cascades: the same vertex data through the cascade's matrix.
-float4 VSShadow(VSInput input, out float2 uv : TEXCOORD0) : SV_Position {
-	InstanceData inst = g_Instances[g_InstanceIndex];
+float4 VSShadow(VSInput input, uint instanceId : SV_InstanceID, out float2 uv : TEXCOORD0) : SV_Position {
+	InstanceData inst = g_Instances[g_InstanceMap[g_InstanceIndex + instanceId]];
 	MaterialData mat = g_Materials[g_MaterialIndex];
 	uv = input.uv * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
 	return mul(g_ShadowViewProj[g_CascadeIndex], mul(inst.world, float4(input.position, 1.0)));
@@ -55,6 +62,41 @@ void PSShadowAlphaTest(float4 position : SV_Position, float2 uv : TEXCOORD0) {
 	MaterialData mat = g_Materials[g_MaterialIndex];
 	float alpha = g_BaseMap.Sample(s_Aniso, uv).a * mat.baseColor.a;
 	clip(alpha - mat.params.z);
+}
+
+// The game's blob shadow: a box around the ground under a car. Every opaque surface inside the box is darkened by the
+// box's texture, looked up with the surface's position in the box (x, z); the surface is found from the scene depth.
+// Drawn without a depth buffer, far faces only (PassKind kDecal).
+float4 PSBlobDecal(VSOutput input) : SV_Target {
+	MaterialData mat = g_Materials[g_MaterialIndex];
+	int view = (int)g_Misc.x;
+	if (view != VIEW_NONE && view < VIEW_SUN) {
+		discard; // (not part of the material debug views)
+	}
+	float depth = g_PostDepth.Load(int3(input.position.xy, 0)).r;
+	if (depth <= 0.0) {
+		discard; // the sky
+	}
+	float2 ndc = input.position.xy * g_ScreenSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
+	float4 world = mul(g_InvViewProj, float4(ndc, depth, 1.0));
+	InstanceData inst = g_Instances[input.instance];
+	float3 surface = world.xyz / world.w;
+	float3 rel = surface - float3(inst.world[0][3], inst.world[1][3], inst.world[2][3]);
+	// (the normal rows are the columns of the inverse world matrix)
+	float3 local = inst.normalRow0.xyz * rel.x + inst.normalRow1.xyz * rel.y + inst.normalRow2.xyz * rel.z;
+	if (any(abs(local) > 0.5)) {
+		discard; // outside the box (a unit cube in its own space)
+	}
+	float shade = g_BaseMap.SampleLevel(s_LinearClamp, local.xz + 0.5, 0.0).r * mat.baseColor.a;
+	// fades out towards the box's top and bottom so that nothing is cut off at a hard edge
+	shade *= saturate((0.5 - abs(local.y)) * 4.0);
+	// Only what the car stands on: the box also holds the car's own sills, wheels and lower doors, and darkening those
+	// drew a level line along the car's side at the height of the box's top. A surface that does not face along the
+	// box's up axis (found from the depth buffer's slope) is left alone.
+	float3 up = normalize(float3(inst.world[0][1], inst.world[1][1], inst.world[2][1]));
+	float3 facing = normalize(cross(ddx(surface), ddy(surface)));
+	shade *= smoothstep(0.6, 0.9, abs(dot(facing, up)));
+	return float4(0.0, 0.0, 0.0, shade);
 }
 
 // ---- BRDF (GGX, Smith height-correlated visibility approximation, Schlick Fresnel)
@@ -108,10 +150,14 @@ float3 DirectLight(Surface s, float3 V, float3 L, float3 radiance) {
 	float VoH = saturate(dot(V, H));
 	float a = max(s.roughness * s.roughness, 0.002);
 	float3 f0 = lerp(0.04, s.albedo, s.metallic);
-	float3 diffuse = s.albedo * (1.0 - s.metallic) / PI;
+	// diffuse: Burley's (Disney) model, as the game's own renderer has it: brighter than Lambert on rough surfaces
+	// seen or lit at a grazing angle
+	float fd90 = 0.5 + s.roughness * (1.0 + dot(L, V));
+	float scatter = (1.0 + (fd90 - 1.0) * pow(1.0 - NoL, 5.0)) * (1.0 + (fd90 - 1.0) * pow(1.0 - NoV, 5.0)) / 1.03571;
+	float3 diffuse = s.albedo * (1.0 - s.metallic) * scatter / PI;
 	float3 F = F_Schlick(f0, VoH);
 	float3 specular = D_GGX(NoH, a) * V_SmithGGX(NoV, NoL, a) * F;
-	float3 base = (diffuse * (1.0 - F) + specular) * NoL;
+	float3 base = (diffuse + specular) * NoL;
 	if (s.clearCoat > 0.0) {
 		// a second, dielectric lobe on top (f0 0.04); the base layer loses what the coat reflects
 		float ac = max(s.clearCoatRoughness * s.clearCoatRoughness, 0.002);
@@ -122,37 +168,7 @@ float3 DirectLight(Surface s, float3 V, float3 L, float3 radiance) {
 	return base * radiance;
 }
 
-float SunShadow(float3 worldPos, float3 normal, float viewDepth, out uint cascade) {
-	cascade = 0;
-	uint count = (uint)g_ShadowParams.x;
-	if (count == 0 || g_SunColor.w < 0.5) {
-		return 1.0;
-	}
-	for (uint i = 0; i < count; ++i) {
-		cascade = i;
-		if (viewDepth < g_CascadeSplits[i]) {
-			break;
-		}
-	}
-	if (viewDepth >= g_CascadeSplits[count - 1]) {
-		return 1.0; // beyond the last cascade
-	}
-	// push the sample off the surface along the normal by about one shadow texel of this cascade
-	float texelWorld = g_ShadowParams.w * (1.0 + (float)cascade * 1.5);
-	float3 p = worldPos + normal * texelWorld;
-	float4 sc = mul(g_ShadowMatrix[cascade], float4(p, 1.0));
-	float depth = sc.z - g_ShadowParams.z;
-	float texel = g_ShadowParams.y;
-	float sum = 0.0;
-	for (int y = -1; y <= 1; ++y) {
-		for (int x = -1; x <= 1; ++x) {
-			sum += g_ShadowAtlas.SampleCmpLevelZero(s_Shadow, sc.xy + float2(x, y) * texel, depth);
-		}
-	}
-	return sum / 9.0;
-}
-
-float3 PunctualLights(Surface s, float3 worldPos, float3 V, float2 pixel, float viewDepth, out uint lightCount) {
+float3 PunctualLights(Surface s, float3 worldPos, float3 V, float2 pixel, float viewDepth, uint layers, out uint lightCount) {
 	lightCount = 0;
 	float3 result = 0.0;
 	uint3 counts = (uint3)g_ClusterCounts.xyz;
@@ -167,6 +183,9 @@ float3 PunctualLights(Surface s, float3 worldPos, float3 V, float2 pixel, float 
 	lightCount = cell.y;
 	for (uint i = 0; i < cell.y; ++i) {
 		LightData light = g_Lights[g_LightIndices[cell.x + i]];
+		if ((asuint(light.typeFlags.y) & layers) == 0u) {
+			continue; // light layers: this light does not reach the renderer
+		}
 		float3 toLight = light.positionRange.xyz - worldPos;
 		float d2 = dot(toLight, toLight);
 		float range = light.positionRange.w;
@@ -202,7 +221,12 @@ static const float3 kClassColors[14] = {
 	float3(1, 0, 1), float3(0.6, 0.6, 0.6), float3(0.1, 0.4, 1), float3(0.2, 0.8, 0.9), float3(0.5, 0.9, 1), float3(0.9, 0.9, 0.2), float3(1, 0.5, 0.1),
 	float3(0.9, 0.3, 0.3), float3(0.2, 0.8, 0.2), float3(0.7, 0.4, 0.9), float3(1, 1, 1), float3(1, 0.8, 0.5), float3(0.25, 0.25, 0.25), float3(0, 0, 0)};
 
-float4 PSForward(VSOutput input, bool frontFace : SV_IsFrontFace) : SV_Target {
+#define GLASS_F0 0.13 // glass reflectance at normal incidence (matched by eye against the game's picture)
+
+// surface: what the reflection pass needs to know about an opaque surface (the opaque pass's second target):
+// xy the normal (octahedral), z the roughness of the lobe that mirrors, w how much of the mirrored light it returns.
+float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
+	surface = 0.0;
 	MaterialData mat = g_Materials[g_MaterialIndex];
 	const uint materialClass = (uint)mat.params2.z;
 	const int view = (int)g_Misc.x;
@@ -249,15 +273,43 @@ float4 PSForward(VSOutput input, bool frontFace : SV_IsFrontFace) : SV_Target {
 
 	// ---- class specific surface inputs
 	if (materialClass == CLASS_VEHICLE_GENERIC || materialClass == CLASS_VEHICLE_TIRE) {
-		// colour mask map: each channel tints with one of the material's colours, by that colour's alpha
+		// colour mask map (checked against the game's textures: the masks are in R, then G): each channel tints with one
+		// of the material's colours, by that colour's alpha. Without the map the base colour is not a tint at all.
+		s.albedo = base.rgb;
 		if (mat.params3.w > 0.5) {
 			float3 mask = g_ExtraMap.Sample(s_Aniso, input.uv).rgb;
+			s.albedo = lerp(s.albedo, base.rgb * mat.baseColor.rgb, mask.r * mat.baseColor.a);
 			s.albedo = lerp(s.albedo, base.rgb * mat.secondaryColor.rgb, mask.g * mat.secondaryColor.a);
 		}
-	} else if (materialClass == CLASS_VEHICLE_PAINT) {
-		// two tone paint: the secondary colour shows at grazing angles (weight in its alpha)
+	} else if (materialClass == CLASS_COLOR_MASK) {
+		// the game's Colormask graph: the mask map's B channel says where the base colour tints (R metallic, G occlusion,
+		// A smoothness as in HDRP's mask map; checked against the game's textures)
+		float tintMask = mat.params3.y > 0.5 ? g_MaskMap.Sample(s_Aniso, input.uv).b : 1.0;
+		s.albedo = base.rgb * lerp(1.0, mat.baseColor.rgb, tintMask);
+	} else if (materialClass == CLASS_VEHICLE_LIGHTS) {
+		// one light group per channel of the mask texture, switched by the material's four intensities
+		float4 groups = g_EmissiveMap.Sample(s_Aniso, input.uv);
+		s.emissive = base.rgb * dot(groups, max(mat.secondaryColor, 0.0)) * mat.emissiveMetallic.rgb;
+	} else if (materialClass == CLASS_VEHICLE_STITCHES) {
+		// the body's panel seams (door and bonnet gaps, the filler cap): a strip lying over the body, seen through by its
+		// pack texture. In the game's own picture (same view, side by side) a seam is a dark groove in the paint, in the
+		// shade as much as in the sun. The strip's material carries no paint colour (white by default, and the game
+		// gives these renderers no property block), so drawing it as paint made every seam a white outline.
+		// Drawn as what it shows: a gap that swallows the light.
+		float4 pack = g_MaskMap.Sample(s_Aniso, input.uv); // (read back from the game's texture: B is 1 along the seam and 0 at the strip's edges, R falls towards the seam)
+		s.albedo = 0.01;
+		s.metallic = 0.0;
+		s.roughness = 1.0;
+		s.clearCoat = 0.0;
+		s.alpha = pack.b * 0.6; // (the depth of the groove is matched by eye against the game's picture)
+	} else if (materialClass == CLASS_VEHICLE_PAINT || materialClass == CLASS_VEHICLE_RIM) {
+		// the game's paint: a colour, and a second one that takes over towards grazing angles (none set = one colour)
 		float facing = saturate(dot(normalize(input.normal), V));
-		s.albedo = lerp(s.albedo, base.rgb * mat.secondaryColor.rgb, mat.secondaryColor.a * pow(1.0 - facing, 2.0));
+		float twoTone = any(mat.secondaryColor.rgb > 0.0) ? pow(1.0 - facing, 2.0) : 0.0;
+		float3 paint = lerp(mat.baseColor.rgb, mat.secondaryColor.rgb, twoTone);
+		// the body's texture is its livery (vinyls, stickers): over the paint by its alpha. baseColor.a = a livery is bound
+		s.albedo = materialClass == CLASS_VEHICLE_PAINT && mat.baseColor.a > 0.5 ? lerp(paint, base.rgb, base.a) : paint;
+		s.alpha = 1.0;
 	}
 
 	// ---- normal
@@ -278,37 +330,84 @@ float4 PSForward(VSOutput input, bool frontFace : SV_IsFrontFace) : SV_Target {
 	uint cascade = 0, lightCount = 0;
 	float shadow = SunShadow(input.worldPos, normalize(input.normal) * (outside ? 1.0 : -1.0), input.viewDepth, cascade);
 	float3 direct = 0.0;
-	if (g_SunDirection.w > 0.5) {
-		direct += DirectLight(s, V, g_SunDirection.xyz, g_SunColor.rgb * shadow);
+	float3 sunLight = 0.0;
+	const uint layers = asuint(g_Instances[input.instance].layers.x);
+	if (g_SunDirection.w > 0.5 && (asuint(g_ClusterCounts.w) & layers) != 0u) {
+		sunLight = DirectLight(s, V, g_SunDirection.xyz, g_SunColor.rgb * shadow);
+		direct += sunLight;
 	}
-	direct += PunctualLights(s, input.worldPos, V, input.position.xy, input.viewDepth, lightCount);
+	direct += PunctualLights(s, input.worldPos, V, input.position.xy, input.viewDepth, layers, lightCount);
 
 	float NoV = max(dot(N, V), 1e-4);
 	float3 f0 = lerp(0.04, s.albedo, s.metallic);
 	float3 ambientDiffuse = AmbientDiffuse(N) * g_Misc.w * s.albedo * (1.0 - s.metallic);
 	float3 R = reflect(-V, N);
-	float3 ambientSpecular = SkyRadiance(R, s.roughness) * EnvBRDFApprox(f0, s.roughness, NoV);
+	// a rough surface reflects mostly what lies around its normal, not around the mirror direction
+	float alphaR = s.roughness * s.roughness;
+	float3 dominantR = normalize(lerp(N, R, (sqrt(1.0 - alphaR) + alphaR) * (1.0 - alphaR)));
+	float3 ambientSpecular = EnvironmentSpecular(input.worldPos, dominantR, s.roughness) * EnvBRDFApprox(f0, s.roughness, NoV);
 	float3 ambient = (ambientDiffuse + ambientSpecular) * s.occlusion;
+	float reflectionOcclusion = s.occlusion;
+	// screen space ambient occlusion: all of it on the ambient light, part of it (the host's setting) on direct light
+	if (g_AOParams.w > 0.5 && (g_DrawFlags & 2u) == 0u) {
+		float ao = g_AO.Load(int3(input.position.xy, 0)).r;
+		reflectionOcclusion *= ao;
+		ambient *= ao;
+		float directAo = lerp(1.0, ao, g_AOParams.z);
+		direct *= directAo;
+		sunLight *= directAo;
+	}
 	if (s.clearCoat > 0.0) {
 		float Fc = (0.04 + 0.96 * pow(1.0 - NoV, 5.0)) * s.clearCoat;
-		ambient = ambient * (1.0 - Fc) + SkyRadiance(R, s.clearCoatRoughness) * Fc * s.occlusion;
+		ambient = ambient * (1.0 - Fc) + EnvironmentSpecular(input.worldPos, R, s.clearCoatRoughness) * Fc * s.occlusion;
 	}
 	float3 color = direct + ambient + s.emissive;
 	float alpha = s.alpha;
+	if (s.clearCoat > 0.0) {
+		// the coat is what mirrors: its Fresnel term is the share of the mirrored light
+		surface = float4(OctEncode(N), s.clearCoatRoughness, saturate((0.04 + 0.96 * pow(1.0 - NoV, 5.0)) * s.clearCoat * reflectionOcclusion));
+	} else {
+		surface = float4(OctEncode(N), s.roughness, saturate(dot(EnvBRDFApprox(f0, s.roughness, NoV), 1.0 / 3.0) * reflectionOcclusion));
+	}
 
 	if (materialClass == CLASS_VEHICLE_GLASS) {
-		// glass: mostly what is behind it, plus the reflection, stronger at grazing angles
-		float fresnel = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
+		// glass: what is behind it, dimmed by the tint, plus what it mirrors (stronger at grazing angles).
+		// The mirrored light is not part of what the tint covers: it is added in full. (Before, it went through the
+		// alpha blend with the rest and was scaled down by the glass's own opacity: a window mirrored a few percent
+		// of what it does in the game's picture.) The reflectance at normal incidence is matched by eye against the
+		// game's picture of the same view: its glass graph has a clear coat and a specular colour, no values to read.
+		float fresnel = GLASS_F0 + (1.0 - GLASS_F0) * pow(1.0 - NoV, 5.0);
 		float tint = max(mat.baseColor.a, 0.12);
-		color = s.albedo * (AmbientDiffuse(N) * g_Misc.w) * 0.2 + SkyRadiance(R, 0.02) * fresnel + direct;
+		// (the direct term is mostly the diffuse response of the glass colour, which glass does not have: a small part of
+		// it stands in for the sun's highlight)
+		float3 body = s.albedo * (AmbientDiffuse(N) * g_Misc.w) * 0.05 + direct * 0.08;
+		float3 mirrored = EnvironmentSpecular(input.worldPos, R, 0.03) * fresnel;
 		alpha = saturate(tint + fresnel);
+		color = (body * tint + mirrored) / max(alpha, 1e-3); // (blended by alpha: the sum reaches the picture as it is)
 	} else if (materialClass == CLASS_UNLIT) {
 		color = s.albedo + s.emissive;
 	}
 
 	if (g_Fog.a > 0.0) {
-		float f = 1.0 - exp(-input.viewDepth * g_Fog.a);
-		color = lerp(color, g_Fog.rgb, f);
+		// exponential height fog: full density up to the base height, falling off above it
+		float3 toPixel = input.worldPos - g_CameraPos.xyz;
+		float dist = length(toPixel);
+		float3 viewDir = toPixel / max(dist, 1e-4);
+		if (g_FogHeight.z > 0.0) {
+			dist = min(dist, g_FogHeight.z);
+		}
+		float h0 = max(g_CameraPos.y - g_FogHeight.x, 0.0), h1 = max(input.worldPos.y - g_FogHeight.x, 0.0);
+		float k = g_FogHeight.y;
+		float dh = h1 - h0;
+		// the mean of exp(-k h) along the ray
+		float meanDensity = abs(dh) < 1e-3 ? exp(-k * h0) : (exp(-k * h0) - exp(-k * h1)) / (k * dh);
+		float f = 1.0 - exp(-dist * g_Fog.a * meanDensity);
+		float3 fogColor = g_FogHeight.w > 0.5 ? SkyRadiance(viewDir, 0.7) * g_Fog.rgb : g_Fog.rgb;
+		color = lerp(color, fogColor, f);
+	}
+
+	if ((g_DrawFlags & 2u) == 0u) {
+		alpha = 1.0; // (opaque: the alpha is not used; what moves by itself is marked in the velocity target, see PSForward)
 	}
 
 	// ---- debug views
@@ -322,7 +421,25 @@ float4 PSForward(VSOutput input, bool frontFace : SV_IsFrontFace) : SV_Target {
 		else if (view == VIEW_LIGHTING) color = (direct + ambient) / max(s.albedo, 0.05) * g_Exposure.x;
 		else if (view == VIEW_SHADOW) color = shadow * lerp(float3(1, 0.4, 0.4), float3(0.4, 0.4, 1), cascade / 3.0);
 		else if (view == VIEW_MATERIAL_CLASS) color = kClassColors[min(materialClass, 13u)] * (0.3 + 0.7 * saturate(dot(N, V)));
+		else if (view == VIEW_SUN) color = sunLight;
+		else if (view == VIEW_AMBIENT) color = ambient;
+		else if (view == VIEW_REFLECTION) color = EnvironmentSpecular(input.worldPos, R, 0.0);
 		alpha = 1.0;
+		surface.a = 0.0;
 	}
 	return float4(color, alpha);
+}
+
+struct ForwardOutput {
+	float4 color : SV_Target0;
+	float4 surface : SV_Target1; // (only the opaque pass has a second and a third target)
+	float4 velocity : SV_Target2; // xy how far the pixel moved on screen since the frame before (uv units), z 1 = part of something that moves by itself
+};
+
+ForwardOutput PSForward(VSOutput input, bool frontFace : SV_IsFrontFace) {
+	ForwardOutput o;
+	o.color = ShadeForward(input, frontFace, o.surface);
+	float2 now = input.clipNow.xy / max(input.clipNow.w, 1e-5), before = input.clipBefore.xy / max(input.clipBefore.w, 1e-5);
+	o.velocity = float4(input.clipBefore.w > 1e-4 ? (now - before) * float2(0.5, -0.5) : float2(0.0, 0.0), g_Instances[input.instance].layers.y > 0.5 ? 1.0 : 0.0, 0.0);
+	return o;
 }

@@ -737,6 +737,42 @@ void SettingsTab() {
 		ImGui::EndCombo();
 	}
 	ImGui::TextDisabled("Quality sets the shadow cascades' resolution and distance of Aether's scene renderer.");
+	ImGui::SeparatorText("Graphics");
+	ImGui::TextDisabled("These are Aether's own options. The game's graphics menu is not used.");
+	struct Toggle { const char* key; const char* label; bool value; };
+	Toggle toggles[] = {
+		{"antialiasing", "Antialiasing (temporal)", s.antialiasing}, {"shadows", "Sun shadows", s.shadows}, {"ssao", "Ambient occlusion", s.ssao},
+		{"ssr", "Screen space reflections", s.ssr}, {"bloom", "Bloom", s.bloom}, {"motionBlur", "Motion blur", s.motionBlur},
+		{"particles", "Particles and tyre smoke", s.particles},
+	};
+	for (Toggle& t : toggles) {
+		if (ImGui::Checkbox(t.label, &t.value)) {
+			settings.Set(t.key, t.value, "overlay");
+		}
+	}
+	struct Slider { const char* key; const char* label; float value, lo, hi; const char* format; };
+	Slider sliders[] = {
+		{"shadowSoftness", "Shadow softness (texels)", s.shadowSoftness, 0.0f, 4.0f, "%.1f"},
+		{"motionBlurStrength", "Motion blur strength", s.motionBlurStrength, 0.0f, 2.0f, "%.2f"},
+		{"bloomStrength", "Bloom strength", s.bloomStrength, 0.0f, 2.0f, "%.2f"},
+		{"smokeOpacity", "Tyre smoke opacity", s.smokeOpacity, 0.0f, 2.0f, "%.2f"},
+		{"exposureEV", "Exposure bias (stops)", s.exposureEV, -3.0f, 3.0f, "%.2f"},
+		{"lodBias", "Level of detail bias", s.lodBias, 0.3f, 8.0f, "%.1f"},
+	};
+	for (Slider& sl : sliders) {
+		if (ImGui::SliderFloat(sl.label, &sl.value, sl.lo, sl.hi, sl.format)) {
+			settings.Set(sl.key, sl.value, "overlay");
+		}
+	}
+	int level = s.anisotropicLevel;
+	if (ImGui::SliderInt("Anisotropic filtering", &level, 1, 16)) {
+		settings.Set("anisotropicLevel", level, "overlay");
+	}
+	static const char* vsyncText[] = {"off", "every refresh", "every second refresh"};
+	int vsync = s.vsync;
+	if (ImGui::Combo("Vertical sync", &vsync, vsyncText, 3)) {
+		settings.Set("vsync", vsync, "overlay");
+	}
 	ImGui::SeparatorText("AI agent (MCP)");
 	static const char* modes[] = {"deny", "ask", "allow"};
 	static const char* modeText[] = {"deny: read only", "ask: every change needs approval here", "allow: changes without asking"};

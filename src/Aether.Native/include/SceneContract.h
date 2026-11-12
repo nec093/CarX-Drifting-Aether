@@ -7,7 +7,7 @@
 #pragma once
 #include <stdint.h>
 
-#define AE_SCENE_CONTRACT_VERSION 1
+#define AE_SCENE_CONTRACT_VERSION 7 // 7: the host's screen space reflection settings; particles (Aether_SceneSubmitParticles) // 6: the host's post-processing settings (bloom, motion blur, antialiasing) // 5: 5: the sky is the host's own cube map (plain mip chain) with an intensity and a rotation // 4: 4: the host's exposure settings (Aether meters itself when there is no exposure texture) // 3: the host's shadow, ambient occlusion and grading settings on the frame // 2: rendering layer masks on instances and lights (light layers)
 
 // A stable identifier chosen by the managed side (Unity's instance id). 0 = none. Unique per kind, not across kinds.
 typedef uint32_t AeHandle;
@@ -96,8 +96,9 @@ enum AeMaterialClass {
 	kAeMaterialUnlit = 10,
 	kAeMaterialVehicleLights = 11,
 	kAeMaterialVehicleTire = 12,
-	kAeMaterialSkip = 13,       // known helper geometry that must not be drawn (motion vector proxies, blob shadows handled elsewhere)
-	kAeMaterialClassCount = 14,
+	kAeMaterialSkip = 13,       // known helper geometry that must not be drawn (motion vector proxies)
+	kAeMaterialBlobShadow = 14, // the soft contact shadow quad under a car: darkens what is behind it by its texture
+	kAeMaterialClassCount = 15,
 };
 
 enum AeMaterialFlags {
@@ -158,9 +159,40 @@ typedef struct AeInstanceDesc {
 	uint32_t flags;         // AeInstanceFlags
 	uint32_t layer;
 	uint32_t materialCount; // followed by the AeHandle array (one per sub mesh) passed next to the struct
+	uint32_t renderingLayerMask; // Renderer.renderingLayerMask: a light reaches the instance when (light.layerMask & this) != 0
+	uint32_t reserved;
 } AeInstanceDesc;
 
-enum AeFrameInstanceFlags { kAeFrameInstanceVisible = 1 << 0 };
+enum AeAntialiasing { kAeAntialiasingNone = 0, kAeAntialiasingFast = 1, kAeAntialiasingTemporal = 2, kAeAntialiasingMorphological = 3 };
+
+enum AeFrameInstanceFlags {
+	kAeFrameInstanceVisible = 1 << 0,    // part of this frame (the renderer culls it against the view and the shadow cascades itself)
+	kAeFrameInstanceShadowOnly = 1 << 1, // never drawn in the view: it only casts shadows (a layer the camera does not show, a shadows-only renderer)
+};
+
+// Particles: camera facing quads, sent every frame (Aether_SceneSubmitParticles, before the frame they belong to).
+// A batch is a run of particles that share a texture and a way of blending.
+typedef struct AeParticle {
+	float position[3]; // world space centre
+	float size;        // metres across
+	float color[4];    // linear rgb (scene units for unlit batches, albedo for lit ones), a = opacity
+	float rotation;    // radians about the view direction
+	float stretch[3];  // world vector from the centre to the quad's far end (all 0: a square facing the camera)
+	float uv[4];       // the texture's part this particle shows: offset (xy), size (zw)
+} AeParticle;
+
+enum AeParticleFlags {
+	kAeParticleAdditive = 1 << 0, // added to the picture (flames, sparks) instead of covering it
+	kAeParticleLit = 1 << 1,      // lit by the sun (with its shadow) and the sky (smoke, dust)
+	kAeParticleDisc = 1 << 2,     // no texture: a soft round puff
+};
+
+typedef struct AeParticleBatch {
+	AeHandle texture; // 0 (or not registered yet) = drawn as kAeParticleDisc
+	uint32_t flags;   // AeParticleFlags
+	uint32_t first;   // index of the batch's first particle
+	uint32_t count;
+} AeParticleBatch;
 
 // The dynamic part of an instance, sent every frame for every live instance.
 typedef struct AeFrameInstance {
@@ -181,7 +213,30 @@ typedef struct AeLight {
 	float spotOuterCos;   // cos(half outer angle)
 	float color[3];       // linear, premultiplied by the intensity (directional: lux, punctual: candela)
 	float spotInnerCos;
+	uint32_t layerMask;   // which rendering layers the light reaches (0xFFFFFFFF when the host does not use light layers)
+	uint32_t reserved;
 } AeLight;
+
+enum AeTonemap { kAeTonemapUnknown = 0, kAeTonemapNone = 1, kAeTonemapNeutral = 2, kAeTonemapAces = 3, kAeTonemapCustom = 4, kAeTonemapExternal = 5 };
+enum AeExposureMode { kAeExposureUnknown = 0, kAeExposureFixed = 1, kAeExposureAutomatic = 2 };
+enum AeFogFlags { kAeFogColorFromSky = 1 << 0 };
+
+enum AeProbeFlags {
+	kAeProbeBoxProjection = 1 << 0, // reflections are re-projected onto the influence box (parallax correction)
+	kAeProbeSphere = 1 << 1,        // the influence volume is a sphere of radius extents[0]
+};
+
+// A reflection probe: a cube map (the host's own texture, borrowed like any other) and where it applies.
+// Sent as a whole list with Aether_SceneSetProbes whenever the host's set of probes changes.
+typedef struct AeProbe {
+	AeHandle texture;        // cube map
+	uint32_t flags;          // AeProbeFlags
+	float worldToLocal[12];  // rows of the 3 x 4 matrix world -> the influence volume's space (rotation and translation only)
+	float extents[3];        // half size of the influence box (sphere: radius in [0])
+	float blendDistance;     // metres over which the probe fades in from the volume's faces
+	float capturePosition[3];
+	float intensity;
+} AeProbe;
 
 enum AeFrameFlags {
 	kAeFrameCameraValid = 1 << 0, // false: nothing to render this frame (no camera, a loading screen)
@@ -211,7 +266,48 @@ typedef struct AeFrame {
 	float ambientSH[7][4];
 	float fogColor[3];
 	float fogDensity;       // 0 = no fog
-	AeHandle skyTexture;      // cube map (array) with a mip chain, 0 = none (procedural sky)
+	AeHandle skyTexture;      // cube map with a plain mip chain (the host's HDRI sky asset), 0 = none (the ambient probe is the sky)
 	AeHandle exposureTexture; // 1x1 texture whose red channel is the exposure multiplier, 0 = use `exposure`
-	uint32_t reserved[2];
+	// What the host's own renderer does after lighting, so that Aether's picture can be graded the same way.
+	uint32_t tonemapMode;     // AeTonemap
+	float tonemapCurve[6];    // kAeTonemapCustom: toe strength, toe length, shoulder strength, shoulder length, shoulder angle, gamma
+	float postExposure;       // stops added after the exposure (colour adjustments)
+	// Height fog: fogDensity (above) is 1 / mean free path at and below fogBaseHeight, falling off up to fogMaxHeight.
+	float fogBaseHeight;
+	float fogMaxHeight;
+	float fogMaxDistance;     // 0 = no limit
+	float fogTint[3];
+	uint32_t fogFlags;        // AeFogFlags
+	// The host's directional shadow settings (0 distance = unknown: Aether's own defaults).
+	float shadowDistance;     // metres from the camera
+	uint32_t shadowCascades;  // 1..4
+	float shadowSplits[3];    // where cascades 0..2 end, as fractions of shadowDistance
+	// Screen space ambient occlusion as the host has it (0 intensity = none).
+	float aoIntensity;
+	float aoRadius;           // metres
+	float aoDirectStrength;   // how much of the occlusion also dims direct light (0..1)
+	// Shadows / midtones / highlights grading: rgb multipliers already prepared (1 = neutral), and the luminance ranges
+	// (shadows start, shadows end, highlights start, highlights end). All limits 0 = no grading.
+	float smhShadows[4];
+	float smhMidtones[4];
+	float smhHighlights[4];
+	float smhLimits[4];
+	// Exposure as the host sets it up; used when exposureTexture is 0 (the host's post-processing is not running).
+	uint32_t exposureMode;      // AeExposureMode
+	float exposureFixedEV;      // kAeExposureFixed: EV100
+	float exposureMinEV;        // kAeExposureAutomatic: limits of the metered EV100
+	float exposureMaxEV;
+	float exposureCompensation; // stops, subtracted from the EV
+	float skyIntensity;         // multiplier on the sky texture (0 = 1)
+	float skyRotation;          // radians about the world's up axis
+	// Post-processing as the host has it set up (0 = off).
+	float bloomIntensity;       // the host's 0..1 control value
+	float bloomScatter;         // 0..1
+	float motionBlurIntensity;
+	uint32_t antialiasing;      // AeAntialiasing
+	// Screen space reflections as the host has them set up.
+	uint32_t ssrEnabled;          // 0 = off
+	float ssrMinSmoothness;       // surfaces less smooth than this (perceptual smoothness, 0..1) get none
+	float ssrSmoothnessFadeStart; // ... and the full amount from this smoothness on
+	float ssrScreenFadeDistance;  // the part of the screen over which a reflection fades out towards the screen's edge (0..1)
 } AeFrame;

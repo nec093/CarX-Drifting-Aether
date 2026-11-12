@@ -104,8 +104,8 @@ public static class ToolCatalog {
 			Control: true, TimeoutSeconds: ControlTimeout),
 
 		new("set_render_mode",
-			"[control] Chooses who draws the scene: hdrp (the game's renderer), aether (Aether's forward+ renderer replaces the picture, the game's UI stays on top), compare (left half HDRP, right half Aether). Optionally a debug view of Aether's renderer. Needs --allow-control and the game's permission.",
-			"""{"type":"object","properties":{"mode":{"type":"string","enum":["hdrp","aether","compare"]},"debugView":{"type":"string","enum":["none","albedo","normal","roughness","metallic","depth","lighting","shadow","materialClass"]}},"additionalProperties":false}""",
+			"[control] Chooses who draws the scene: aether (Aether is the game's render pipeline: the game's own pipeline is not created; the UI stays on top), hdrp (the game's own renderer, for reference pictures and measurements), compare (left half HDRP, right half Aether). Optionally a debug view of Aether's renderer. Needs --allow-control and the game's permission.",
+			"""{"type":"object","properties":{"mode":{"type":"string","enum":["hdrp","aether","compare","standalone"]},"debugView":{"type":"string","enum":["none","albedo","normal","roughness","metallic","depth","lighting","shadow","materialClass","sun","ambient","reflection"]}},"additionalProperties":false}""",
 			"""{"type":"object","properties":{"mode":{"type":"string"},"debugView":{"type":"string"},"note":{"type":"string"}},"required":["mode","debugView"]}""",
 			Control: true, TimeoutSeconds: ControlTimeout),
 
@@ -129,7 +129,7 @@ public static class ToolCatalog {
 
 		new("run_benchmark",
 			"[control] Records frame times, GPU time, VRAM and draw calls for the given time in the current scene, writes the result as JSON to kino/mods/Aether/benchmarks and returns it (average FPS, 1% low, frame time percentiles, VRAM start / end / peak, resource statistics, render graph). Needs --allow-control and the game's permission.",
-			"""{"type":"object","properties":{"seconds":{"type":"integer","minimum":1,"maximum":600,"description":"Default 10."},"label":{"type":"string","maxLength":64,"description":"Name of the run (file name prefix). Default mcp."},"wait":{"type":"boolean","description":"Wait for the result (default true). False returns at once; poll get_benchmark."}},"additionalProperties":false}""",
+			"""{"type":"object","properties":{"seconds":{"type":"integer","minimum":1,"maximum":600,"description":"Default 10."},"vsync":{"type":"boolean","description":"false: VSync and the frame rate cap are switched off while the benchmark runs and put back afterwards (uncapped numbers). Default true: the game's own setting."},"label":{"type":"string","maxLength":64,"description":"Name of the run (file name prefix). Default mcp."},"wait":{"type":"boolean","description":"Wait for the result (default true). False returns at once; poll get_benchmark."}},"additionalProperties":false}""",
 			"""{"type":"object","properties":{"state":{"type":"string","enum":["running","done"]},"result":{"type":"object","description":"schema aether.benchmark/1: label, frames, averageFps, onePercentLowFps, pointOnePercentLowFps, frameTimeMs, gpuFrameTimeMs, dedicatedVramBytes{start,end,peak}, aetherResources, unityAtEnd, context, file"}},"required":["state"]}""",
 			Control: true, TimeoutSeconds: ControlTimeout, Handler: RunBenchmark),
 	];
@@ -161,6 +161,9 @@ public static class ToolCatalog {
 		var parameters = new JsonObject { ["seconds"] = seconds };
 		if (arguments["label"] is JsonNode label) {
 			parameters["label"] = label.DeepClone();
+		}
+		if (arguments["vsync"] is JsonNode vsync) {
+			parameters["vsync"] = vsync.DeepClone();
 		}
 		await client.Call("run_benchmark", parameters, true, TimeSpan.FromSeconds(ControlTimeout), cancel);
 		if (!wait) {

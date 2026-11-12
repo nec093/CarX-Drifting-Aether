@@ -289,8 +289,21 @@ AETHER_API void Aether_Log(int severity, const char* component, const char* mess
 AETHER_API int Aether_OverlayVisible(void) { return Overlay::Get().Visible() ? 1 : 0; }
 AETHER_API void Aether_SetOverlayVisible(int visible) { Overlay::Get().SetVisible(visible != 0); }
 AETHER_API int Aether_OverlayWantsInput(void) { return Overlay::Get().WantsInput() ? 1 : 0; }
+AETHER_API int Aether_OverlayInputFlags(void) { return Overlay::Get().InputFlags(); }
+AETHER_API int Aether_BenchmarkWantsUncapped(void) { return Profiler::Get().BenchmarkWantsUncapped() ? 1 : 0; }
 
 // ---- the scene data contract
+AETHER_API double Aether_SettingNumber(const char* key, double fallback) {
+	if (!key) {
+		return fallback;
+	}
+	const json all = Settings::Get().ToJson();
+	auto it = all.find(key);
+	if (it == all.end()) {
+		return fallback;
+	}
+	return it->is_boolean() ? (it->get<bool>() ? 1.0 : 0.0) : it->is_number() ? it->get<double>() : fallback;
+}
 AETHER_API int Aether_SceneContractVersion(void) { return AE_SCENE_CONTRACT_VERSION; }
 AETHER_API int Aether_SceneStructSize(int which) {
 	static const int sizes[] = {int(sizeof(AeMeshDesc)), int(sizeof(AeTextureDesc)), int(sizeof(AeMaterialDesc)), int(sizeof(AeInstanceDesc)), int(sizeof(AeFrameInstance)), int(sizeof(AeLight)), int(sizeof(AeFrame)), int(sizeof(AeSubMesh))};
@@ -302,10 +315,16 @@ AETHER_API int Aether_SceneUpsertMaterial(const AeMaterialDesc* desc) { return S
 AETHER_API int Aether_SceneUpsertInstance(const AeInstanceDesc* desc, const AeHandle* materials) { return SceneStore::Get().UpsertInstance(desc, materials) ? 1 : 0; }
 AETHER_API void Aether_SceneDestroy(int kind, AeHandle handle) { SceneStore::Get().Destroy(kind, handle); }
 AETHER_API void Aether_SceneClear(void) { SceneStore::Get().Clear(); }
+AETHER_API int Aether_SceneSetProbes(const AeProbe* probes, uint32_t count, uint32_t structSize) {
+	return SceneStore::Get().SetProbes(probes, count, structSize) ? 1 : 0;
+}
+AETHER_API int Aether_SceneSubmitParticles(const AeParticleBatch* batches, uint32_t batchCount, const AeParticle* particles, uint32_t particleCount, uint32_t particleSize) {
+	return SceneStore::Get().SubmitParticles(batches, batchCount, particles, particleCount, particleSize) ? 1 : 0;
+}
 AETHER_API int Aether_SceneSubmitFrame(const AeFrame* frame, const AeFrameInstance* instances, uint32_t instanceCount, const AeLight* lights, uint32_t lightCount) {
 	return SceneStore::Get().SubmitFrame(frame, instances, instanceCount, lights, lightCount) ? 1 : 0;
 }
 AETHER_API int Aether_GetRenderMode(void) {
 	const std::string mode = Settings::Get().Snapshot().renderMode;
-	return mode == "aether" ? 1 : mode == "compare" ? 2 : 0;
+	return mode == "aether" ? 1 : mode == "compare" ? 2 : mode == "standalone" ? 3 : 0;
 }

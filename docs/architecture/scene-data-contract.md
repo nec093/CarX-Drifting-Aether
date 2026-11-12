@@ -1,4 +1,8 @@
-# Scene Data Contract (version 1)
+# Scene Data Contract (version 3)
+
+Version 3 (2026-11-12) adds the host's settings to the frame: directional shadows (`shadowDistance`, `shadowCascades`, `shadowSplits`), ambient occlusion (`aoIntensity`, `aoRadius`, `aoDirectStrength`) and shadows / midtones / highlights grading (`smhShadows`, `smhMidtones`, `smhHighlights`, `smhLimits`).
+
+Version 2 (2026-11-12) adds: `renderingLayerMask` on instances and `layerMask` on lights (HDRP light layers: a light reaches an instance when the masks share a bit); on the frame, what the host's renderer does after lighting (`tonemapMode` and the custom curve's six parameters, `postExposure`) and height fog (`fogBaseHeight`, `fogMaxHeight`, `fogMaxDistance`, `fogTint`, `fogFlags`). Skinned renderers are sent as a mesh of their own whose stream 0 is Unity's GPU-skinned vertex buffer.
 
 The interface between the managed side (Unity, `src/Aether.Managed/SceneCapture`) and Aether's native renderer
 (`src/Aether.Native/Scene/SceneStore`). The layout is `src/Aether.Native/include/SceneContract.h`, mirrored field for
@@ -63,3 +67,15 @@ order, culling, a mirrored instance, shadows and blending are checked by pixel p
 
 New fields go into the `reserved` members first. A layout change needs a version bump on both sides; the size check
 catches a stale pair.
+
+## 版 5・6（2026-11-12）
+
+- **版 5**：空はホストのキューブマップそのもの（通常のミップチェーン）。フレームに `skyIntensity`（空のテクスチャへの乗数）と `skyRotation`（上軸まわりのラジアン）を追加。`exposureTexture` は使わない（常に 0。露出は `exposureMode` と EV の上下限から Aether が測る）。フレームごとのインスタンスのフラグに `kAeFrameInstanceShadowOnly`（視界には描かず影だけ落とす）を追加。`kAeFrameInstanceVisible` は「このフレームに存在する」の意味になり、視界と影カスケードに対するカリングはネイティブ側が行う。マテリアルクラスに `kAeMaterialBlobShadow`（車の下の箱型デカール）を追加。
+- **版 6**：ホストのポストプロセス設定。`bloomIntensity`、`bloomScatter`、`motionBlurIntensity`、`antialiasing`（`AeAntialiasing`）。0 はオフ。
+
+塗装クラス（`kAeMaterialVehiclePaint`）の `baseColor` のアルファは「リバリーのテクスチャがベーススロットにある」の意味（1 = ある）。継ぎ目クラス（`kAeMaterialVehicleStitches`）はマスクスロットにパックテクスチャを持つ（B が不透明度）。
+
+## 版 7（2026-11-12）
+
+- フレームに、ホストの SSR 設定を追加：`ssrEnabled`、`ssrMinSmoothness`、`ssrSmoothnessFadeStart`、`ssrScreenFadeDistance`（以前の `reserved[4]` の位置）。
+- パーティクル：`Aether_SceneSubmitParticles(batches, batchCount, particles, particleCount, particleSize)`。そのフレームの `Aether_SceneSubmitFrame` の前に毎フレーム呼ぶ（無いときは 0 個で呼ぶ）。`AeParticle` はカメラを向く四角形 1 枚（中心、大きさ、色と不透明度、回転、引き伸ばしのベクトル、テクスチャの範囲）。`AeParticleBatch` は同じテクスチャと合成方法を持つ並び（`kAeParticleAdditive`：加算、`kAeParticleLit`：太陽と空で照らす、`kAeParticleDisc`：テクスチャなしの丸い煙）。加算でないバッチはネイティブ側が奥から手前へ並べ替える。

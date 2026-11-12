@@ -53,7 +53,11 @@ struct SceneInstance {
 	AeInstanceDesc desc = {};
 	std::vector<AeHandle> materials;
 	Mat4 world = Mat4::Identity();
+	Mat4 prevWorld = Mat4::Identity(); // where it was in the frame before (the motion of its pixels on screen)
 	bool visible = false;
+	bool shadowOnly = false;
+	bool moved = false; // its transform changed lately (a car, a door: not part of the still world)
+	uint64_t movedFrame = 0; // the last frame its transform changed (0: never)
 	uint64_t frameStamp = 0; // frame of the last transform
 };
 
@@ -69,6 +73,9 @@ struct SceneFrame {
 	AeFrame frame = {};
 	std::vector<AeFrameInstance> instances;
 	std::vector<AeLight> lights;
+	std::vector<AeProbe> probes; // the host's reflection probes (replaced as a whole, not per frame)
+	std::vector<AeParticleBatch> particleBatches; // this frame's particles
+	std::vector<AeParticle> particles;
 	bool valid = false;
 };
 
@@ -83,6 +90,8 @@ public:
 	bool UpsertInstance(const AeInstanceDesc* desc, const AeHandle* materials);
 	void Destroy(int kind, AeHandle handle); // kind: 0 mesh, 1 texture, 2 material, 3 instance
 	void Clear();                            // scene unload: every handle goes
+	bool SetProbes(const AeProbe* probes, uint32_t count, uint32_t structSize);
+	bool SubmitParticles(const AeParticleBatch* batches, uint32_t batchCount, const AeParticle* particles, uint32_t particleCount, uint32_t particleSize);
 	bool SubmitFrame(const AeFrame* frame, const AeFrameInstance* instances, uint32_t instanceCount, const AeLight* lights, uint32_t lightCount);
 
 	// ---- render thread
@@ -130,7 +139,11 @@ private:
 	std::mutex pendingMutex_;
 	std::vector<Pending> pending_;
 	SceneFrame staged_;
+	std::vector<AeParticleBatch> stagedBatches_; // sent since the last frame (under pendingMutex_)
+	std::vector<AeParticle> stagedParticles_;
 	bool stagedNew_ = false;
+	std::vector<AeProbe> stagedProbes_;
+	bool stagedProbesNew_ = false;
 
 	// render thread
 	std::unordered_map<AeHandle, SceneMesh> meshes_;

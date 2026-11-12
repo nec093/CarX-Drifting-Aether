@@ -84,6 +84,8 @@ namespace Aether {
 		public uint flags;
 		public uint layer;
 		public uint materialCount;
+		public uint renderingLayerMask;
+		public uint reserved;
 	}
 
 	[StructLayout(LayoutKind.Sequential)]
@@ -103,6 +105,37 @@ namespace Aether {
 		public float spotOuterCos;
 		public fixed float color[3];
 		public float spotInnerCos;
+		public uint layerMask;
+		public uint reserved;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	internal struct AeParticle {
+		public UnityEngine.Vector3 position;
+		public float size;
+		public UnityEngine.Color color;
+		public float rotation;
+		public UnityEngine.Vector3 stretch;
+		public UnityEngine.Vector4 uv;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	internal struct AeParticleBatch {
+		public uint texture;
+		public uint flags;
+		public uint first;
+		public uint count;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	internal unsafe struct AeProbe {
+		public uint texture;
+		public uint flags;
+		public fixed float worldToLocal[12];
+		public fixed float extents[3];
+		public float blendDistance;
+		public fixed float capturePosition[3];
+		public float intensity;
 	}
 
 	[StructLayout(LayoutKind.Sequential)]
@@ -130,24 +163,58 @@ namespace Aether {
 		public float fogDensity;
 		public uint skyTexture;
 		public uint exposureTexture;
-		public fixed uint reserved[2];
+		public uint tonemapMode;
+		public fixed float tonemapCurve[6];
+		public float postExposure;
+		public float fogBaseHeight;
+		public float fogMaxHeight;
+		public float fogMaxDistance;
+		public fixed float fogTint[3];
+		public uint fogFlags;
+		public float shadowDistance;
+		public uint shadowCascades;
+		public fixed float shadowSplits[3];
+		public float aoIntensity;
+		public float aoRadius;
+		public float aoDirectStrength;
+		public fixed float smhShadows[4];
+		public fixed float smhMidtones[4];
+		public fixed float smhHighlights[4];
+		public fixed float smhLimits[4];
+		public uint exposureMode;
+		public float exposureFixedEV;
+		public float exposureMinEV;
+		public float exposureMaxEV;
+		public float exposureCompensation;
+		public float skyIntensity;
+		public float skyRotation;
+		public float bloomIntensity;
+		public float bloomScatter;
+		public float motionBlurIntensity;
+		public uint antialiasing;
+		public uint ssrEnabled;
+		public float ssrMinSmoothness;
+		public float ssrSmoothnessFadeStart;
+		public float ssrScreenFadeDistance;
 	}
 
 	internal static class AeConst {
-		public const int ContractVersion = 1;
+		public const int ContractVersion = 7;
 
 		public const byte SemanticPosition = 0, SemanticNormal = 1, SemanticTangent = 2, SemanticColor = 3, SemanticTexCoord0 = 4, SemanticTexCoord1 = 5;
 		public const uint Texture2D = 0, TextureCube = 1, TextureCubeArray = 2, Texture2DArray = 3, Texture3D = 4;
 
 		public const uint ClassUnsupported = 0, ClassStandard = 1, ClassVehiclePaint = 2, ClassVehicleGeneric = 3, ClassVehicleGlass = 4, ClassVehicleRim = 5,
-			ClassVehicleStitches = 6, ClassColorMask = 7, ClassVegetation = 8, ClassTransparent = 9, ClassUnlit = 10, ClassVehicleLights = 11, ClassVehicleTire = 12, ClassSkip = 13;
+			ClassVehicleStitches = 6, ClassColorMask = 7, ClassVegetation = 8, ClassTransparent = 9, ClassUnlit = 10, ClassVehicleLights = 11, ClassVehicleTire = 12, ClassSkip = 13, ClassBlobShadow = 14;
 
 		public const uint MaterialAlphaTest = 1, MaterialBlend = 2, MaterialDoubleSided = 4, MaterialAdditive = 8, MaterialClearCoat = 16, MaterialNoShadow = 32;
 		public const uint MaskNone = 0, MaskHdrp = 1, MaskRmo = 2;
 		public const int SlotBase = 0, SlotNormal = 1, SlotMask = 2, SlotEmissive = 3, SlotExtra = 4;
 
 		public const uint InstanceCastShadows = 1, InstanceReceiveShadows = 2, InstanceStatic = 4;
+		public const uint ParticleAdditive = 1, ParticleLit = 2, ParticleDisc = 4;
 		public const uint FrameInstanceVisible = 1;
+		public const uint FrameInstanceShadowOnly = 2;
 		public const uint LightDirectional = 0, LightPoint = 1, LightSpot = 2;
 		public const uint LightCastsShadows = 1;
 		public const uint FrameCameraValid = 1;

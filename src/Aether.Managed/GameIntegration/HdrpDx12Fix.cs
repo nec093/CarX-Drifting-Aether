@@ -29,6 +29,24 @@ namespace Aether {
 		public static string Status { get; private set; } = "not applied";
 		public static bool Failed => Status.StartsWith("failed") || Status.StartsWith("missing");
 
+		private static string dataDir_, configDir_;
+		private static bool applied_;
+
+		/// <summary>Remembers where the fix's files are. The fix itself is only needed (and applied) when the game's own pipeline is about to run.</summary>
+		public static void Prepare(string modDataDir, string configDir) {
+			dataDir_ = modDataDir;
+			configDir_ = configDir;
+		}
+
+		/// <summary>Applies the fix once, before the game's pipeline is created.</summary>
+		public static void Ensure() {
+			if (!applied_ && dataDir_ != null) {
+				applied_ = true;
+				Apply(dataDir_, configDir_);
+				Native.Log(Failed ? 3 : 1, "HDRP DX12 fix: " + Status);
+			}
+		}
+
 		public static void Apply(string modDataDir, string configDir) {
 			try {
 				Status = Run(modDataDir, configDir);
@@ -37,9 +55,9 @@ namespace Aether {
 			}
 			// (no call into the native runtime here: this runs before AetherNative.dll is in place)
 			if (Failed) {
-				KSL.API.Kino.Log.Error("[Aether] HDRP DX12 fix: " + Status);
+				AetherCore.Host.LogError("[Aether] HDRP DX12 fix: " + Status);
 			} else {
-				KSL.API.Kino.Log.Info("[Aether] HDRP DX12 fix: " + Status);
+				AetherCore.Host.LogInfo("[Aether] HDRP DX12 fix: " + Status);
 			}
 		}
 

@@ -25,13 +25,36 @@ namespace Aether {
 			public int[] materialIds; // Unity instance ids of the shared materials (change detection)
 			public bool registered;
 			public bool isStatic;
+			// What the last look at the renderer found (UpdateTracked, about twice a second). Used every frame for a
+			// renderer that stands still, instead of asking Unity again: on a track that is 7 000 of 7 500 renderers,
+			// and asking each of them four things every frame cost 8 ms of the main thread.
+			// live: asked every frame. Set for whatever can move by itself (skinned, under a Rigidbody or an Animator)
+			// and for anything that was seen to have moved between two looks.
+			public bool live;
+			public bool matrixKnown;
+			public bool enabled;
+			public ShadowCastingMode casting;
+			public Matrix4x4 matrix;
 			public int layerBit; // 1 << gameObject.layer, refreshed by the scan
+			public SkinnedMeshRenderer skinned; // set for a skinned renderer: stream 0 of its mesh is Unity's skinned vertex buffer
+			public uint meshHandle;             // the native mesh this renderer draws (per renderer when skinned)
+			public IntPtr skinnedPointer;       // the skinned vertex buffer the native side was given
+			public int lodGroup = -1;            // index in lodGroups_ when a LOD group owns the renderer
+			public uint lodMask;                 // the group's levels the renderer belongs to
+			public int skinnedFailures;         // scans in a row in which its skinned buffer did not fit the mesh's layout
+			public bool skinnedUnsupported;     // ... often enough to be counted as not drawable (it is still tried again)
+			// Unity skins into more than one buffer per renderer and alternates between them from frame to frame: each
+			// buffer is a mesh of its own on the native side, and the instance is pointed at this frame's one
+			public Dictionary<IntPtr, uint> skinnedVariants;
 		}
 
 		private sealed class TrackedMaterial {
 			public Material material;
 			public int crc;
-			public Color? colorOverride;
+			public Renderer owner; // the renderer whose own property values went into it (null: the shared material)
+			public int index;      // that renderer's material slot
+			public uint signature; // of the description that was sent
+			public uint[] textures; // the textures that description names (slot order, 0 = none)
 		}
 
 		private sealed class TrackedTexture {
@@ -67,7 +90,7 @@ namespace Aether {
 		private bool active_;
 		private uint sceneId_ = 1;
 		private uint frameIndex_;
-		private Texture sky_, exposure_;
+		private Texture sky_;
 		private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
 
 		// statistics for the diagnostics
@@ -83,11 +106,32 @@ namespace Aether {
 			}
 			active_ = true;
 			devFlags_ = Native.Aether_DevCaptureFlags();
+			particleTexture_ = ParticleTexture;
+			lightLayers_ = HostLightLayers();
 			nextScan_ = 0;
 			Native.Log(1, "Scene capture started");
 		}
 
 		/// <summary>Stops capturing and destroys every native handle (the scene path's next event applies it).</summary>
+		// ---- particles
+		private readonly ParticleCapture particles_ = new ParticleCapture();
+		private readonly HashSet<uint> particleTextures_ = new HashSet<uint>();
+		private Func<Texture, uint> particleTexture_;
+
+		/// <summary>The native handle of a particle system's texture: 0 while it is not registered (it is queued then).</summary>
+		private uint ParticleTexture(Texture t) {
+			if (t == null) {
+				return 0;
+			}
+			uint handle = Handle(t);
+			particleTextures_.Add(handle);
+			if (textures_.ContainsKey(handle)) {
+				return handle;
+			}
+			QueueTexture(t);
+			return 0;
+		}
+
 		public void Stop() {
 			if (!active_) {
 				return;
@@ -105,9 +149,16 @@ namespace Aether {
 		}
 
 		private void Reset() {
+			scanPhase_ = 0;
+			seen_.Clear();
+			pendingFailures_.Clear();
+			particles_.Reset();
+			particleTextures_.Clear();
 			renderers_.Clear();
 			order_.Clear();
+			skinnedTracked_.Clear();
 			meshes_.Clear();
+			dynamicMeshes_.Clear();
 			materials_.Clear();
 			textures_.Clear();
 			pendingMeshes_.Clear();
@@ -115,7 +166,9 @@ namespace Aether {
 			pendingTextures_.Clear();
 			pendingTextureSet_.Clear();
 			lights_.Clear();
-			sky_ = exposure_ = null;
+			sky_ = null;
+			probeSignature_ = 0;
+			ProbeCount = 0;
 		}
 
 		// ------------------------------------------------------------------------------------------------ scanning
@@ -125,28 +178,83 @@ namespace Aether {
 		}
 
 		// A material seen through a renderer's property block is its own native material: the handle mixes both ids.
-		private static uint VariantHandle(Material m, Renderer r) {
+		private static uint VariantHandle(UnityEngine.Object m, Renderer r, int index = 0) {
 			unchecked {
 				uint h = 2166136261u;
 				h = (h ^ (uint)m.GetInstanceID()) * 16777619u;
 				h = (h ^ (uint)r.GetInstanceID()) * 16777619u;
+				h = (h ^ (uint)index) * 16777619u;
 				return h == 0 ? 1u : h;
 			}
 		}
 
-		private void Scan() {
-			// ---- renderers: new ones, changed ones, destroyed ones
+		/// <summary>
+		/// The renderer's own property values for its material `index`, or null. A block set for that slot wins over the
+		/// one set for the whole renderer, as in Unity. The game sets the whole renderer's block when it builds a car part
+		/// and the slot's block on every change after that (a new paint, CarBodyPart.SetMaterialPropertyBlock): reading
+		/// the renderer's first showed the paint the car was built with forever.
+		/// (Renderer.HasPropertyBlock is not asked: it does not tell about blocks set per slot.)
+		/// </summary>
+		private MaterialPropertyBlock BlockOf(Renderer r, int index) {
+			r.GetPropertyBlock(block_, index);
+			if (block_.isEmpty) {
+				r.GetPropertyBlock(block_);
+			}
+			return block_.isEmpty ? null : block_;
+		}
+
+		// The scan is done in four steps, one per frame: on a track all of it in one frame took 10 ms.
+		private int scanPhase_; // 0: none in progress
+		private readonly HashSet<int> seen_ = new HashSet<int>();
+		private bool scanSetChanged_;
+
+		private void ScanStep() {
+			switch (scanPhase_) {
+			case 1: ScanMeshRenderers(); break;
+			case 2: ScanSkinnedAndRemovals(); break;
+			case 3: ScanSweepMeshesAndMaterials(); break;
+			default: ScanTexturesAndLights(); break;
+			}
+			scanPhase_ = scanPhase_ >= 4 ? 0 : scanPhase_ + 1;
+		}
+
+		private void ScanMeshRenderers() {
+			// ---- renderers: new ones (the known ones are looked at again by UpdateSlice)
 			MeshRenderer[] found = UnityEngine.Object.FindObjectsByType<MeshRenderer>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
-			var seen = new HashSet<int>();
+			HashSet<int> seen = seen_;
+			seen.Clear();
+			scanSetChanged_ = false;
 			foreach (MeshRenderer r in found) {
 				int id = r.GetInstanceID();
 				seen.Add(id);
 				if (!renderers_.TryGetValue(id, out Tracked t)) {
 					t = new Tracked { renderer = r, filter = r.GetComponent<MeshFilter>(), handle = unchecked((uint)id), isStatic = r.gameObject.isStatic };
+					t.live = !t.isStatic && (r.GetComponentInParent<Rigidbody>() != null || r.GetComponentInParent<Animator>() != null || r.GetComponentInParent<Animation>() != null);
 					renderers_[id] = t;
 					order_.Add(t);
+					UpdateTracked(t);
+					scanSetChanged_ = true;
+				}
+				// (a renderer already known is looked at again by UpdateSlice, a few per frame: looking at all of a track's
+				// 7 500 renderers in one frame, twice a second, was a hitch twice a second)
+			}
+		}
+
+		private void ScanSkinnedAndRemovals() {
+			HashSet<int> seen = seen_;
+			// skinned renderers: Unity skins on the GPU into a vertex buffer of its own per renderer; Aether draws from it
+			int skinnedWaiting = 0;
+			foreach (SkinnedMeshRenderer r in UnityEngine.Object.FindObjectsByType<SkinnedMeshRenderer>(FindObjectsInactive.Exclude, FindObjectsSortMode.None)) {
+				int id = r.GetInstanceID();
+				seen.Add(id);
+				if (!renderers_.TryGetValue(id, out Tracked t)) {
+					t = new Tracked { renderer = r, skinned = r, handle = unchecked((uint)id), isStatic = false, live = true };
+					renderers_[id] = t;
+					order_.Add(t);
+					skinnedTracked_.Add(t);
 				}
 				UpdateTracked(t);
+				skinnedWaiting += t.registered || !r.enabled || !r.isVisible ? 0 : 1; // hidden ones (the driver in the garage) are not skinned by Unity and not missing
 			}
 			for (int i = order_.Count - 1; i >= 0; --i) {
 				Tracked t = order_[i];
@@ -157,16 +265,33 @@ namespace Aether {
 					}
 					renderers_.Remove(unchecked((int)t.handle));
 					order_.RemoveAt(i);
+					scanSetChanged_ = true;
+					if (t.skinned != null) {
+						skinnedTracked_.Remove(t);
+					}
 				}
 			}
-			SkinnedSkipped = UnityEngine.Object.FindObjectsByType<SkinnedMeshRenderer>(FindObjectsInactive.Exclude, FindObjectsSortMode.None).Length;
+			// the LOD groups are read again when the set of renderers changed. (Not on a timer any more: reading 2 350
+			// groups allocates their level arrays anew, and that garbage was a pause every ten seconds on a track.)
+			if (scanSetChanged_ || lodGroups_.Count == 0 && Time.unscaledTime >= nextLodScan_) {
+				nextLodScan_ = Time.unscaledTime + 10.0f;
+				ScanLodGroups();
+			}
+			SkinnedSkipped = skinnedWaiting; // not drawn (yet): Unity has no GPU-skinned buffer for them, or the mesh cannot be described
+		}
 
+		private void ScanSweepMeshesAndMaterials() {
 			// ---- what nothing references any more
 			var usedMeshes = new HashSet<uint>();
 			var usedMaterials = new HashSet<uint>();
 			foreach (Tracked t in order_) {
 				if (t.mesh != null) {
-					usedMeshes.Add(Handle(t.mesh));
+					usedMeshes.Add(t.meshHandle);
+					if (t.skinnedVariants != null) {
+						foreach (uint variant in t.skinnedVariants.Values) {
+							usedMeshes.Add(variant);
+						}
+					}
 				}
 				if (t.materials != null) {
 					foreach (uint m in t.materials) {
@@ -176,23 +301,29 @@ namespace Aether {
 			}
 			Sweep(meshes_, usedMeshes, AeConst.KindMesh, (mesh) => mesh == null);
 			Sweep(materials_, usedMaterials, AeConst.KindMaterial, (m) => m.material == null);
-			// textures: the ones the live materials name, plus the global ones
+		}
+
+		private void ScanTexturesAndLights() {
+			// textures: the ones the materials as they were sent name (not the Unity materials' own properties: a livery
+			// comes from the renderer's property block, and a texture only found there was dropped and uploaded again
+			// on alternate scans, which showed as a livery that blinks), plus the global ones
 			var usedTextures = new HashSet<uint>();
 			foreach (var kv in materials_) {
-				if (kv.Value.material == null) {
+				if (kv.Value.material == null || kv.Value.textures == null) {
 					continue;
 				}
-				ids_.Clear();
-				kv.Value.material.GetTexturePropertyNameIDs(ids_);
-				foreach (int pid in ids_) {
-					Texture tex = kv.Value.material.GetTexture(pid);
-					if (tex != null) {
-						usedTextures.Add(Handle(tex));
+				foreach (uint texture in kv.Value.textures) {
+					if (texture != 0) {
+						usedTextures.Add(texture);
 					}
 				}
 			}
 			if (sky_ != null) usedTextures.Add(Handle(sky_));
-			if (exposure_ != null) usedTextures.Add(Handle(exposure_));
+			foreach (uint texture in particleTextures_) {
+				usedTextures.Add(texture); // (asked for since the last scan: the particle systems that have particles)
+			}
+			particleTextures_.Clear();
+			ScanProbes(usedTextures);
 			Sweep(textures_, usedTextures, AeConst.KindTexture, (t) => t.texture == null);
 
 			// ---- textures whose GPU resource changed (texture streaming loads or drops mips; render textures resize)
@@ -211,12 +342,84 @@ namespace Aether {
 			lights_.Clear();
 			lights_.AddRange(UnityEngine.Object.FindObjectsByType<Light>(FindObjectsInactive.Exclude, FindObjectsSortMode.None));
 
-			// ---- the environment HDRP publishes as global textures (while HDRP runs)
-			TrackGlobal(ref sky_, "_SkyTexture");
-			TrackGlobal(ref exposure_, "_ExposureTexture");
 		}
 
-		private readonly List<int> ids_ = new List<int>();
+		// ---- LOD groups. Unity tells per renderer whether the camera sees it (Renderer.isVisible, with the LOD level
+		// already chosen), but says nothing about what is outside the view. Shadow casters are needed from there too, so
+		// for those the level is chosen here, with Unity's own rule (the group's height on screen against each level's
+		// threshold, scaled by the LOD bias).
+		private sealed class LodGroupInfo {
+			public LODGroup group;
+			public float[] thresholds;
+			public int current; // the level for this frame, -1 = culled
+			public bool still;  // not under a Rigidbody: its place and size are read when the groups are scanned
+			public Vector3 reference;
+			public float size;
+		}
+
+		private static void MeasureLodGroup(LodGroupInfo info) {
+			LODGroup g = info.group;
+			Transform tr = g.transform;
+			Vector3 scale = tr.lossyScale;
+			info.size = g.size * Mathf.Max(Mathf.Abs(scale.x), Mathf.Max(Mathf.Abs(scale.y), Mathf.Abs(scale.z)));
+			info.reference = tr.TransformPoint(g.localReferencePoint);
+		}
+
+		private readonly List<LodGroupInfo> lodGroups_ = new List<LodGroupInfo>();
+
+		private void ScanLodGroups() {
+			lodGroups_.Clear();
+			foreach (Tracked t in order_) {
+				t.lodGroup = -1;
+				t.lodMask = 0;
+			}
+			foreach (LODGroup g in UnityEngine.Object.FindObjectsByType<LODGroup>(FindObjectsInactive.Exclude, FindObjectsSortMode.None)) {
+				if (!g.enabled) {
+					continue;
+				}
+				LOD[] lods = g.GetLODs();
+				var info = new LodGroupInfo { group = g, thresholds = new float[lods.Length], still = g.GetComponentInParent<Rigidbody>() == null };
+				MeasureLodGroup(info);
+				int index = lodGroups_.Count;
+				for (int level = 0; level < lods.Length && level < 32; ++level) {
+					info.thresholds[level] = lods[level].screenRelativeTransitionHeight;
+					if (lods[level].renderers == null) {
+						continue;
+					}
+					foreach (Renderer r in lods[level].renderers) {
+						if (r != null && renderers_.TryGetValue(r.GetInstanceID(), out Tracked t)) {
+							t.lodGroup = index;
+							t.lodMask |= 1u << level;
+						}
+					}
+				}
+				lodGroups_.Add(info);
+			}
+		}
+
+		private void UpdateLodLevels(Camera camera) {
+			Vector3 eye = camera.transform.position;
+			float halfTan = Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad);
+			float bias = QualitySettings.lodBias;
+			foreach (LodGroupInfo info in lodGroups_) {
+				LODGroup g = info.group;
+				info.current = -1;
+				if (g == null) {
+					continue;
+				}
+				if (!info.still) {
+					MeasureLodGroup(info);
+				}
+				float distance = Mathf.Max(Vector3.Distance(eye, info.reference), 1e-4f);
+				float height = info.size * 0.5f / (distance * halfTan) * bias;
+				for (int level = 0; level < info.thresholds.Length; ++level) {
+					if (height >= info.thresholds[level]) {
+						info.current = level;
+						break;
+					}
+				}
+			}
+		}
 
 		private void Sweep<T>(Dictionary<uint, T> table, HashSet<uint> used, int kind, Func<T, bool> dead) {
 			List<uint> remove = null;
@@ -234,20 +437,40 @@ namespace Aether {
 			}
 		}
 
-		private void TrackGlobal(ref Texture slot, string name) {
-			Texture t = Shader.GetGlobalTexture(name);
-			if (t == slot) {
+		private float nextLodScan_;
+		private int sliceCursor_;
+
+		/// <summary>Looks at a share of the known mesh renderers again (mesh, materials, property blocks, state): all of them about twice a second at 60 frames a second.</summary>
+		private void UpdateSlice() {
+			int n = order_.Count;
+			if (n == 0) {
 				return;
 			}
-			slot = t;
-			if (t != null) {
-				QueueTexture(t);
+			int budget = Mathf.Max(32, n / 30 + 1);
+			for (int i = 0; i < budget; ++i) {
+				if (sliceCursor_ >= order_.Count) {
+					sliceCursor_ = 0;
+				}
+				Tracked t = order_[sliceCursor_++];
+				if (t.renderer != null && t.skinned == null) {
+					UpdateTracked(t);
+				}
 			}
 		}
 
 		private unsafe void UpdateTracked(Tracked t) {
-			Mesh mesh = t.filter != null ? t.filter.sharedMesh : null;
+			Mesh mesh = t.skinned != null ? t.skinned.sharedMesh : t.filter != null ? t.filter.sharedMesh : null;
 			t.layerBit = 1 << t.renderer.gameObject.layer;
+			t.enabled = t.renderer.enabled && !t.renderer.forceRenderingOff && t.renderer.gameObject.activeInHierarchy;
+			t.casting = t.renderer.shadowCastingMode;
+			if (!t.live) {
+				Matrix4x4 now = t.renderer.localToWorldMatrix;
+				if (t.matrixKnown && !now.Equals(t.matrix)) {
+					t.live = true; // it moves after all: followed every frame from here on
+				}
+				t.matrix = now;
+				t.matrixKnown = true;
+			}
 			sharedMaterials_.Clear();
 			t.renderer.GetSharedMaterials(sharedMaterials_);
 			bool changed = !t.registered || mesh != t.mesh || t.materialIds == null || t.materialIds.Length != sharedMaterials_.Count;
@@ -261,6 +484,27 @@ namespace Aether {
 				}
 			}
 			if (!changed) {
+				// a slot that got property values of its own since the last scan, or lost them: bound again
+				for (int i = 0; i < sharedMaterials_.Count; ++i) {
+					Material m = sharedMaterials_[i];
+					if (m != null && m.shader != null && (BlockOf(t.renderer, i) != null) != (t.materials[i] != Handle(m))) {
+						changed = true;
+						break;
+					}
+				}
+			}
+			if (!changed) {
+				if (t.skinned != null) {
+					RegisterSkinnedMesh(t, mesh); // the skinned buffer can be replaced by Unity: looked at again every scan
+				}
+				// the game changes these values in place (a new paint, the brake lights): translated again every scan,
+				// sent only when the result differs
+				for (int i = 0; i < sharedMaterials_.Count; ++i) {
+					Material m = sharedMaterials_[i];
+					if (m != null && m.shader != null && t.materials[i] != 0 && t.materials[i] != Handle(m)) {
+						RegisterMaterial(m, t.materials[i], t.renderer, i);
+					}
+				}
 				return;
 			}
 			if (mesh == null) {
@@ -272,17 +516,18 @@ namespace Aether {
 				return;
 			}
 			t.mesh = mesh;
-			QueueMesh(mesh);
+			if (t.skinned != null) {
+				if (!RegisterSkinnedMesh(t, mesh)) {
+					t.mesh = null; // not skinned on the GPU yet (never rendered so far): the next scan tries again
+					return;
+				}
+			} else {
+				t.meshHandle = Handle(mesh);
+				QueueMesh(mesh);
+			}
 			int count = sharedMaterials_.Count;
 			t.materialIds = new int[count];
 			t.materials = new uint[count];
-			Color? overrideColor = null;
-			if (t.renderer.HasPropertyBlock()) {
-				t.renderer.GetPropertyBlock(block_);
-				if (block_.HasColor(BaseColorId)) {
-					overrideColor = block_.GetColor(BaseColorId);
-				}
-			}
 			for (int i = 0; i < count; ++i) {
 				Material m = sharedMaterials_[i];
 				t.materialIds[i] = m != null ? m.GetInstanceID() : 0;
@@ -290,26 +535,53 @@ namespace Aether {
 					t.materials[i] = 0;
 					continue;
 				}
-				uint handle = overrideColor.HasValue ? VariantHandle(m, t.renderer) : Handle(m);
+				bool own = BlockOf(t.renderer, i) != null;
+				uint handle = own ? VariantHandle(m, t.renderer, i) : Handle(m);
 				t.materials[i] = handle;
-				if (!materials_.ContainsKey(handle)) {
-					RegisterMaterial(m, handle, overrideColor);
+				if (own || !materials_.ContainsKey(handle)) {
+					RegisterMaterial(m, handle, own ? t.renderer : null, i);
 				}
 			}
+			BindInstance(t);
+		}
+
+		/// <summary>Sends the instance: its mesh, its materials, its flags.</summary>
+		private unsafe void BindInstance(Tracked t) {
 			AeInstanceDesc d = default;
 			d.structSize = (uint)sizeof(AeInstanceDesc);
 			d.instance = t.handle;
-			d.mesh = Handle(mesh);
+			d.mesh = t.meshHandle;
 			d.flags = (t.renderer.shadowCastingMode != ShadowCastingMode.Off ? AeConst.InstanceCastShadows : 0) | (t.renderer.receiveShadows ? AeConst.InstanceReceiveShadows : 0) | (t.isStatic ? AeConst.InstanceStatic : 0);
 			d.layer = (uint)t.renderer.gameObject.layer;
-			d.materialCount = (uint)count;
+			d.materialCount = (uint)t.materials.Length;
+			d.renderingLayerMask = t.renderer.renderingLayerMask;
 			fixed (uint* p = t.materials) {
 				t.registered = Native.Aether_SceneUpsertInstance(&d, p) != 0;
 			}
 		}
 
-		private unsafe void RegisterMaterial(Material m, uint handle, Color? overrideColor) {
-			MaterialTranslator.Result result = MaterialTranslator.Translate(m, handle, overrideColor);
+		/// <summary>
+		/// Every frame, for the skinned renderers the camera sees: Unity has skinned this frame into one of the renderer's
+		/// buffers (not the one of the frame before). The instance must draw from that one, or a part that moves fast
+		/// (a car's suspension at speed) is drawn where it was a frame ago.
+		/// </summary>
+		private void RefreshSkinned() {
+			foreach (Tracked t in skinnedTracked_) {
+				if (!t.registered || t.mesh == null || t.renderer == null || !t.renderer.isVisible) {
+					continue;
+				}
+				uint before = t.meshHandle;
+				if (RegisterSkinnedMesh(t, t.mesh) && t.meshHandle != before) {
+					BindInstance(t);
+				}
+			}
+		}
+
+		private readonly List<Tracked> skinnedTracked_ = new List<Tracked>();
+
+		/// <summary>Translates a material (with `owner`'s own property values for slot `index`, if it has any) and sends it when it is new or differs from what was sent.</summary>
+		private unsafe void RegisterMaterial(Material m, uint handle, Renderer owner, int index) {
+			MaterialTranslator.Result result = MaterialTranslator.Translate(m, handle, owner != null ? BlockOf(owner, index) : null);
 			for (int i = 0; i < 5; ++i) {
 				Texture tex = result.textures[i];
 				if (tex != null) {
@@ -320,8 +592,22 @@ namespace Aether {
 				}
 			}
 			AeMaterialDesc d = result.desc;
+			uint signature = 2166136261u;
+			byte* bytes = (byte*)&d;
+			for (int i = 0; i < sizeof(AeMaterialDesc); ++i) {
+				signature = unchecked((signature ^ bytes[i]) * 16777619u);
+			}
+			int crc = m.ComputeCRC();
+			if (materials_.TryGetValue(handle, out TrackedMaterial known) && known.signature == signature && known.material == m) {
+				known.crc = crc;
+				return; // nothing changed
+			}
 			Native.Aether_SceneUpsertMaterial(&d);
-			materials_[handle] = new TrackedMaterial { material = m, crc = m.ComputeCRC(), colorOverride = overrideColor };
+			var textures = new uint[5];
+			for (int i = 0; i < 5; ++i) {
+				textures[i] = d.textures[i];
+			}
+			materials_[handle] = new TrackedMaterial { material = m, crc = crc, owner = owner, index = index, signature = signature, textures = textures };
 		}
 
 		private void CheckMaterials() {
@@ -337,7 +623,7 @@ namespace Aether {
 				return;
 			}
 			foreach (var kv in changed) {
-				RegisterMaterial(kv.Value.material, kv.Key, kv.Value.colorOverride);
+				RegisterMaterial(kv.Value.material, kv.Key, kv.Value.owner, kv.Value.index);
 			}
 		}
 
@@ -348,7 +634,310 @@ namespace Aether {
 			}
 		}
 
+		// ---- what the game's renderer does after lighting (the screen camera's HDRP volume stack)
+		private float nextVolume_;
+		private uint tonemapMode_;
+		private readonly float[] tonemapCurve_ = new float[6];
+		private float postExposure_;
+		private bool fogOn_;
+		private float fogDensity_, fogBase_, fogMax_, fogMaxDistance_;
+		private Color fogColor_ = Color.black, fogTint_ = Color.white;
+		private bool fogFromSky_;
+		private string hostFeatures_ = "";
+		private bool fsBloom_ = true, fsMotionBlur_ = true, fsAntialiasing_ = true, fsPost_ = true;
+		private float bloomIntensity_, bloomScatter_, motionBlur_;
+		private uint antialiasing_;
+		private bool ssrEnabled_;
+		private float ssrMinSmoothness_ = 0.9f, ssrFadeStart_ = 0.9f, ssrScreenFade_ = 0.1f;
+		private uint exposureMode_;
+		private float exposureFixed_, exposureMin_, exposureMax_, exposureCompensation_;
+		public int OffscreenCasters { get; private set; }
+		public float ShadowDistance => shadowDistance_ > 0 ? shadowDistance_ : 150.0f;
+		private VolumeStack volumeStack_;
+		private string volumeProblem_ = "";
+		private int volumeGeneration_ = -1;
+		private float skyIntensity_ = 1, skyRotation_;
+		private string skyState_ = "";
+		private float shadowDistance_;
+		private uint shadowCascades_;
+		private readonly float[] shadowSplits_ = new float[3];
+		private float aoIntensity_, aoRadius_, aoDirect_;
+		private readonly float[] smh_ = new float[16]; // shadows, midtones, highlights (prepared rgb + unused), limits
+
+		// HDRP's shadows / midtones / highlights value: rgb is a colour, w an offset that weighs four times as much when positive
+		private void PrepareSmh(Vector4 v, int at) {
+			float weight = v.w * (v.w < 0 ? 1.0f : 4.0f);
+			smh_[at] = Mathf.Max(v.x + weight, 0);
+			smh_[at + 1] = Mathf.Max(v.y + weight, 0);
+			smh_[at + 2] = Mathf.Max(v.z + weight, 0);
+			smh_[at + 3] = 0;
+		}
+
+		private void ReadHostVolume(Camera camera) {
+			try {
+				// The game describes its look with volumes (data of the scene, evaluated by Unity's volume manager for the
+				// camera's position) and with per camera feature switches ("frame settings"). Both are read as data: no
+				// renderer of the game's has to run for them.
+				if (!VolumeManager.instance.isInitialized) {
+					volumeStack_ = null; // between two pipelines: the previous values stay
+					return;
+				}
+				if (volumeStack_ == null || volumeGeneration_ != PipelineSwitch.VolumeGeneration) {
+					volumeGeneration_ = PipelineSwitch.VolumeGeneration;
+					volumeStack_ = VolumeManager.instance.CreateStack();
+				}
+				VolumeStack stack = volumeStack_;
+				LayerMask volumeLayers = ~0;
+				Transform anchor = camera.transform;
+				UnityEngine.Rendering.HighDefinition.HDAdditionalCameraData cameraData;
+				if (camera.TryGetComponent(out cameraData)) {
+					volumeLayers = cameraData.volumeLayerMask;
+					if (cameraData.volumeAnchorOverride != null) {
+						anchor = cameraData.volumeAnchorOverride;
+					}
+				}
+				VolumeManager.instance.Update(stack, anchor, volumeLayers);
+				HostFrameSettings fs = new HostFrameSettings(cameraData);
+				bool fsTonemap = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.Tonemapping);
+				bool fsGrading = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.ColorGrading);
+				bool fsAo = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.SSAO);
+				bool fsFog = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.AtmosphericScattering);
+				fsBloom_ = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.Bloom);
+				fsMotionBlur_ = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.MotionBlur);
+				fsAntialiasing_ = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.Antialiasing);
+				fsPost_ = fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.Postprocess);
+				string state = "post-processing " + fsPost_ + ", tonemapping " + fsTonemap + ", colour grading " + fsGrading + ", SSAO " + fsAo + ", fog " + fsFog
+					+ ", bloom " + fsBloom_ + ", motion blur " + fsMotionBlur_ + ", antialiasing " + fsAntialiasing_
+					+ ", SSR " + fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.SSR) + (fs.DefaultsKnown ? "" : " (the game's default frame settings could not be read: everything counts as on)");
+				if (state != hostFeatures_) {
+					hostFeatures_ = state;
+					Native.Log(1, "Host camera frame settings (" + camera.name + "): " + state);
+				}
+				ReadHostSky(stack);
+				// post-processing: what the scene's volumes ask for, where the camera has the feature switched on
+				var bloom = stack.GetComponent<UnityEngine.Rendering.HighDefinition.Bloom>();
+				bool bloomOn = bloom != null && fsPost_ && fsBloom_ && bloom.intensity.value > 0;
+				bloomIntensity_ = bloomOn ? bloom.intensity.value : 0;
+				bloomScatter_ = bloomOn ? bloom.scatter.value : 0;
+				var motionBlur = stack.GetComponent<UnityEngine.Rendering.HighDefinition.MotionBlur>();
+				motionBlur_ = motionBlur != null && fsPost_ && fsMotionBlur_ ? motionBlur.intensity.value : 0;
+				// (Aether's own options: LOD bias, anisotropic filtering, VSync. Antialiasing is Aether's switch on the native
+				// side; the mode the game's menu or camera asks for is passed on for information only.)
+				HostQualitySettings.Apply();
+				antialiasing_ = cameraData != null ? (uint)cameraData.antialiasing : 0u;
+				var ssr = stack.GetComponent<UnityEngine.Rendering.HighDefinition.ScreenSpaceReflection>();
+				ssrEnabled_ = ssr != null && ssr.enabled.value && fs.IsEnabled(UnityEngine.Rendering.HighDefinition.FrameSettingsField.SSR);
+				if (ssr != null) {
+					ssrMinSmoothness_ = ssr.minSmoothness;
+					ssrFadeStart_ = ssr.smoothnessFadeStart;
+					ssrScreenFade_ = ssr.screenFadeDistance.value;
+				}
+				var tone = stack.GetComponent<UnityEngine.Rendering.HighDefinition.Tonemapping>();
+				if (!fsTonemap) {
+					tonemapMode_ = 1; // none
+				} else if (tone != null) {
+					switch (tone.mode.value) {
+					case UnityEngine.Rendering.HighDefinition.TonemappingMode.None: tonemapMode_ = 1; break;
+					case UnityEngine.Rendering.HighDefinition.TonemappingMode.Neutral: tonemapMode_ = 2; break;
+					case UnityEngine.Rendering.HighDefinition.TonemappingMode.ACES: tonemapMode_ = 3; break;
+					case UnityEngine.Rendering.HighDefinition.TonemappingMode.Custom: tonemapMode_ = 4; break;
+					default: tonemapMode_ = 5; break;
+					}
+					tonemapCurve_[0] = tone.toeStrength.value;
+					tonemapCurve_[1] = tone.toeLength.value;
+					tonemapCurve_[2] = tone.shoulderStrength.value;
+					tonemapCurve_[3] = tone.shoulderLength.value;
+					tonemapCurve_[4] = tone.shoulderAngle.value;
+					tonemapCurve_[5] = tone.gamma.value;
+				}
+				var grade = stack.GetComponent<UnityEngine.Rendering.HighDefinition.ColorAdjustments>();
+				postExposure_ = grade != null && fsGrading ? grade.postExposure.value : 0;
+				var fog = stack.GetComponent<UnityEngine.Rendering.HighDefinition.Fog>();
+				fogOn_ = fsFog && fog != null && fog.enabled.value && fog.meanFreePath.value > 0;
+				if (fogOn_) {
+					fogDensity_ = 1.0f / fog.meanFreePath.value;
+					fogBase_ = fog.baseHeight.value;
+					fogMax_ = fog.maximumHeight.value;
+					fogMaxDistance_ = fog.maxFogDistance.value;
+					fogFromSky_ = fog.colorMode.value == UnityEngine.Rendering.HighDefinition.FogColorMode.SkyColor;
+					fogColor_ = fog.color.value.linear;
+					fogTint_ = fog.tint.value.linear;
+				}
+				var exposure = stack.GetComponent<UnityEngine.Rendering.HighDefinition.Exposure>();
+				if (exposure != null) {
+					exposureMode_ = exposure.mode.value == UnityEngine.Rendering.HighDefinition.ExposureMode.Fixed ? 1u : 2u;
+					exposureFixed_ = exposure.fixedExposure.value;
+					exposureMin_ = exposure.limitMin.value;
+					exposureMax_ = exposure.limitMax.value;
+					exposureCompensation_ = exposure.compensation.value;
+				}
+				var shadowSettings = stack.GetComponent<UnityEngine.Rendering.HighDefinition.HDShadowSettings>();
+				if (shadowSettings != null) {
+					shadowDistance_ = shadowSettings.maxShadowDistance.value;
+					shadowCascades_ = (uint)Mathf.Clamp(shadowSettings.cascadeShadowSplitCount.value, 1, 4);
+					shadowSplits_[0] = shadowSettings.cascadeShadowSplit0.value;
+					shadowSplits_[1] = shadowSettings.cascadeShadowSplit1.value;
+					shadowSplits_[2] = shadowSettings.cascadeShadowSplit2.value;
+				}
+				var ao = stack.GetComponent<UnityEngine.Rendering.HighDefinition.ScreenSpaceAmbientOcclusion>();
+				aoIntensity_ = ao != null && fsAo ? ao.intensity.value : 0;
+				aoRadius_ = ao != null ? ao.radius.value : 0;
+				aoDirect_ = ao != null ? ao.directLightingStrength.value : 0;
+				var smh = stack.GetComponent<UnityEngine.Rendering.HighDefinition.ShadowsMidtonesHighlights>();
+				for (int i = 12; i < 16; ++i) {
+					smh_[i] = 0; // off unless the camera grades
+				}
+				if (smh != null && fsGrading) {
+					PrepareSmh(smh.shadows.value, 0);
+					PrepareSmh(smh.midtones.value, 4);
+					PrepareSmh(smh.highlights.value, 8);
+					smh_[12] = smh.shadowsStart.value;
+					smh_[13] = smh.shadowsEnd.value;
+					smh_[14] = smh.highlightsStart.value;
+					smh_[15] = smh.highlightsEnd.value;
+				}
+			} catch (Exception e) {
+				// volume components this game does not have: the frame keeps its defaults
+				string problem = e.GetType().Name + ": " + e.Message;
+				if (problem != volumeProblem_) {
+					volumeProblem_ = problem;
+					Native.Log(2, "The game's volume settings could not be read: " + e);
+				}
+			}
+		}
+
+		// The sky: the game's HDRI sky volume names a cube map asset, an intensity and a rotation.
+		private void ReadHostSky(VolumeStack stack) {
+			Texture cube = null;
+			float intensity = 1, rotation = 0;
+			string kind = "none";
+			var environment = stack.GetComponent<UnityEngine.Rendering.HighDefinition.VisualEnvironment>();
+			int skyType = environment != null ? environment.skyType.value : 0;
+			if (skyType == (int)UnityEngine.Rendering.HighDefinition.SkyType.HDRI) {
+				var hdri = stack.GetComponent<UnityEngine.Rendering.HighDefinition.HDRISky>();
+				if (hdri != null && hdri.hdriSky.value != null) {
+					cube = hdri.hdriSky.value;
+					switch (hdri.skyIntensityMode.value) {
+					case UnityEngine.Rendering.HighDefinition.SkyIntensityMode.Multiplier: intensity = hdri.multiplier.value; break;
+					case UnityEngine.Rendering.HighDefinition.SkyIntensityMode.Lux: intensity = hdri.desiredLuxValue.value / Mathf.Max(hdri.upperHemisphereLuxValue.value, 1e-4f); break;
+					default: intensity = Mathf.Pow(2.0f, hdri.exposure.value) / 1.2f; break; // HDRP: ConvertEV100ToExposure(-exposure) = 2^exposure / 1.2
+					}
+					rotation = -hdri.rotation.value * Mathf.Deg2Rad; // (HDRP turns the lookup direction by -rotation)
+					kind = "HDRI " + cube.name + " " + cube.width + ", intensity " + intensity.ToString("F3") + " (" + hdri.skyIntensityMode.value + "), rotation " + hdri.rotation.value.ToString("F0");
+				}
+			} else if (skyType != 0) {
+				kind = "sky type " + skyType + " (not an HDRI sky: Aether lights the scene with the ambient probe)";
+			}
+			if (kind != skyState_) {
+				skyState_ = kind;
+				Native.Log(1, "Host sky: " + kind);
+			}
+			skyIntensity_ = intensity;
+			skyRotation_ = rotation;
+			if (cube != sky_) {
+				sky_ = cube;
+				if (cube != null) {
+					QueueTexture(cube);
+				}
+			}
+		}
+
+		// ---- reflection probes: the host's cube maps and where they apply
+		private AeProbe[] probeScratch_ = new AeProbe[8];
+		private int probeSignature_;
+		public int ProbeCount { get; private set; }
+
+		private unsafe void ScanProbes(HashSet<uint> usedTextures) {
+			ReflectionProbe[] found = UnityEngine.Object.FindObjectsByType<ReflectionProbe>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+			if (probeScratch_.Length < found.Length) {
+				probeScratch_ = new AeProbe[Mathf.NextPowerOfTwo(found.Length)];
+			}
+			int count = 0, signature = 17;
+			var described = new System.Text.StringBuilder();
+			fixed (AeProbe* probes = probeScratch_) {
+				foreach (ReflectionProbe probe in found) {
+					if (probe == null || !probe.isActiveAndEnabled) {
+						continue;
+					}
+					Texture texture = null;
+					Vector3 extents = probe.size * 0.5f;
+					float blend = probe.blendDistance, intensity = probe.intensity;
+					uint flags = probe.boxProjection ? 1u : 0u;
+					// HDRP keeps the real settings on its own component
+					if (probe.TryGetComponent(out UnityEngine.Rendering.HighDefinition.HDAdditionalReflectionData hd)) {
+						texture = hd.texture;
+						var volume = hd.influenceVolume;
+						if (volume != null) {
+							if (volume.shape == UnityEngine.Rendering.HighDefinition.InfluenceShape.Sphere) {
+								flags |= 2u;
+								extents = new Vector3(volume.sphereRadius, volume.sphereRadius, volume.sphereRadius);
+								blend = volume.sphereBlendDistance;
+							} else {
+								extents = volume.boxSize * 0.5f;
+								Vector3 b = volume.boxBlendDistancePositive;
+								blend = Mathf.Max(b.x, Mathf.Max(b.y, b.z));
+							}
+						}
+						intensity = hd.multiplier * hd.weight;
+						flags = (flags & 2u) | (hd.isProjectionInfinite ? 0u : 1u);
+					}
+					if (texture == null) {
+						texture = probe.texture;
+					}
+					if (texture == null || texture.dimension != TextureDimension.Cube) {
+						continue; // nothing captured (yet)
+					}
+					uint handle = Handle(texture);
+					usedTextures.Add(handle);
+					if (!textures_.ContainsKey(handle)) {
+						QueueTexture(texture);
+					}
+					Transform t = probe.transform;
+					Matrix4x4 worldToLocal = Matrix4x4.TRS(t.position, t.rotation, Vector3.one).inverse;
+					AeProbe* p = probes + count++;
+					*p = default;
+					p->texture = handle;
+					p->flags = flags;
+					for (int r = 0; r < 3; ++r) {
+						for (int c = 0; c < 4; ++c) {
+							p->worldToLocal[r * 4 + c] = worldToLocal[r, c];
+						}
+					}
+					p->extents[0] = extents.x; p->extents[1] = extents.y; p->extents[2] = extents.z;
+					p->blendDistance = blend;
+					Vector3 capture = t.position;
+					p->capturePosition[0] = capture.x; p->capturePosition[1] = capture.y; p->capturePosition[2] = capture.z;
+					p->intensity = intensity;
+					described.Append("; ").Append(probe.name).Append(" cube ").Append(texture.name).Append(' ').Append(texture.width).Append(" at ").Append(t.position.ToString("F1"))
+						.Append(" extents ").Append(extents.ToString("F1")).Append(" blend ").Append(blend.ToString("F2")).Append(" intensity ").Append(intensity.ToString("F2")).Append(" flags ").Append(flags)
+						.Append(" in store ").Append(textures_.ContainsKey(handle));
+					unchecked {
+						signature = signature * 31 + (int)handle;
+						signature = signature * 31 + worldToLocal.GetHashCode() + extents.GetHashCode() + blend.GetHashCode() + intensity.GetHashCode() + (int)flags;
+					}
+				}
+				if (signature != probeSignature_ || count != ProbeCount) {
+					probeSignature_ = signature;
+					ProbeCount = count;
+					Native.Aether_SceneSetProbes(probes, (uint)count, (uint)sizeof(AeProbe));
+					Native.Log(1, "Reflection probes: " + count + described);
+				}
+			}
+		}
+
 		private int devFlags_;
+		private bool lightLayers_;
+
+		// Whether the game's HDRP asset has light layers on (then a light only reaches renderers that share a layer with it).
+		private static bool HostLightLayers() {
+			try {
+				// the game's own pipeline asset says whether its lights are restricted to rendering layers (read as data)
+				var asset = (PipelineSwitch.GameAsset ?? GraphicsSettings.currentRenderPipeline) as UnityEngine.Rendering.HighDefinition.HDRenderPipelineAsset;
+				return asset != null && asset.currentPlatformRenderPipelineSettings.supportLightLayers;
+			} catch (Exception) {
+				return false;
+			}
+		}
 
 		private void QueueTexture(Texture tex) {
 			if ((devFlags_ & 1) != 0) {
@@ -391,23 +980,120 @@ namespace Aether {
 			}
 		}
 
-		/// <summary>True when the mesh is registered or can never be; false to try again later (not on the GPU yet).</summary>
-		private unsafe bool RegisterMesh(Mesh mesh) {
+		/// <summary>
+		/// The matrix that takes Unity's skinned vertices (SkinnedMeshRenderer.GetVertexBuffer) to the world: the space of
+		/// the renderer's root bone (its own transform when it has none); for cloth that space without its scale.
+		/// Renderer.localToWorldMatrix is the renderer's own transform, which is neither: with it people stood 0.9 m deep
+		/// in the ground and flags hung 2 m low.
+		/// Measured in the game (survey, "skinned"): Unity's own world bounds of each skinned renderer are its local bounds
+		/// taken through exactly these matrices (root bones with scale 1 and 100; cloth with scale 0.5). That the vertices
+		/// are in the same space as the bounds is an assumption, checked by eye against the game's picture.
+		/// </summary>
+		internal static Matrix4x4 SkinnedMatrix(SkinnedMeshRenderer r) {
+			Transform root = r.rootBone != null ? r.rootBone : r.transform;
+			if (r.TryGetComponent(out Cloth cloth) && cloth.enabled) {
+				return Matrix4x4.TRS(root.position, root.rotation, Vector3.one);
+			}
+			return root.localToWorldMatrix;
+		}
+
+		/// <summary>Describes a skinned renderer's mesh with Unity's skinned vertex buffer as stream 0. False = not available yet.</summary>
+		private bool RegisterSkinnedMesh(Tracked t, Mesh mesh) {
+			if (mesh == null) {
+				return false;
+			}
+			GraphicsBuffer skinnedBuffer = null;
+			try {
+				skinnedBuffer = t.skinned.GetVertexBuffer();
+				if (skinnedBuffer == null) {
+					return false;
+				}
+				IntPtr pointer = skinnedBuffer.GetNativeBufferPtr();
+				int stride = skinnedBuffer.stride;
+				if (pointer == IntPtr.Zero || stride <= 0) {
+					return false;
+				}
+				if (pointer == t.skinnedPointer && meshes_.ContainsKey(t.meshHandle)) {
+					return true;
+				}
+				if (t.skinnedVariants != null && t.skinnedVariants.TryGetValue(pointer, out uint known) && meshes_.ContainsKey(known)) {
+					t.meshHandle = known; // the other buffer, registered before
+					t.skinnedPointer = pointer;
+					return true;
+				}
+				// the skinned buffer replaces the mesh's stream 0, which must hold exactly what skinning produces
+				attributes_.Clear();
+				mesh.GetVertexAttributes(attributes_);
+				// (a skinned buffer with the mesh's own stride for stream 0 keeps that stream's whole layout: small meshes that
+				// have everything in one stream)
+				bool sameLayout = stride == mesh.GetVertexBufferStride(0);
+				foreach (VertexAttributeDescriptor a in attributes_) {
+					bool skinnedAttribute = a.attribute == VertexAttribute.Position || a.attribute == VertexAttribute.Normal || a.attribute == VertexAttribute.Tangent;
+					if (!sameLayout && (a.stream == 0) != skinnedAttribute) {
+						// (seen right after a renderer appears, before Unity skinned it once: the buffer is not the final
+						// one yet. Tried again; only a renderer that never fits is reported.)
+						if (++t.skinnedFailures == 40 && !t.skinnedUnsupported) {
+							t.skinnedUnsupported = true;
+							++UnsupportedFormats;
+						}
+						return false;
+					}
+				}
+				if (t.skinnedVariants == null) {
+					t.skinnedVariants = new Dictionary<IntPtr, uint>();
+				} else if (t.skinnedVariants.Count >= 4) {
+					t.skinnedVariants.Clear(); // Unity replaced its buffers: the old meshes go with the next sweep
+				}
+				uint handle = VariantHandle(mesh, t.renderer, 1000 + t.skinnedVariants.Count + (int)(frameIndex_ & 0xFFFF) * 8);
+				if (!RegisterMeshCore(mesh, handle, pointer, stride) || !meshes_.ContainsKey(handle)) {
+					return false;
+				}
+				t.skinnedVariants[pointer] = handle;
+				t.meshHandle = handle;
+				t.skinnedPointer = pointer;
+				t.skinnedFailures = 0;
+				if (t.skinnedUnsupported) {
+					t.skinnedUnsupported = false;
+					--UnsupportedFormats;
+				}
+				return true;
+			} finally {
+				if (skinnedBuffer != null) {
+					skinnedBuffer.Dispose(); // only this handle: the buffer itself stays Unity's
+				}
+			}
+		}
+
+		private bool RegisterMesh(Mesh mesh) {
+			return RegisterMeshCore(mesh, Handle(mesh), IntPtr.Zero, 0);
+		}
+
+		private unsafe bool RegisterMeshCore(Mesh mesh, uint handle, IntPtr stream0, int stream0Stride) {
 			int streams = mesh.vertexBufferCount;
-			if (streams < 1 || streams > 4 || mesh.subMeshCount < 1) {
+			if (streams < 1 || mesh.vertexCount == 0) {
+				// an empty mesh: one the game builds while it runs (tyre marks, trails) and has not filled yet. It is watched
+				// from now on and sent whenever its contents change (UpdateDynamicMeshes).
+				if (!dynamicMeshes_.ContainsKey(handle)) {
+					dynamicMeshes_[handle] = new DynamicMesh { mesh = mesh };
+				}
+				return true;
+			}
+			if (streams > 4 || mesh.subMeshCount < 1) {
 				++UnsupportedFormats;
+				Native.Log(2, "Mesh not drawn: " + mesh.name + " has " + streams + " vertex streams, " + mesh.vertexCount + " vertices, " + mesh.subMeshCount + " sub meshes");
 				return true;
 			}
 			AeMeshDesc d = default;
 			d.structSize = (uint)sizeof(AeMeshDesc);
-			d.mesh = Handle(mesh);
+			d.mesh = handle;
 			d.vertexCount = (uint)mesh.vertexCount;
 			d.indexStride = mesh.indexFormat == IndexFormat.UInt16 ? 2u : 4u;
 			d.streamCount = (uint)streams;
 			IntPtr* buffers = &d.vertexBuffer0;
 			for (int s = 0; s < streams; ++s) {
-				buffers[s] = mesh.GetNativeVertexBufferPtr(s);
-				d.streamStride[s] = (uint)mesh.GetVertexBufferStride(s);
+				bool replaced = s == 0 && stream0 != IntPtr.Zero;
+				buffers[s] = replaced ? stream0 : mesh.GetNativeVertexBufferPtr(s);
+				d.streamStride[s] = (uint)(replaced ? stream0Stride : mesh.GetVertexBufferStride(s));
 				if (buffers[s] == IntPtr.Zero) {
 					return false;
 				}
@@ -436,6 +1122,7 @@ namespace Aether {
 			}
 			if (!hasPosition) {
 				++UnsupportedFormats;
+				Native.Log(2, "Mesh not drawn: " + mesh.name + " has no position attribute Aether can read (" + attributes_.Count + " attributes)");
 				return true;
 			}
 			d.attributeCount = count;
@@ -463,6 +1150,7 @@ namespace Aether {
 					meshes_[d.mesh] = mesh;
 				} else {
 					++UnsupportedFormats;
+					Native.Log(2, "Mesh not drawn: " + mesh.name + " was refused by the renderer (" + d.vertexCount + " vertices, " + indexCount + " indices, " + streams + " streams)");
 				}
 			}
 			return true;
@@ -477,7 +1165,7 @@ namespace Aether {
 			textures_.TryGetValue(handle, out TrackedTexture t);
 			bool known = t != null;
 			if (!known) {
-				t = new TrackedTexture { texture = tex, global = tex == sky_ || tex == exposure_ };
+				t = new TrackedTexture { texture = tex, global = false };
 				textures_[handle] = t;
 			}
 			int loadedMip = tex is Texture2D t2 ? t2.loadedMipmapLevel : 0;
@@ -501,6 +1189,7 @@ namespace Aether {
 			case TextureDimension.Tex3D: d.dimension = AeConst.Texture3D; break;
 			default:
 				++UnsupportedFormats;
+				Native.Log(2, "Texture not used: " + tex.name + " (" + tex.GetType().Name + ", dimension " + tex.dimension + ", " + tex.width + " x " + tex.height + ")");
 				return true;
 			}
 			Native.Aether_SceneUpsertTexture(&d);
@@ -512,19 +1201,48 @@ namespace Aether {
 			return true;
 		}
 
+		// What Unity has not put on the GPU (yet) is asked for again, but not every frame: asking for a native pointer
+		// makes the main thread wait for the render thread, and one texture that never gets there (seen on a track: one
+		// stays pending for the whole session) cost that wait in every frame.
+		private readonly Dictionary<uint, int> pendingFailures_ = new Dictionary<uint, int>();
+		private float pendingRetryAt_;
+
+		private bool WaitsForRetry(uint handle, bool retryNow) {
+			return !retryNow && pendingFailures_.ContainsKey(handle);
+		}
+
+		private void PendingFailed(UnityEngine.Object o, uint handle) {
+			pendingFailures_.TryGetValue(handle, out int n);
+			pendingFailures_[handle] = ++n;
+			if (n == 20) {
+				Native.Log(1, "Scene capture: still not on the GPU after 20 tries: " + o.GetType().Name + " " + o.name + " (asked for again once a second)");
+			}
+		}
+
 		private void ProcessPending() {
 			int budget = PointerQueriesPerFrame;
 			int retries = 0;
+			bool retryNow = Time.unscaledTime >= pendingRetryAt_;
+			if (retryNow) {
+				pendingRetryAt_ = Time.unscaledTime + 1.0f;
+			}
 			while (budget > 0 && pendingMeshes_.Count > retries) {
 				Mesh mesh = pendingMeshes_.Dequeue();
 				if (mesh == null) {
 					continue;
 				}
+				if (WaitsForRetry(Handle(mesh), retryNow)) {
+					pendingMeshes_.Enqueue(mesh);
+					++retries;
+					continue;
+				}
 				budget -= mesh.vertexBufferCount + 1;
 				if (RegisterMesh(mesh)) {
 					pendingMeshSet_.Remove(Handle(mesh));
+					pendingFailures_.Remove(Handle(mesh));
 				} else {
 					pendingMeshes_.Enqueue(mesh); // not uploaded by Unity yet
+					PendingFailed(mesh, Handle(mesh));
 					++retries;
 				}
 			}
@@ -534,11 +1252,18 @@ namespace Aether {
 				if (tex == null) {
 					continue;
 				}
+				if (WaitsForRetry(Handle(tex), retryNow)) {
+					pendingTextures_.Enqueue(tex);
+					++retries;
+					continue;
+				}
 				--budget;
 				if (RegisterTexture(tex)) {
 					pendingTextureSet_.Remove(Handle(tex));
+					pendingFailures_.Remove(Handle(tex));
 				} else {
 					pendingTextures_.Enqueue(tex);
+					PendingFailed(tex, Handle(tex));
 					++retries;
 				}
 			}
@@ -552,20 +1277,160 @@ namespace Aether {
 		/// make the main thread wait for the render thread, and doing that while the render pipeline is in the middle of
 		/// recording a frame (graphics jobs) upset Unity's own texture uploads (docs/development/stability-investigation.md).
 		/// </summary>
+		// ---- what the capture costs on the main thread (milliseconds; the window restarts every few seconds)
+		private struct Cost {
+			public double sum, max, lastAvg, lastMax;
+			public int count;
+			public void Add(long ticks) {
+				double ms = ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+				sum += ms;
+				max = Math.Max(max, ms);
+				++count;
+			}
+			public void Roll() {
+				lastAvg = count > 0 ? sum / count : 0;
+				lastMax = max;
+				sum = max = 0;
+				count = 0;
+			}
+			public override string ToString() { return lastAvg.ToString("F2") + " avg / " + lastMax.ToString("F2") + " max"; }
+		}
+
+		private Cost scanCost_, tickCost_, frameCost_;
+		private float nextCostRoll_;
+
 		public void Tick() {
 			if (!active_) {
 				return;
 			}
 			float now = Time.unscaledTime;
-			if (now >= nextScan_) {
-				nextScan_ = now + ScanInterval;
-				Scan();
+			if (now >= nextCostRoll_) {
+				nextCostRoll_ = now + 5.0f;
+				scanCost_.Roll();
+				tickCost_.Roll();
+				frameCost_.Roll();
 			}
+			long tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
+			try {
+				TickCore(now);
+			} finally {
+				tickCost_.Add(System.Diagnostics.Stopwatch.GetTimestamp() - tickStart);
+			}
+		}
+
+		private void TickCore(float now) {
+			if (scanPhase_ == 0 && now >= nextScan_) {
+				// (a big scene is searched for new renderers less often: the search itself is what costs there)
+				nextScan_ = now + (order_.Count > 2000 ? ScanInterval * 4.0f : ScanInterval);
+				scanPhase_ = 1;
+			}
+			if (scanPhase_ != 0) {
+				long scanStart = System.Diagnostics.Stopwatch.GetTimestamp();
+				ScanStep();
+				scanCost_.Add(System.Diagnostics.Stopwatch.GetTimestamp() - scanStart);
+			}
+			UpdateSlice();
 			if (now >= nextMaterialCheck_) {
 				nextMaterialCheck_ = now + MaterialCheckInterval;
 				CheckMaterials();
 			}
+			RefreshOwnedMaterials();
 			ProcessPending();
+			UpdateDynamicMeshes();
+		}
+
+		// ---- materials seen through a renderer's property block, every frame. The game writes the player's changes
+		// there (a paint colour while the slider moves, the brake lights): waiting for the next scan showed them up to
+		// half a second late. Reading every property of every such material each frame would cost too much, so only the
+		// values the game changes while it runs are compared; the full translation runs when one of them differs.
+		private static readonly int[] quickVectors_ = { Shader.PropertyToID("_BaseColor"), Shader.PropertyToID("_SecondaryColor"), Shader.PropertyToID("_EmissionIntensity") };
+		private static readonly int[] quickFloats_ = { Shader.PropertyToID("_Roughness"), Shader.PropertyToID("_Metalness"), Shader.PropertyToID("_Clearcoat") };
+		private static readonly int quickTexture_ = Shader.PropertyToID("_BaseMap");
+		private readonly Dictionary<uint, uint> quickSignatures_ = new Dictionary<uint, uint>();
+		private readonly List<uint> quickChanged_ = new List<uint>();
+
+		private void RefreshOwnedMaterials() {
+			quickChanged_.Clear();
+			foreach (var kv in materials_) {
+				TrackedMaterial m = kv.Value;
+				if (m.owner == null || m.material == null) {
+					continue;
+				}
+				MaterialPropertyBlock block = BlockOf(m.owner, m.index);
+				uint h = 2166136261u;
+				if (block != null) {
+					unchecked {
+						foreach (int id in quickVectors_) {
+							Vector4 v = block.GetVector(id);
+							h = (h ^ (uint)v.GetHashCode()) * 16777619u;
+						}
+						foreach (int id in quickFloats_) {
+							h = (h ^ (uint)block.GetFloat(id).GetHashCode()) * 16777619u;
+						}
+						Texture tex = block.GetTexture(quickTexture_);
+						h = (h ^ (tex != null ? (uint)tex.GetInstanceID() : 0u)) * 16777619u;
+					}
+				}
+				if (!quickSignatures_.TryGetValue(kv.Key, out uint known)) {
+					quickSignatures_[kv.Key] = h; // first sight: what was sent is current
+				} else if (known != h) {
+					quickSignatures_[kv.Key] = h;
+					quickChanged_.Add(kv.Key);
+				}
+			}
+			foreach (uint handle in quickChanged_) {
+				TrackedMaterial m = materials_[handle];
+				RegisterMaterial(m.material, handle, m.owner, m.index);
+			}
+			if (quickSignatures_.Count > materials_.Count + 256) {
+				quickSignatures_.Clear(); // handles that are gone; the next frame fills it again
+			}
+		}
+
+		// ---- meshes the game writes while it runs
+		private sealed class DynamicMesh {
+			public Mesh mesh;
+			public int vertexCount;
+			public long indexCount;
+		}
+
+		private readonly Dictionary<uint, DynamicMesh> dynamicMeshes_ = new Dictionary<uint, DynamicMesh>();
+		private readonly List<uint> deadDynamic_ = new List<uint>();
+		public int DynamicMeshes => dynamicMeshes_.Count;
+
+		private void UpdateDynamicMeshes() {
+			if (dynamicMeshes_.Count == 0) {
+				return;
+			}
+			deadDynamic_.Clear();
+			foreach (var kv in dynamicMeshes_) {
+				DynamicMesh d = kv.Value;
+				if (d.mesh == null) {
+					deadDynamic_.Add(kv.Key);
+					continue;
+				}
+				int vertices = d.mesh.vertexCount;
+				long indices = 0;
+				for (int s = 0; s < d.mesh.subMeshCount; ++s) {
+					indices += d.mesh.GetIndexCount(s);
+				}
+				if (vertices == d.vertexCount && indices == d.indexCount) {
+					continue;
+				}
+				// grown or rewritten: Unity may have moved it to new buffers, and its index ranges are different
+				if (vertices > 0 && indices > 0) {
+					if (!RegisterMeshCore(d.mesh, kv.Key, IntPtr.Zero, 0)) {
+						continue; // its buffers are not on the GPU yet: the next frame tries again
+					}
+				} else if (meshes_.Remove(kv.Key)) {
+					Native.Aether_SceneDestroy(AeConst.KindMesh, kv.Key); // emptied again
+				}
+				d.vertexCount = vertices;
+				d.indexCount = indices;
+			}
+			foreach (uint handle in deadDynamic_) {
+				dynamicMeshes_.Remove(handle);
+			}
 		}
 
 		/// <summary>
@@ -573,6 +1438,15 @@ namespace Aether {
 		/// game's cameras rendered. Returns false when nothing was submitted.
 		/// </summary>
 		public unsafe bool SubmitFrame(Camera camera) {
+			long start = System.Diagnostics.Stopwatch.GetTimestamp();
+			try {
+				return SubmitFrameCore(camera);
+			} finally {
+				frameCost_.Add(System.Diagnostics.Stopwatch.GetTimestamp() - start);
+			}
+		}
+
+		private unsafe bool SubmitFrameCore(Camera camera) {
 			if (!active_) {
 				return false;
 			}
@@ -600,6 +1474,51 @@ namespace Aether {
 				f.cameraForward[0] = fwd.x; f.cameraForward[1] = fwd.y; f.cameraForward[2] = fwd.z;
 				f.nearPlane = camera.nearClipPlane;
 				f.farPlane = camera.farClipPlane;
+				if (Time.unscaledTime >= nextVolume_) {
+					nextVolume_ = Time.unscaledTime + 0.5f;
+					ReadHostVolume(camera);
+				}
+			}
+			f.tonemapMode = tonemapMode_;
+			for (int i = 0; i < 6; ++i) {
+				f.tonemapCurve[i] = tonemapCurve_[i];
+			}
+			f.postExposure = postExposure_;
+			f.exposureMode = exposureMode_;
+			f.exposureFixedEV = exposureFixed_;
+			f.exposureMinEV = exposureMin_;
+			f.exposureMaxEV = exposureMax_;
+			f.exposureCompensation = exposureCompensation_;
+			f.bloomIntensity = bloomIntensity_;
+			f.bloomScatter = bloomScatter_;
+			f.motionBlurIntensity = motionBlur_;
+			f.antialiasing = antialiasing_;
+			f.ssrEnabled = ssrEnabled_ ? 1u : 0u;
+			f.ssrMinSmoothness = ssrMinSmoothness_;
+			f.ssrSmoothnessFadeStart = ssrFadeStart_;
+			f.ssrScreenFadeDistance = ssrScreenFade_;
+			f.shadowDistance = shadowDistance_;
+			f.shadowCascades = shadowCascades_;
+			for (int i = 0; i < 3; ++i) {
+				f.shadowSplits[i] = shadowSplits_[i];
+			}
+			f.aoIntensity = aoIntensity_;
+			f.aoRadius = aoRadius_;
+			f.aoDirectStrength = aoDirect_;
+			for (int i = 0; i < 4; ++i) {
+				f.smhShadows[i] = smh_[i];
+				f.smhMidtones[i] = smh_[4 + i];
+				f.smhHighlights[i] = smh_[8 + i];
+				f.smhLimits[i] = smh_[12 + i];
+			}
+			if (fogOn_) {
+				f.fogDensity = fogDensity_;
+				f.fogBaseHeight = fogBase_;
+				f.fogMaxHeight = fogMax_;
+				f.fogMaxDistance = fogMaxDistance_;
+				f.fogColor[0] = fogColor_.r; f.fogColor[1] = fogColor_.g; f.fogColor[2] = fogColor_.b;
+				f.fogTint[0] = fogTint_.r; f.fogTint[1] = fogTint_.g; f.fogTint[2] = fogTint_.b;
+				f.fogFlags = fogFromSky_ ? 1u : 0u;
 			}
 			// ambient light: Unity's probe as the seven vectors its shaders use (unity_SHAr .. unity_SHC)
 			SphericalHarmonicsL2 sh = RenderSettings.ambientProbe;
@@ -617,10 +1536,12 @@ namespace Aether {
 			f.ambientSH[27] = 1.0f;
 			if (sky_ != null && textures_.ContainsKey(Handle(sky_))) {
 				f.skyTexture = Handle(sky_);
+				f.skyIntensity = skyIntensity_;
+				f.skyRotation = skyRotation_;
 			}
-			if (exposure_ != null && textures_.ContainsKey(Handle(exposure_))) {
-				f.exposureTexture = Handle(exposure_);
-			}
+
+			// ---- particles (sent before the frame they belong to)
+			particles_.Submit(camera, particleTexture_);
 
 			// ---- one entry per registered renderer
 			if (frameInstances_.Length < order_.Count) {
@@ -628,6 +1549,18 @@ namespace Aether {
 			}
 			int count = 0;
 			int cullingMask = camera != null ? camera.cullingMask : ~0;
+			int offscreen = 0;
+			int sunMask = ~0; // the layers the sun lights (and so the layers whose renderers cast its shadows)
+			foreach (Light l in lights_) {
+				if (l != null && l.isActiveAndEnabled && l.type == LightType.Directional) {
+					sunMask = l.cullingMask;
+					break;
+				}
+			}
+			if (camera != null) {
+				UpdateLodLevels(camera);
+			}
+			RefreshSkinned();
 			fixed (AeFrameInstance* instances = frameInstances_) {
 				for (int i = 0; i < order_.Count; ++i) {
 					Tracked t = order_[i];
@@ -639,10 +1572,26 @@ namespace Aether {
 					fi->instance = t.handle;
 					// isVisible is Unity's own culling result for the frame just rendered (frustum, LOD group, occlusion;
 					// also true for a renderer only a shadow needs): the LOD level HDRP picked is the one Aether draws
-					fi->flags = r.enabled && !r.forceRenderingOff && (t.layerBit & cullingMask) != 0 && r.isVisible ? AeConst.FrameInstanceVisible : 0u;
-					*(Matrix4x4*)fi->localToWorld = r.localToWorldMatrix;
+					// (a renderer that stands still: what the last look at it found, see Tracked; the others are asked every frame)
+					bool enabled = !t.live ? t.enabled : r.enabled && !r.forceRenderingOff;
+					bool inCamera = (t.layerBit & cullingMask) != 0;
+					ShadowCastingMode casting = !t.live ? t.casting : r.shadowCastingMode;
+					uint flags = 0;
+					if (enabled && inCamera && r.isVisible) {
+						flags = AeConst.FrameInstanceVisible | (casting == ShadowCastingMode.ShadowsOnly ? AeConst.FrameInstanceShadowOnly : 0u);
+					} else if (enabled && casting != ShadowCastingMode.Off && (t.layerBit & sunMask) != 0 &&
+						(t.lodGroup < 0 || (t.lodGroup < lodGroups_.Count && lodGroups_[t.lodGroup].current >= 0 && (t.lodMask & (1u << lodGroups_[t.lodGroup].current)) != 0))) {
+						// Not seen by the camera (outside the view, hidden by Unity's occlusion data, or on a layer the camera
+						// does not show), but the sun reaches its layer: it can cast a shadow into the view. The native side
+						// culls it against the view and every shadow cascade itself.
+						flags = AeConst.FrameInstanceVisible | (inCamera && casting != ShadowCastingMode.ShadowsOnly ? 0u : AeConst.FrameInstanceShadowOnly);
+						++offscreen;
+					}
+					fi->flags = flags;
+					*(Matrix4x4*)fi->localToWorld = t.skinned != null ? SkinnedMatrix(t.skinned) : !t.live ? t.matrix : r.localToWorldMatrix;
 				}
 
+				OffscreenCasters = offscreen;
 				// ---- lights
 				if (frameLights_.Length < lights_.Count) {
 					frameLights_ = new AeLight[Mathf.NextPowerOfTwo(lights_.Count)];
@@ -661,10 +1610,29 @@ namespace Aether {
 						case LightType.Spot: type = AeConst.LightSpot; break;
 						default: continue; // area lights are not part of the contract yet
 						}
+						// The game's lights carry a second component with the settings of its own pipeline. It is the game's
+						// switch as well: a light whose component is disabled is off (the garage's lamps by day), whatever the
+						// Light itself says. Its dimmer and its fade with the distance from the camera apply too.
+						float dimmer = 1;
+						if (l.TryGetComponent(out UnityEngine.Rendering.HighDefinition.HDAdditionalLightData data)) {
+							if (!data.isActiveAndEnabled) {
+								continue;
+							}
+							dimmer = data.lightDimmer;
+							if (type != AeConst.LightDirectional && camera != null && data.fadeDistance > 0) {
+								float distance = Vector3.Distance(camera.transform.position, l.transform.position);
+								dimmer *= Mathf.Clamp01((data.fadeDistance - distance) / (data.fadeDistance * 0.2f));
+							}
+							if (dimmer <= 0) {
+								continue;
+							}
+						}
 						AeLight* o = lights + lightCount++;
 						*o = default;
 						o->type = type;
 						o->flags = l.shadows != LightShadows.None ? AeConst.LightCastsShadows : 0u;
+						// HDRP light layers: the light's layers are the low byte of Light.renderingLayerMask
+						o->layerMask = lightLayers_ ? ((uint)l.renderingLayerMask & 0xFFu) : 0xFFFFFFFFu;
 						Transform tr = l.transform;
 						Vector3 pos = tr.position, dir = tr.forward;
 						o->position[0] = pos.x; o->position[1] = pos.y; o->position[2] = pos.z;
@@ -675,7 +1643,7 @@ namespace Aether {
 						if (l.useColorTemperature) {
 							c *= Mathf.CorrelatedColorTemperatureToRGB(l.colorTemperature);
 						}
-						float intensity = l.intensity;
+						float intensity = l.intensity * dimmer;
 						o->color[0] = c.r * intensity; o->color[1] = c.g * intensity; o->color[2] = c.b * intensity;
 						o->spotOuterCos = Mathf.Cos(l.spotAngle * 0.5f * Mathf.Deg2Rad);
 						o->spotInnerCos = Mathf.Cos(Mathf.Min(l.innerSpotAngle, l.spotAngle) * 0.5f * Mathf.Deg2Rad);
@@ -685,9 +1653,17 @@ namespace Aether {
 			}
 		}
 
+		private int SkinnedBuffers() {
+			int n = 0;
+			foreach (Tracked t in skinnedTracked_) {
+				n += t.skinnedVariants != null ? t.skinnedVariants.Count : 0;
+			}
+			return n;
+		}
+
 		public string Status() {
 			return order_.Count + " renderers, " + meshes_.Count + " meshes (" + pendingMeshes_.Count + " pending), " + materials_.Count + " materials, " + textures_.Count + " textures (" +
-				pendingTextures_.Count + " pending), " + lights_.Count + " lights; skipped: " + SkinnedSkipped + " skinned renderers, " + UnsupportedFormats + " unsupported meshes / textures";
+				pendingTextures_.Count + " pending), " + lights_.Count + " lights, " + lodGroups_.Count + " LOD groups, " + OffscreenCasters + " off-screen shadow casters, " + SkinnedBuffers() + " skinned buffers of " + skinnedTracked_.Count + " skinned renderers, " + dynamicMeshes_.Count + " dynamic meshes; skipped: " + SkinnedSkipped + " skinned renderers, " + UnsupportedFormats + " unsupported meshes / textures; " + particles_.LastCount + " particles (" + particles_.LastSmoke + " tyre smoke, " + particles_.Systems + " particle systems); main thread ms: scan " + scanCost_ + ", tick " + tickCost_ + ", frame " + frameCost_ + ", pipeline " + AetherPipeline.Timing;
 		}
 	}
 }

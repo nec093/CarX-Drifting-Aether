@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
-using KSL.API;
 using UnityEngine;
 using UnityEngine.Profiling;
 using UnityEngine.Rendering;
@@ -52,7 +51,7 @@ namespace Aether {
 				Native.SetManagedState(key, build());
 			} catch (Exception e) {
 				Native.Log(3, "Could not collect '" + key + "': " + e.GetType().Name + ": " + e.Message);
-				Native.SetManagedState(key, new Json().BeginObject().Add("error", e.GetType().Name + ": " + e.Message).EndObject().ToString());
+				Native.SetManagedState(key, new Json().BeginObject().Add("error", e.GetType().Name + ": " + e.Message).Add("stack", e.StackTrace).EndObject().ToString());
 			}
 		}
 
@@ -65,7 +64,7 @@ namespace Aether {
 			j.Add("nativeLoad", Native.LoadStrategy);
 			j.Add("hdrpDx12Fix", HdrpDx12Fix.Status);
 			j.Add("gamePassesDx12", GameDx12Workarounds.Status);
-			j.Add("loader", Kino.Loader.Name);
+			j.Add("loader", AetherCore.Host.LoaderName);
 			j.Add("unityVersion", Application.unityVersion);
 			j.Add("gameVersion", Application.version);
 			j.Add("graphicsDeviceType", SystemInfo.graphicsDeviceType.ToString());
@@ -95,7 +94,7 @@ namespace Aether {
 
 			j.BeginArray("mods");
 			try {
-				foreach (object mod in Kino.Loader.GetLoadedMods()) {
+				foreach (object mod in AetherCore.Host.LoadedMods()) {
 					j.BeginObject();
 					foreach (string name in new[] { "Name", "Version", "Author", "Type" }) {
 						PropertyInfo p = mod.GetType().GetProperty(name);

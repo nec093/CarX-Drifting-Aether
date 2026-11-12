@@ -4,8 +4,8 @@
 #       [-NoDebugLayer] [-Triangle 1] [-GpuTiming 1] [-Dev '{"directSubmit":true}'] [-Out results.jsonl]
 #
 # -Mode / -Triangle / -GpuTiming are written into aether.json before each run; -Dev becomes
-# kino\config\Aether\dev-options.json (experiment switches, src/Aether.Native/Core/DevOptions.h; "statsSeconds" is added).
-# One JSON line per run is appended to -Out (default: kino\mods\Aether\benchmarks\soak-results.jsonl).
+# dev-options.json in Aether's config folder (experiment switches, src/Aether.Native/Core/DevOptions.h; "statsSeconds" is added).
+# One JSON line per run is appended to -Out (default: benchmarks\soak-results.jsonl in Aether's data folder).
 # Afterwards dev-options.json is removed and aether.json is put back to renderMode hdrp.
 param(
 	[Parameter(Mandatory = $true)][string]$Name,
@@ -21,12 +21,15 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$configDir = Join-Path $GameDir 'kino\config\Aether'
+# where Aether lives depends on the loader it was deployed for (scripts\deploy.ps1)
+$bepinex = Test-Path (Join-Path $GameDir 'BepInEx\plugins\Aether\Aether.dll')
+$dataDir = if ($bepinex) { Join-Path $GameDir 'BepInEx\plugins\Aether' } else { Join-Path $GameDir 'kino\mods\Aether' }
+$configDir = if ($bepinex) { Join-Path $GameDir 'BepInEx\config\Aether' } else { Join-Path $GameDir 'kino\config\Aether' }
 $cfg = Join-Path $configDir 'aether.json'
 $devFile = Join-Path $configDir 'dev-options.json'
-$log = Join-Path $GameDir 'kino\mods\Aether\logs\aether.jsonl'
+$log = Join-Path $dataDir 'logs\aether.jsonl'
 $crashRoot = Join-Path $env:LOCALAPPDATA 'Temp\CarX Technologies\Drift Racing Online\Crashes'
-if (-not $Out) { $Out = Join-Path $GameDir 'kino\mods\Aether\benchmarks\soak-results.jsonl' }
+if (-not $Out) { $Out = Join-Path $dataDir 'benchmarks\soak-results.jsonl' }
 
 function Get-Game { Get-Process | Where-Object { $_.ProcessName -like 'Drift Racing Online*' } | Select-Object -First 1 }
 function Set-Config([string]$mode, [int]$triangle, [int]$timing) {
@@ -68,12 +71,15 @@ $devObject = $Dev | ConvertFrom-Json
 $devObject | Add-Member -NotePropertyName statsSeconds -NotePropertyValue 5 -Force
 try {
 	for ($rep = 1; $rep -le $Reps; $rep++) {
+		$waitUntil = (Get-Date).AddSeconds(90) # the process of the previous run can take a while to go away
+		while ((Get-Game) -and (Get-Date) -lt $waitUntil) { Start-Sleep -Seconds 3 }
 		if (Get-Game) { throw 'the game is already running' }
 		Set-Config $Mode $Triangle $GpuTiming
 		[IO.File]::WriteAllText($devFile, ($devObject | ConvertTo-Json -Compress))
 		$crashesBefore = @(Get-ChildItem $crashRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
 		$launchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'scripts\launch-game.ps1'), '-TimeoutSeconds', '240')
 		if (-not $NoDebugLayer) { $launchArgs += '-DebugLayer' }
+		$launchTime = Get-Date
 		$null = & powershell @launchArgs
 		$start = Get-Date
 		while (((Get-Date) - $start).TotalSeconds -lt $Seconds -and (Get-Game)) { Start-Sleep -Seconds 3 }
@@ -83,13 +89,21 @@ try {
 			dev = $devObject; survived = $alive; seconds = $ran }
 		if ($alive) {
 			$null = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\launch-game.ps1') -Stop
+			$closeUntil = (Get-Date).AddSeconds(60)
+			while ((Get-Game) -and (Get-Date) -lt $closeUntil) { Start-Sleep -Seconds 3 }
 			$result.closed = -not [bool](Get-Game)
+			if (-not $result.closed) { # a test run that hangs on exit must not block the next one
+				Get-Game | ForEach-Object { Stop-Process -Id $_.Id -Force -Confirm:$false }
+				$result.forcedKill = $true
+				Start-Sleep -Seconds 5
+			}
 		} else {
 			Start-Sleep -Seconds 12 # the crash handler writes its folder after the process is gone
 			$new = Get-ChildItem $crashRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $crashesBefore -notcontains $_.Name } | Sort-Object LastWriteTime | Select-Object -Last 1
 			if ($new) { $result.crash = Read-Crash $new.FullName }
 		}
 		$entries = @(Get-Content $log | ForEach-Object { try { $_ | ConvertFrom-Json } catch { } })
+		$result.aetherStarted = [bool]($entries.Count -gt 0 -and [datetime]$entries[0].timestamp -ge $launchTime.AddSeconds(-5))
 		$stats = $entries | Where-Object { $_.message -eq 'Submission statistics' } | Select-Object -Last 1
 		if ($stats) { $result.lastStats = $stats.extra }
 		$d3d = @($entries | Where-Object { $_.component -eq 'D3D12' })
@@ -106,7 +120,7 @@ try {
 		Add-Content -Path $Out -Value ($result | ConvertTo-Json -Compress -Depth 6) -Encoding utf8
 		$frames = if ($stats) { $stats.extra.frame } else { '?' }
 		$subs = if ($stats) { $stats.extra.submissions } else { '?' }
-		Write-Host ("{0} #{1}: {2} after {3} s, frames {4}, submissions {5}, d3d12 messages {6}{7}" -f $Name, $rep, $(if ($alive) { 'SURVIVED' } else { 'CRASHED' }), $ran, $frames, $subs, $d3d.Count,
+		Write-Host ("{0} #{1}: {2} after {3} s, frames {4}, submissions {5}, d3d12 messages {6}{7}" -f $Name, $rep, $(if (-not $result.aetherStarted) { 'INVALID (Aether did not start)' } elseif ($alive) { 'SURVIVED' } else { 'CRASHED' }), $ran, $frames, $subs, $d3d.Count,
 			$(if ($result.lastD3D12) { ' | ' + $result.lastD3D12.Substring(0, [Math]::Min(110, $result.lastD3D12.Length)) } else { '' }))
 		Start-Sleep -Seconds 5
 	}

@@ -64,12 +64,38 @@ namespace Aether {
 
 		private static readonly Texture[] scratch_ = new Texture[5];
 
+		// A renderer can replace any of its material's properties (MaterialPropertyBlock): the game does that for
+		// everything the player customises (paint colours, roughness, metalness, clear coat, the livery texture, the
+		// lamps' intensities). Every read goes through these helpers: the renderer's value where it has one.
+		private static MaterialPropertyBlock over_;
+
 		private static Texture Tex(Material m, int id) {
+			if (over_ != null && over_.HasTexture(id)) {
+				return over_.GetTexture(id);
+			}
 			return m.HasProperty(id) ? m.GetTexture(id) : null;
 		}
 
 		private static float Float(Material m, int id, float fallback) {
+			if (over_ != null && over_.HasFloat(id)) {
+				return over_.GetFloat(id);
+			}
 			return m.HasProperty(id) ? m.GetFloat(id) : fallback;
+		}
+
+		/// <summary>A colour property in linear space (a block stores colours the way the shader gets them: linear).</summary>
+		private static Color Col(Material m, int id) {
+			if (over_ != null && (over_.HasColor(id) || over_.HasVector(id))) {
+				return (Color)over_.GetVector(id);
+			}
+			return m.HasProperty(id) ? m.GetColor(id).linear : Color.white;
+		}
+
+		private static Vector4 Vec(Material m, int id) {
+			if (over_ != null && over_.HasVector(id)) {
+				return over_.GetVector(id);
+			}
+			return m.HasProperty(id) ? m.GetVector(id) : Vector4.zero;
 		}
 
 		private static unsafe void SetColor(float* destination, Color c) {
@@ -79,8 +105,17 @@ namespace Aether {
 			destination[3] = c.a;
 		}
 
-		/// <summary>Translates a material. `colorOverride`: a per-renderer base colour (MaterialPropertyBlock), if any.</summary>
-		public static unsafe Result Translate(Material m, uint handle, Color? colorOverride) {
+		/// <summary>Translates a material. `block`: the renderer's own property values (MaterialPropertyBlock), or null.</summary>
+		public static unsafe Result Translate(Material m, uint handle, MaterialPropertyBlock block) {
+			over_ = block != null && !block.isEmpty ? block : null;
+			try {
+				return TranslateCore(m, handle);
+			} finally {
+				over_ = null;
+			}
+		}
+
+		private static unsafe Result TranslateCore(Material m, uint handle) {
 			var r = new Result { textures = new Texture[5] };
 			AeMaterialDesc d = default;
 			d.structSize = (uint)sizeof(AeMaterialDesc);
@@ -118,23 +153,33 @@ namespace Aether {
 			} else if (paintFamily) {
 				// the game's paint graphs: _Roughness, _Metalness, _Clearcoat, _BaseColor, _SecondaryColor
 				cls = m.HasProperty(Spectrum) ? AeConst.ClassVehiclePaint : m.HasProperty(StitchesPack) ? AeConst.ClassVehicleStitches : AeConst.ClassVehicleRim;
-				SetColor(d.baseColor, m.GetColor(BaseColor).linear);
-				SetColor(d.secondaryColor, m.GetColor(SecondaryColor).linear);
-				d.metallic = m.GetFloat(Metalness);
-				d.roughness = m.GetFloat(Roughness);
-				if (Float(m, ClearCoatEnabled, 0) > 0.5f) {
-					// The graph has HDRP's clear coat feature on. What _Clearcoat scales is not known without the graph:
-					// a coat is assumed present, at least as strong as _Clearcoat says.
-					d.clearCoat = Mathf.Max(m.GetFloat(Clearcoat), cls == AeConst.ClassVehicleStitches ? 0.0f : 1.0f);
+				SetColor(d.baseColor, Col(m, BaseColor));
+				SetColor(d.secondaryColor, Col(m, SecondaryColor));
+				d.metallic = Float(m, Metalness, 0);
+				d.roughness = Float(m, Roughness, 0);
+				float coat = Float(m, Clearcoat, 0);
+				if (Float(m, ClearCoatEnabled, 0) > 0.5f && coat > 0) {
+					// the graph has HDRP's clear coat feature on; _Clearcoat (the player's paint setting) is the coat's strength
+					d.clearCoat = Mathf.Clamp01(coat);
 					d.clearCoatRoughness = 0.04f;
 					flags |= AeConst.MaterialClearCoat;
 				}
 				scratch_[AeConst.SlotBase] = Tex(m, BaseMap);
 				scratch_[AeConst.SlotNormal] = Tex(m, NormalMap);
+				if (cls == AeConst.ClassVehicleStitches) {
+					// the panel seams: a strip of paint over the body whose pack texture says how much of it shows (the
+					// shader reads it from the mask slot; no mask layout: it is not a roughness / metallic map)
+					scratch_[AeConst.SlotMask] = Tex(m, StitchesPack);
+				}
+				if (cls == AeConst.ClassVehiclePaint) {
+					// _BaseMap of the body is the livery (vinyls, stickers) over the paint; the colours' alpha is not used by the
+					// game (0 everywhere seen), so it carries "a livery texture is bound" to the shader
+					d.baseColor[3] = scratch_[AeConst.SlotBase] != null ? 1.0f : 0.0f;
+				}
 				uvProperty = BaseMap;
 			} else if (m.HasProperty(AlphaClippingThreshold) && m.HasProperty(Spectrum)) {
 				cls = AeConst.ClassVehicleGlass;
-				SetColor(d.baseColor, m.GetColor(BaseColor).linear);
+				SetColor(d.baseColor, Col(m, BaseColor));
 				d.roughness = 0.03f;
 				d.alphaCutoff = m.GetFloat(AlphaClippingThreshold);
 				scratch_[AeConst.SlotBase] = Tex(m, BaseMap);
@@ -160,11 +205,21 @@ namespace Aether {
 				d.maskLayout = AeConst.MaskRmo;
 				d.roughness = 1;
 				d.metallic = 1;
+				if (cls == AeConst.ClassVehicleLights) {
+					// CarLights: _EmissionMasks has one light group per channel, _EmissionIntensity (a vector) switches each
+					// group on. The four intensities travel in secondaryColor; the emission is the lamp's own base colour.
+					scratch_[AeConst.SlotEmissive] = Tex(m, EmissionMasks);
+					Vector4 groups = Vec(m, EmissionIntensity);
+					d.secondaryColor[0] = groups.x; d.secondaryColor[1] = groups.y; d.secondaryColor[2] = groups.z; d.secondaryColor[3] = groups.w;
+					if (scratch_[AeConst.SlotEmissive] != null) {
+						d.emissive[0] = d.emissive[1] = d.emissive[2] = 1;
+					}
+				}
 				if (cls == AeConst.ClassVehicleGeneric) {
 					scratch_[AeConst.SlotExtra] = Tex(m, ColormaskMap);
 					// the colours tint through the mask; their alpha is the weight (0 in the materials seen = untinted)
 					if (m.HasProperty(SecondaryColor)) {
-						SetColor(d.secondaryColor, m.GetColor(SecondaryColor).linear);
+						SetColor(d.secondaryColor, Col(m, SecondaryColor));
 					}
 					scratch_[AeConst.SlotEmissive] = Tex(m, EmissionMap);
 					float intensity = Float(m, EmissionIntensity, 0);
@@ -176,7 +231,7 @@ namespace Aether {
 			} else if (m.HasProperty(MaxBaseColorMap) && m.HasProperty(MaxMetalness)) {
 				// HDRP's 3ds Max physical material
 				cls = AeConst.ClassStandard;
-				SetColor(d.baseColor, m.GetColor(MaxBaseColor).linear);
+				SetColor(d.baseColor, Col(m, MaxBaseColor));
 				scratch_[AeConst.SlotBase] = Tex(m, MaxBaseColorMap);
 				d.roughness = Mathf.Max(m.GetFloat(MaxRoughness), 0.05f);
 				d.metallic = m.GetFloat(MaxMetalness);
@@ -184,7 +239,7 @@ namespace Aether {
 			} else if (m.HasProperty(BaseColorMap) && m.HasProperty(Metallic) && m.HasProperty(Smoothness)) {
 				// HDRP/Lit
 				cls = AeConst.ClassStandard;
-				SetColor(d.baseColor, m.GetColor(BaseColor).linear);
+				SetColor(d.baseColor, Col(m, BaseColor));
 				scratch_[AeConst.SlotBase] = Tex(m, BaseColorMap);
 				scratch_[AeConst.SlotNormal] = Tex(m, NormalMap);
 				scratch_[AeConst.SlotMask] = Tex(m, MaskMap);
@@ -194,8 +249,8 @@ namespace Aether {
 					d.metallic = Float(m, MetallicRemapMax, 1);
 					d.roughness = 1.0f - Float(m, SmoothnessRemapMax, 1);
 				} else {
-					d.metallic = m.GetFloat(Metallic);
-					d.roughness = 1.0f - m.GetFloat(Smoothness);
+					d.metallic = Float(m, Metallic, 0);
+					d.roughness = 1.0f - Float(m, Smoothness, 0.5f);
 				}
 				if (m.HasProperty(EmissiveColor)) {
 					Color e = m.GetColor(EmissiveColor); // an HDR colour: already linear, in nits
@@ -209,7 +264,7 @@ namespace Aether {
 			} else if (m.HasProperty(BaseColorMap) && m.HasProperty(MaskMap) && m.HasProperty(BaseColor)) {
 				// the game's Colormask graph: base map tinted by _BaseColor, normal, mask
 				cls = AeConst.ClassColorMask;
-				SetColor(d.baseColor, m.GetColor(BaseColor).linear);
+				SetColor(d.baseColor, Col(m, BaseColor));
 				scratch_[AeConst.SlotBase] = Tex(m, BaseColorMap);
 				scratch_[AeConst.SlotNormal] = Tex(m, NormalMap);
 				scratch_[AeConst.SlotMask] = Tex(m, MaskMap);
@@ -225,9 +280,15 @@ namespace Aether {
 				scratch_[AeConst.SlotBase] = Tex(m, BaseColorMap);
 				d.roughness = 0.8f;
 				uvProperty = BaseColorMap;
-			} else if (m.shader.name.IndexOf("Blobshadow", StringComparison.OrdinalIgnoreCase) >= 0 || (m.HasProperty(BaseColorMap) && transparent && !m.HasProperty(MainTex))) {
-				// the car's blob shadow quad (CarBlobshadow, an unlit transparent graph with only _BaseColorMap): Aether
-				// casts real shadows, the quad is not drawn
+			} else if (m.shader.name.IndexOf("Blobshadow", StringComparison.OrdinalIgnoreCase) >= 0) {
+				// the car's blob shadow quad (CarBlobshadow, an unlit transparent graph with only _BaseColorMap): the soft
+				// dark patch the game puts under every car, on top of the real shadows. Drawn the way the game draws it.
+				cls = AeConst.ClassBlobShadow;
+				scratch_[AeConst.SlotBase] = Tex(m, BaseColorMap);
+				transparent = true;
+				flags |= AeConst.MaterialNoShadow;
+			} else if (m.HasProperty(BaseColorMap) && transparent && !m.HasProperty(MainTex)) {
+				// an unlit transparent graph with nothing but a texture, not known: not drawn
 				cls = AeConst.ClassSkip;
 			} else if (m.HasProperty(MainTex)) {
 				// particles, video panels: unlit, their texture as it is
@@ -253,8 +314,8 @@ namespace Aether {
 					d.uvOffset[0] = offset.x;
 					d.uvOffset[1] = offset.y;
 				}
-				if (colorOverride.HasValue) {
-					SetColor(d.baseColor, colorOverride.Value.linear);
+				if (over_ != null && (over_.HasColor(BaseColor) || over_.HasVector(BaseColor)) && cls != AeConst.ClassVehiclePaint) {
+					SetColor(d.baseColor, Col(m, BaseColor)); // (classes that take no colour from the material itself)
 				}
 			}
 			// textures the material has that nothing above mapped: reported, so a gap in the translation is visible

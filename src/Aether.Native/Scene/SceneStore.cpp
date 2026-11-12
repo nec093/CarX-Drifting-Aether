@@ -7,7 +7,7 @@
 namespace aether {
 
 static const char* kClassNames[kAeMaterialClassCount] = {"unsupported", "standard", "vehiclePaint", "vehicleGeneric", "vehicleGlass", "vehicleRim", "vehicleStitches",
-	"colorMask", "vegetation", "transparent", "unlit", "vehicleLights", "vehicleTire", "skip"};
+	"colorMask", "vegetation", "transparent", "unlit", "vehicleLights", "vehicleTire", "skip", "blobShadow"};
 
 const char* MaterialClassName(uint32_t materialClass) {
 	return materialClass < kAeMaterialClassCount ? kClassNames[materialClass] : "invalid";
@@ -154,7 +154,39 @@ void SceneStore::Clear() {
 	staged_.valid = false;
 	staged_.instances.clear();
 	staged_.lights.clear();
+	staged_.particleBatches.clear();
+	staged_.particles.clear();
+	stagedBatches_.clear();
+	stagedParticles_.clear();
 	stagedNew_ = true;
+}
+
+bool SceneStore::SetProbes(const AeProbe* probes, uint32_t count, uint32_t structSize) {
+	if (structSize != sizeof(AeProbe) || (count > 0 && !probes) || count > 256) {
+		ContractError("AeProbe has the wrong size or the probe list is invalid");
+		return false;
+	}
+	std::lock_guard lock(pendingMutex_);
+	stagedProbes_.assign(probes, probes + count);
+	stagedProbesNew_ = true;
+	return true;
+}
+
+bool SceneStore::SubmitParticles(const AeParticleBatch* batches, uint32_t batchCount, const AeParticle* particles, uint32_t particleCount, uint32_t particleSize) {
+	if (particleSize != sizeof(AeParticle) || (batchCount > 0 && !batches) || (particleCount > 0 && !particles) || batchCount > 4096 || particleCount > (1u << 18)) {
+		ContractError("AeParticle has the wrong size or the particle arrays are invalid");
+		return false;
+	}
+	for (uint32_t i = 0; i < batchCount; ++i) {
+		if (uint64_t(batches[i].first) + batches[i].count > particleCount) {
+			ContractError("An AeParticleBatch reaches past the particle array");
+			return false;
+		}
+	}
+	std::lock_guard lock(pendingMutex_);
+	stagedBatches_.assign(batches, batches + batchCount);
+	stagedParticles_.assign(particles, particles + particleCount);
+	return true;
 }
 
 bool SceneStore::SubmitFrame(const AeFrame* frame, const AeFrameInstance* instances, uint32_t instanceCount, const AeLight* lights, uint32_t lightCount) {
@@ -171,6 +203,11 @@ bool SceneStore::SubmitFrame(const AeFrame* frame, const AeFrameInstance* instan
 	// assign keeps the vectors' capacity: no allocation once they reached the scene's size
 	staged_.instances.assign(instances, instances + instanceCount);
 	staged_.lights.assign(lights, lights + lightCount);
+	// (the particles sent since the frame before belong to this frame; none sent = none)
+	staged_.particleBatches.swap(stagedBatches_);
+	staged_.particles.swap(stagedParticles_);
+	stagedBatches_.clear();
+	stagedParticles_.clear();
 	staged_.valid = (frame->flags & kAeFrameCameraValid) != 0 && frame->width > 0 && frame->height > 0;
 	stagedNew_ = true;
 	return true;
@@ -305,10 +342,16 @@ const SceneFrame& SceneStore::Apply(UINT64 fence, uint64_t frame) {
 	{
 		std::lock_guard lock(pendingMutex_);
 		pending.swap(pending_);
+		if (stagedProbesNew_) {
+			current_.probes = stagedProbes_;
+			stagedProbesNew_ = false;
+		}
 		if (stagedNew_) {
 			std::swap(current_.frame, staged_.frame);
 			current_.instances.swap(staged_.instances);
 			current_.lights.swap(staged_.lights);
+			current_.particleBatches.swap(staged_.particleBatches);
+			current_.particles.swap(staged_.particles);
 			current_.valid = staged_.valid;
 			stagedNew_ = false;
 		} else {
@@ -385,9 +428,9 @@ const SceneFrame& SceneStore::Apply(UINT64 fence, uint64_t frame) {
 			MarkMaterialsUsing(t->desc.texture);
 			++upserts_;
 		} else if (auto* mat = std::get_if<PendingMaterial>(&item)) {
-			SceneMaterial& m = materials_[mat->desc.material];
-			m.desc = mat->desc;
-			m.tableDirty = true;
+			SceneMaterial& sm = materials_[mat->desc.material];
+			sm.desc = mat->desc;
+			sm.tableDirty = true;
 			++upserts_;
 		} else if (auto* inst = std::get_if<PendingInstance>(&item)) {
 			SceneInstance& i = instances_[inst->desc.instance];
@@ -441,8 +484,22 @@ const SceneFrame& SceneStore::Apply(UINT64 fence, uint64_t frame) {
 			if (it == instances_.end()) {
 				continue; // created and destroyed out of step with the frame: skipped, not an error
 			}
+			// Moving = its transform changed within the last 45 frames, not only since the frame before: a car's
+			// transform is set by the physics step, which does not run once per rendered frame, and a frame can be
+			// rendered twice from the same data. A car that counted as still on such frames was smeared by the
+			// motion blur (and left a trail in the temporal antialiasing) on exactly those frames.
+			if (it->second.frameStamp == 0) {
+				memcpy(it->second.prevWorld.m, fi.localToWorld, sizeof(fi.localToWorld)); // first sight: it did not move
+			} else {
+				it->second.prevWorld = it->second.world;
+			}
+			if (memcmp(it->second.world.m, fi.localToWorld, sizeof(fi.localToWorld)) != 0) {
+				it->second.movedFrame = frame;
+			}
+			it->second.moved = it->second.movedFrame != 0 && frame - it->second.movedFrame < 45;
 			memcpy(it->second.world.m, fi.localToWorld, sizeof(fi.localToWorld));
 			it->second.visible = (fi.flags & kAeFrameInstanceVisible) != 0;
+			it->second.shadowOnly = (fi.flags & kAeFrameInstanceShadowOnly) != 0;
 			it->second.frameStamp = frame;
 		}
 	}

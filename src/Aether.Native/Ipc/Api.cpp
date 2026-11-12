@@ -314,7 +314,7 @@ json HandleRequest(const json& request) {
 			return Fail(id, {"E_INVALID_PARAMS", "mode must be one of: hdrp, aether, compare"});
 		}
 		if (!debugView.empty() && std::find(views.begin(), views.end(), debugView) == views.end()) {
-			return Fail(id, {"E_INVALID_PARAMS", "debugView must be one of: none, albedo, normal, roughness, metallic, depth, lighting, shadow, materialClass"});
+			return Fail(id, {"E_INVALID_PARAMS", "debugView must be one of: none, albedo, normal, roughness, metallic, depth, lighting, shadow, materialClass, sun, ambient, reflection"});
 		}
 		if (mode.empty() && debugView.empty()) {
 			return Fail(id, {"E_INVALID_PARAMS", "give mode, debugView or both"});
@@ -329,7 +329,7 @@ json HandleRequest(const json& request) {
 			Settings::Get().Set("debugView", debugView, "mcp");
 		}
 		SettingsData now = Settings::Get().Snapshot();
-		return Ok(id, {{"mode", now.renderMode}, {"debugView", now.debugView}, {"note", "hdrp: the game's renderer. aether: Aether's image replaces it (the UI stays). compare: left half HDRP, right half Aether."}});
+		return Ok(id, {{"mode", now.renderMode}, {"debugView", now.debugView}, {"note", "aether: Aether is the game's render pipeline (the game's own is not created). hdrp: the game's own renderer, for reference. compare: left half the game's renderer, right half Aether."}});
 	}
 	if (method == "reload_shader") {
 		if (!Authorize(request, method, params, error)) {
@@ -390,7 +390,8 @@ json HandleRequest(const json& request) {
 	if (method == "run_benchmark") {
 		long long seconds;
 		std::string label;
-		if (!GetInt(params, "seconds", 1, 600, 10, seconds, error) || !GetString(params, "label", "mcp", label, error, 64)) {
+		bool vsync = true;
+		if (!GetInt(params, "seconds", 1, 600, 10, seconds, error) || !GetString(params, "label", "mcp", label, error, 64) || !GetBool(params, "vsync", true, vsync, error)) {
 			return Fail(id, error);
 		}
 		if (!Renderer::Get().Ready()) {
@@ -400,11 +401,14 @@ json HandleRequest(const json& request) {
 			return Fail(id, error);
 		}
 		json context = {{"startedBy", "mcp"}, {"scene", rt.ManagedState("scene")}, {"game", rt.ManagedState("managed")}, {"settings", Settings::Get().ToJson()}, {"renderGraph", Renderer::Get().RenderGraph()}};
+		context["vsync"] = vsync ? "as the game has it" : "off for the run (QualitySettings.vSyncCount 0, no frame rate cap)";
+		Profiler::Get().SetBenchmarkUncapped(!vsync);
 		std::string why = Profiler::Get().StartBenchmark(label, double(seconds), rt.Subdir(L"benchmarks"), std::move(context));
 		if (!why.empty()) {
+			Profiler::Get().SetBenchmarkUncapped(false);
 			return Fail(id, {"E_BENCHMARK", why});
 		}
-		return Ok(id, {{"started", true}, {"seconds", seconds}, {"label", label}, {"note", "poll get_benchmark until state is done"}});
+		return Ok(id, {{"started", true}, {"seconds", seconds}, {"label", label}, {"vsync", vsync}, {"note", "poll get_benchmark until state is done"}});
 	}
 	if (method == "stop_benchmark") {
 		if (!Authorize(request, method, params, error)) {

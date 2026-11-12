@@ -12,6 +12,19 @@ namespace {
 const DXGI_FORMAT kSceneColorFormat = DXGI_FORMAT_R11G11B10_FLOAT;
 const uint32_t kClusterX = 16, kClusterY = 9, kClusterZ = 24;
 const uint32_t kMaxLightsPerCluster = 64;
+const uint32_t kGlobalsTableSize = 4; // shadow atlas, sky, sky irradiance, ambient occlusion
+const uint32_t kPostTableSize = 4;    // per full screen pass: colour / main input, depth, two auxiliary inputs
+const float kExposureAdaptationRate = 2.0f; // per second: the automatic exposure covers 63 % of a change in half a second
+const uint32_t kPostTables = 64;     // 0..3: ambient occlusion, its blur, composite, exposure metering; the rest handed out per pass (Fullscreen)
+const uint32_t kIrradianceSize = 32;  // octahedral map of the sky's diffuse light
+const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr"};
+const uint32_t kBloomLevels = 5;
+// xy: how far each pixel moved on screen since the frame before (uv units; x = 1000: nothing drawn there),
+// z: 1 = the surface belongs to something that moves by itself (a car). (The scene colour target has no alpha
+// channel, so this cannot live there: a mask written to its alpha read back as 1 everywhere.)
+const DXGI_FORMAT kVelocityFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+const DXGI_FORMAT kSurfaceFormat = DXGI_FORMAT_R16G16B16A16_UNORM; // normal (octahedral, xy), roughness of the reflecting lobe, its weight
+const uint32_t kMaxProbes = 4;        // reflection probes blended per frame (the nearest to the camera)
 const uint32_t kDefaultsSlot = 7; // vertex buffer slot that feeds the semantics a mesh does not have
 // Unity's meshes are clockwise when seen from the front, and the contract's projection keeps that on screen.
 const BOOL kFrontCounterClockwise = FALSE;
@@ -34,12 +47,107 @@ struct FrameConstants {
 	float misc[4];
 	float fog[4];
 	float outputRect[4];
+	float toneCurve[4];   // 1 / white point, x0, x1, unused
+	float toneSegA[3][4]; // per segment (toe, linear, shoulder): offset x, offset y, scale x, scale y
+	float toneSegB[3][4]; // ln A, B
+	float fogHeight[4];   // base height, 1 / scale height, max distance (0 = none), 1 = colour from the sky
+	float cascadeTexel[4]; // world size of one shadow texel, per cascade
+	float aoParams[4];    // intensity, radius (m), strength on direct light, 1 = the AO texture is valid
+	float smh[3][4];      // shadows, midtones, highlights multipliers
+	float smhLimits[4];   // shadows start / end, highlights start / end (all 0 = off)
+	float exposureParams[4]; // metering: min EV100, max EV100, compensation
+	float probeCount[4];     // x: number of probes
+	float probeRows[4][3][4]; // world -> probe space, three rows each
+	float probeExtents[4][4]; // xyz half size (sphere: radius in x), w blend distance
+	float probeCapture[4][4]; // xyz capture position, w intensity
+	float probeInfo[4][4];    // x flags (AeProbeFlags), y mip count
+	float skyParams[4];       // intensity, cos and sin of the rotation about the up axis
+	float prevViewProj[16];   // the frame before: world -> clip, without jitter
+	float jitter[4];          // this frame's sub pixel offset in clip space (xy), z: 1 = the history is valid
+	float postParams[4];      // bloom mix (0 = off), bloom scatter, motion blur intensity, 1 = temporal antialiasing
+	float ssrParams[4];       // 1 = on, smoothness below which there is none, smoothness from which it is full, screen fade distance
+	float qualityParams[4];   // x: how far the sun's shadow edges are blurred, in shadow map texels
 };
+
+// HDRP's "Custom" tone mapping is John Hable's piecewise filmic curve (toe, linear part, shoulder), with the parameters
+// HDRP's volume component exposes. Computes the three segments the shader evaluates.
+void HableCurve(const float user[6], float curve[4], float segA[3][4], float segB[3][4]) {
+	auto saturate = [](float v) { return std::min(std::max(v, 0.0f), 1.0f); };
+	float toeStrength = saturate(user[0]);
+	float toeLength = std::pow(saturate(user[1]), 2.2f);
+	// (the host's naming, not Hable's: the strength is the 0..1 transition into the shoulder, the length is the number
+	// of stops the shoulder adds to the curve's range)
+	float shoulderStrength = std::min(std::max(user[2], 1e-5f), 1.0f - 1e-5f);
+	float shoulderLength = std::max(0.0f, user[3]);
+	float shoulderAngle = saturate(user[4]);
+	float gamma = user[5] > 0.0f ? user[5] : 1.0f;
+
+	float x0 = toeLength * 0.5f;
+	float y0 = (1.0f - toeStrength) * x0;
+	const float remainingY = 1.0f - y0;
+	const float initialW = x0 + remainingY;
+	const float y1Offset = (1.0f - shoulderStrength) * remainingY;
+	float x1 = x0 + y1Offset;
+	float y1 = y0 + y1Offset;
+	const float W = initialW + (std::exp2(shoulderLength) - 1.0f);
+	float overshootX = (W * 2.0f) * shoulderAngle * shoulderLength;
+	float overshootY = 0.5f * shoulderAngle * shoulderLength;
+
+	// in the curve's own space the white point is 1
+	x0 /= W;
+	x1 /= W;
+	overshootX /= W;
+	const float dx = x1 - x0, dy = y1 - y0;
+	const float m = dx > 1e-6f ? dy / dx : 1.0f;
+	const float b = y0 - x0 * m;
+	auto derivative = [&](float x) { return gamma * m * std::pow(std::max(m * x + b, 1e-6f), gamma - 1.0f); };
+	auto solveAB = [](float x, float y, float slope, float& lnA, float& B) {
+		B = (slope * x) / std::max(y, 1e-6f);
+		lnA = std::log(std::max(y, 1e-6f)) - B * std::log(std::max(x, 1e-6f));
+	};
+	struct Segment { float offsetX = 0, offsetY = 0, scaleX = 1, scaleY = 1, lnA = 0, B = 1; } seg[3];
+	// linear part (with the gamma folded in)
+	seg[1].offsetX = -(b / m);
+	seg[1].lnA = gamma * std::log(m);
+	seg[1].B = gamma;
+	const float toeM = derivative(x0), shoulderM = derivative(x1);
+	y0 = std::max(1e-5f, std::pow(y0, gamma));
+	y1 = std::max(1e-5f, std::pow(y1, gamma));
+	overshootY = std::pow(1.0f + overshootY, gamma) - 1.0f;
+	solveAB(x0, y0, toeM, seg[0].lnA, seg[0].B);
+	// the shoulder is the toe's shape mirrored around the overshoot point
+	const float sx = (1.0f + overshootX) - x1, sy = (1.0f + overshootY) - y1;
+	solveAB(sx, sy, shoulderM, seg[2].lnA, seg[2].B);
+	seg[2].offsetX = 1.0f + overshootX;
+	seg[2].offsetY = 1.0f + overshootY;
+	seg[2].scaleX = -1.0f;
+	seg[2].scaleY = -1.0f;
+	auto eval = [](const Segment& s, float x) {
+		const float xs = (x - s.offsetX) * s.scaleX;
+		const float ys = xs > 0.0f ? std::exp(s.lnA + s.B * std::log(xs)) : 0.0f;
+		return ys * s.scaleY + s.offsetY;
+	};
+	// normalise so that the white point maps to 1
+	const float invScale = 1.0f / std::max(eval(seg[2], 1.0f), 1e-6f);
+	for (Segment& s : seg) {
+		s.offsetY *= invScale;
+		s.scaleY *= invScale;
+	}
+	curve[0] = 1.0f / W;
+	curve[1] = x0;
+	curve[2] = x1;
+	curve[3] = 0.0f;
+	for (int i = 0; i < 3; ++i) {
+		segA[i][0] = seg[i].offsetX; segA[i][1] = seg[i].offsetY; segA[i][2] = seg[i].scaleX; segA[i][3] = seg[i].scaleY;
+		segB[i][0] = seg[i].lnA; segB[i][1] = seg[i].B; segB[i][2] = segB[i][3] = 0.0f;
+	}
+}
 
 struct InstanceData {
 	float world[16];
 	float normalRow0[4], normalRow1[4], normalRow2[4];
-	float reserved[4];
+	float reserved[4]; // x: rendering layers (as uint), y: 1 = moved since the frame before
+	float prevWorld[16]; // the instance's world matrix of the frame before
 };
 
 struct MaterialData {
@@ -136,18 +244,35 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	psDepthAlpha_ = sm.Compile("scene_forward.hlsl", "PSDepthAlphaTest", "ps_5_1");
 	psShadowAlpha_ = sm.Compile("scene_forward.hlsl", "PSShadowAlphaTest", "ps_5_1");
 	vsFullscreen_ = sm.Compile("scene_post.hlsl", "VSFullscreen", "vs_5_1");
-	psSky_ = sm.Compile("scene_post.hlsl", "PSSky", "ps_5_1");
-	psComposite_ = sm.Compile("scene_post.hlsl", "PSComposite", "ps_5_1");
-	failedShaders_ = !vsMain_ || !vsShadow_ || !psForward_ || !psDepthAlpha_ || !psShadowAlpha_ || !vsFullscreen_ || !psSky_ || !psComposite_;
+	psDecal_ = sm.Compile("scene_forward.hlsl", "PSBlobDecal", "ps_5_1");
+	// (the particle shaders are not a reason to stop the scene: without them there are no particles)
+	vsParticle_ = sm.Compile("scene_particles.hlsl", "VSParticle", "vs_5_1");
+	psParticle_ = sm.Compile("scene_particles.hlsl", "PSParticle", "ps_5_1");
+	particlePipeline_.Reset();
+	particlePipelineFailed_ = false;
+	failedShaders_ = !vsMain_ || !vsShadow_ || !psForward_ || !psDepthAlpha_ || !psShadowAlpha_ || !vsFullscreen_ || !psDecal_;
+	static_assert(_countof(kFullscreenEntry) == kFullscreenKindCount, "one entry point per full screen pass");
+	for (int k = 0; k < kFullscreenKindCount; ++k) {
+		psFullscreen_[k] = sm.Compile("scene_post.hlsl", kFullscreenEntry[k], "ps_5_1");
+		failedShaders_ |= !psFullscreen_[k];
+	}
 	if (failedShaders_) {
 		AE_LOG_CODE(Error, "SceneRenderer", "E_SCENE_SHADERS", "Scene shaders did not compile: Aether draws no scene until they do (see get_shader_errors, then reload_shader)");
 	}
 
 	if (!root_) {
 		D3D12_DESCRIPTOR_RANGE materialRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kAeSlotCount, 0, 1, 0};
-		D3D12_DESCRIPTOR_RANGE globalsRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 2, 0};
-		D3D12_DESCRIPTOR_RANGE postRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 2, 0};
-		D3D12_ROOT_PARAMETER params[10] = {};
+		// space2: t0 shadow atlas, t1 sky, t2 exposure, t3 ambient occlusion | t4..t6 the inputs of a full screen pass
+		D3D12_DESCRIPTOR_RANGE globalsRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kGlobalsTableSize, 0, 2, 0};
+		D3D12_DESCRIPTOR_RANGE postRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kPostTableSize, 4, 2, 0};
+		D3D12_DESCRIPTOR_RANGE probesRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxProbes, 0, 3, 0}; // space3: reflection probe cubes
+		D3D12_ROOT_PARAMETER params[12] = {};
+		params[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t5: the instance map
+		params[11].Descriptor = {5, 0};
+		params[11].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+		params[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[10].DescriptorTable = {1, &probesRange};
+		params[10].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 		params[0].Descriptor = {0, 0};
 		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -353,7 +478,7 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 		d.pRootSignature = root_.Get();
 		ID3DBlob* vs = shadow ? vsShadow_.Get() : vsMain_.Get();
 		d.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-		ID3DBlob* ps = forward ? psForward_.Get() : kind == kDepthAlpha ? psDepthAlpha_.Get() : kind == kShadowAlpha ? psShadowAlpha_.Get() : nullptr;
+		ID3DBlob* ps = kind == kDecal ? psDecal_.Get() : forward ? psForward_.Get() : kind == kDepthAlpha ? psDepthAlpha_.Get() : kind == kShadowAlpha ? psShadowAlpha_.Get() : nullptr;
 		if (ps) {
 			d.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
 		}
@@ -366,13 +491,14 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 			d.RasterizerState.DepthBias = 200;
 			d.RasterizerState.SlopeScaledDepthBias = 2.0f;
 		}
-		d.DepthStencilState.DepthEnable = TRUE;
+		// (a decal box is drawn without a depth buffer: its pixel shader reads the scene depth and decides itself)
+		d.DepthStencilState.DepthEnable = kind == kDecal ? FALSE : TRUE;
 		d.DepthStencilState.DepthWriteMask = forward ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
 		d.DepthStencilState.DepthFunc = shadow ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-		d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+		d.DSVFormat = kind == kDecal ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_D32_FLOAT;
 		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
 		blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-		if (kind == kForwardBlend || kind == kForwardAdditive) {
+		if (kind == kForwardBlend || kind == kForwardAdditive || kind == kDecal) {
 			blend.BlendEnable = TRUE;
 			blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
 			blend.DestBlend = kind == kForwardAdditive ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
@@ -382,8 +508,11 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 			blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 		}
 		if (forward) {
-			d.NumRenderTargets = 1;
+			// the opaque pass also writes what the reflection pass needs to know about each surface
+			d.NumRenderTargets = kind == kForward ? 3 : 1;
 			d.RTVFormats[0] = kSceneColorFormat;
+			d.RTVFormats[1] = kind == kForward ? kSurfaceFormat : DXGI_FORMAT_UNKNOWN;
+			d.RTVFormats[2] = kind == kForward ? kVelocityFormat : DXGI_FORMAT_UNKNOWN;
 		}
 		d.InputLayout = {elements, 5};
 		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -399,8 +528,47 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 	return pso.Get();
 }
 
-ID3D12PipelineState* SceneRenderer::FullscreenPipeline(bool composite, DXGI_FORMAT format) {
-	const uint32_t key = (composite ? 0x10000u : 0u) | uint32_t(format);
+// Particles: quads made in the vertex shader from the particle buffer, blended over the picture with premultiplied
+// alpha (an additive particle returns alpha 0). No depth buffer bound: the pixel shader tests against the scene depth
+// itself, which also lets a quad fade out where it cuts into a surface.
+ID3D12PipelineState* SceneRenderer::ParticlePipeline() {
+	if (particlePipeline_ || particlePipelineFailed_ || !vsParticle_ || !psParticle_) {
+		return particlePipeline_.Get();
+	}
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+	d.pRootSignature = root_.Get();
+	d.VS = {vsParticle_->GetBufferPointer(), vsParticle_->GetBufferSize()};
+	d.PS = {psParticle_->GetBufferPointer(), psParticle_->GetBufferSize()};
+	d.SampleMask = UINT_MAX;
+	d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	d.RasterizerState.DepthClipEnable = TRUE;
+	D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
+	blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	blend.BlendEnable = TRUE;
+	blend.SrcBlend = D3D12_BLEND_ONE;
+	blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+	blend.BlendOp = D3D12_BLEND_OP_ADD;
+	blend.SrcBlendAlpha = D3D12_BLEND_ZERO; // (the colour target's alpha is the temporal passes' mask: left as it is)
+	blend.DestBlendAlpha = D3D12_BLEND_ONE;
+	blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	d.NumRenderTargets = 1;
+	d.RTVFormats[0] = kSceneColorFormat;
+	d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	d.SampleDesc.Count = 1;
+	HRESULT hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&particlePipeline_));
+	if (FAILED(hr)) {
+		Log::Get().Write(Severity::Error, "SceneRenderer", "E_PIPELINE_STATE", "The particle pipeline state could not be created: no particles", {}, {{"hresult", HrToString(hr)}});
+		particlePipeline_.Reset();
+		particlePipelineFailed_ = true;
+	}
+	return particlePipeline_.Get();
+}
+
+ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI_FORMAT format) {
+	const bool composite = kind == kFullscreenComposite;
+	const bool sky = kind == kFullscreenSky;
+	const uint32_t key = (uint32_t(kind) << 16) | uint32_t(format);
 	auto it = fullscreenPipelines_.find(key);
 	if (it != fullscreenPipelines_.end()) {
 		return it->second.Get();
@@ -408,27 +576,38 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(bool composite, DXGI_FORM
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
 	d.pRootSignature = root_.Get();
 	d.VS = {vsFullscreen_->GetBufferPointer(), vsFullscreen_->GetBufferSize()};
-	ID3DBlob* ps = composite ? psComposite_.Get() : psSky_.Get();
+	ID3DBlob* ps = psFullscreen_[kind].Get();
 	d.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
 	d.SampleMask = UINT_MAX;
 	d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
 	d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 	d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-	if (!composite) {
+	if (kind == kFullscreenSsr) {
+		// added to the picture (the shader returns the reflection minus what the surface already shows there)
+		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
+		blend.BlendEnable = TRUE;
+		blend.SrcBlend = D3D12_BLEND_ONE;
+		blend.DestBlend = D3D12_BLEND_ONE;
+		blend.BlendOp = D3D12_BLEND_OP_ADD;
+		blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+		blend.DestBlendAlpha = D3D12_BLEND_ONE;
+		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	}
+	if (sky) {
 		d.DepthStencilState.DepthEnable = TRUE;
 		d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
 		d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL; // only where nothing was drawn (depth 0)
 		d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
 	}
 	d.NumRenderTargets = 1;
-	d.RTVFormats[0] = composite ? format : kSceneColorFormat;
+	d.RTVFormats[0] = sky ? kSceneColorFormat : format;
 	d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	d.SampleDesc.Count = 1;
 	ComPtr<ID3D12PipelineState> pso;
 	HRESULT hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
 	if (FAILED(hr)) {
-		Log::Get().Write(Severity::Error, "SceneRenderer", "E_PIPELINE_STATE", composite ? "The composite pipeline state could not be created" : "The sky pipeline state could not be created", {},
-			{{"hresult", HrToString(hr)}, {"rtvFormat", int(format)}});
+		Log::Get().Write(Severity::Error, "SceneRenderer", "E_PIPELINE_STATE", "A full screen pipeline state could not be created", {},
+			{{"hresult", HrToString(hr)}, {"rtvFormat", int(format)}, {"kind", int(kind)}});
 		pso.Reset();
 	}
 	fullscreenPipelines_[key] = pso;
@@ -440,6 +619,7 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(bool composite, DXGI_FORM
 void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 	SceneStore& store = SceneStore::Get();
 	opaque_.clear();
+	decals_.clear();
 	transparent_.clear();
 	casters_.clear();
 	instanceData_.clear();
@@ -473,7 +653,7 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 		const Vec3 center = TransformPoint(world, {mesh->desc.boundsCenter[0], mesh->desc.boundsCenter[1], mesh->desc.boundsCenter[2]});
 		const float scale = std::max({Length(Vec3{world.at(0, 0), world.at(1, 0), world.at(2, 0)}), Length(Vec3{world.at(0, 1), world.at(1, 1), world.at(2, 1)}), Length(Vec3{world.at(0, 2), world.at(1, 2), world.at(2, 2)})});
 		const float radius = Length(Vec3{mesh->desc.boundsExtents[0], mesh->desc.boundsExtents[1], mesh->desc.boundsExtents[2]}) * scale;
-		const bool inView = SphereVisible(planes, center, radius);
+		const bool inView = !inst.shadowOnly && SphereVisible(planes, center, radius);
 		const bool castsShadow = (inst.desc.flags & kAeInstanceCastShadows) != 0;
 		if (!inView && !castsShadow) {
 			continue;
@@ -489,6 +669,9 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 			id.normalRow2[c] = inv.at(c, 2);
 		}
 		id.normalRow0[3] = mirrored ? -1.0f : 1.0f;
+		memcpy(&id.reserved[0], &inst.desc.renderingLayerMask, sizeof(uint32_t)); // read with asuint in the shader
+		id.reserved[1] = inst.moved ? 1.0f : 0.0f;
+		memcpy(id.prevWorld, inst.prevWorld.m, sizeof(id.prevWorld));
 		const uint32_t instanceIndex = instanceCount_++;
 		instanceData_.resize(size_t(instanceCount_) * sizeof(InstanceData));
 		memcpy(instanceData_.data() + size_t(instanceIndex) * sizeof(InstanceData), &id, sizeof(id));
@@ -564,14 +747,19 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 			if (!inView) {
 				continue;
 			}
-			if (flags & kAeMaterialBlend) {
+			if (material && material->desc.materialClass == kAeMaterialBlobShadow) {
+				// a box around the place it darkens: its far side is drawn (the camera may be inside it), without depth test
+				item.cull = mirrored ? kCullBack : kCullFront;
+				decals_.push_back(item);
+			} else if (flags & kAeMaterialBlend) {
 				transparent_.push_back(item);
 			} else {
 				opaque_.push_back(item);
 			}
 		}
 	}
-	auto byKey = [](const DrawItem& a, const DrawItem& b) { return a.sortKey < b.sortKey; };
+	// equal keys next to each other, sub mesh by sub mesh: DrawItems turns such runs into one instanced draw
+	auto byKey = [](const DrawItem& a, const DrawItem& b) { return a.sortKey != b.sortKey ? a.sortKey < b.sortKey : a.subMesh < b.subMesh; };
 	std::sort(opaque_.begin(), opaque_.end(), byKey);
 	std::sort(casters_.begin(), casters_.end(), byKey);
 	std::sort(transparent_.begin(), transparent_.end(), [](const DrawItem& a, const DrawItem& b) { return a.depth > b.depth; }); // back to front
@@ -594,6 +782,7 @@ void SceneRenderer::BuildCascades(const SceneFrame& scene, const SettingsData& s
 			sunDirection_ = Normalize(Vec3{-l.direction[0], -l.direction[1], -l.direction[2]});
 			sunColor_ = {l.color[0], l.color[1], l.color[2]};
 			sunShadows_ = (l.flags & kAeLightCastsShadows) != 0;
+			sunLayerMask_ = l.layerMask;
 		}
 	}
 	if (!hasSun_ || !sunShadows_ || !settings.shadows || !shadowAtlas_) {
@@ -601,8 +790,16 @@ void SceneRenderer::BuildCascades(const SceneFrame& scene, const SettingsData& s
 		return;
 	}
 	const bool low = settings.quality == "low";
-	const uint32_t count = low ? 2 : 3;
-	const float distance = std::min(scene.frame.farPlane, low ? 40.0f : settings.quality == "medium" ? 60.0f : settings.quality == "high" ? 80.0f : 120.0f);
+	uint32_t count = low ? 2 : 3;
+	float distance = std::min(scene.frame.farPlane, low ? 40.0f : settings.quality == "medium" ? 60.0f : settings.quality == "high" ? 80.0f : 120.0f);
+	// The host's own shadow settings, when it sent them: its distance (scaled down on the lower presets), its number
+	// of cascades and where it splits them.
+	const AeFrame& hf = scene.frame;
+	const bool hostShadows = hf.shadowDistance > 0.0f && hf.shadowCascades >= 1;
+	if (hostShadows) {
+		count = std::min<uint32_t>(hf.shadowCascades, low ? 2u : 4u);
+		distance = std::min(scene.frame.farPlane, hf.shadowDistance * (low ? 0.25f : settings.quality == "medium" ? 0.5f : 1.0f));
+	}
 	const float nearPlane = std::max(scene.frame.nearPlane, 0.05f);
 	const Mat4 proj = Mat4::From(scene.frame.proj);
 	const Mat4 invView = Inverse(Mat4::From(scene.frame.view));
@@ -615,7 +812,15 @@ void SceneRenderer::BuildCascades(const SceneFrame& scene, const SettingsData& s
 		const float t = float(i + 1) / float(count);
 		const float logSplit = nearPlane * std::pow(distance / nearPlane, t);
 		const float linSplit = nearPlane + (distance - nearPlane) * t;
-		const float sliceFar = 0.8f * logSplit + 0.2f * linSplit;
+		float sliceFar = 0.8f * logSplit + 0.2f * linSplit;
+		if (hostShadows) {
+			// the host's split fractions belong to its own cascade count: the last cascade always ends at the distance
+			const float fraction = (i + 1 < count && i < 3 && hf.shadowSplits[i] > 0.0f) ? hf.shadowSplits[i] : 1.0f;
+			sliceFar = std::max(sliceNear + 0.5f, std::min(distance, distance * fraction));
+			if (i + 1 == count) {
+				sliceFar = distance;
+			}
+		}
 		// the slice's eight corners in world space (view space: x = +-d / P00, y = +-d / P11, z = -d)
 		Vec3 corners[8];
 		int n = 0;
@@ -681,6 +886,7 @@ void SceneRenderer::BuildClusters(const SceneFrame& scene) {
 		memcpy(d.colorInner, l.color, sizeof(l.color));
 		d.colorInner[3] = l.spotInnerCos;
 		d.typeFlags[0] = float(l.type);
+		memcpy(&d.typeFlags[1], &l.layerMask, sizeof(uint32_t)); // rendering layers the light reaches (asuint)
 		lightData_.resize(size_t(punctualCount_ + 1) * sizeof(LightData));
 		memcpy(lightData_.data() + size_t(punctualCount_) * sizeof(LightData), &d, sizeof(d));
 		viewLights.push_back({TransformPoint(view, {l.position[0], l.position[1], l.position[2]}), l.range});
@@ -745,7 +951,44 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	SceneStore& store = SceneStore::Get();
 	const AeFrame& f = scene.frame;
 	FrameConstants fc = {};
-	const Mat4 view = Mat4::From(f.view), proj = Mat4::From(f.proj);
+	const Mat4 view = Mat4::From(f.view);
+	Mat4 proj = Mat4::From(f.proj);
+	const Mat4 cleanViewProj = proj * view;
+	// ---- post-processing as the host has it (frame), where Aether's own switches allow it
+	// (Aether's own switch: which antialiasing the game's graphics menu is set to is not looked at)
+	taa_ = settings.antialiasing;
+	// (the host mixes the picture with its bloom pyramid by the control value itself: at 1 the picture is the pyramid)
+	bloomMix_ = settings.bloom && f.bloomIntensity > 0 ? std::min(f.bloomIntensity * settings.bloomStrength, 1.0f) : 0.0f;
+	bloomScatter_ = 0.05f + 0.9f * std::min(std::max(f.bloomScatter, 0.0f), 1.0f);
+	motionBlur_ = settings.motionBlur ? std::max(f.motionBlurIntensity * settings.motionBlurStrength, 0.0f) : 0.0f;
+	if (f.cameraId != historyCamera_) {
+		historyValid_ = false; // another camera: nothing of the frame before applies
+		historyCamera_ = f.cameraId;
+	}
+	if (taa_) {
+		// a different sub pixel offset every frame (Halton 2, 3 over 8 frames): the frames average to an antialiased picture
+		auto halton = [](uint32_t i, uint32_t base) { float r = 0, fr = 1; while (i > 0) { fr /= float(base); r += fr * float(i % base); i /= base; } return r; };
+		const uint32_t phase = uint32_t(frame_ % 8) + 1;
+		const float jx = (halton(phase, 2) - 0.5f) * 2.0f / float(target.width), jy = (halton(phase, 3) - 0.5f) * 2.0f / float(target.height);
+		proj.at(0, 2) += jx * proj.at(3, 2);
+		proj.at(1, 2) += jy * proj.at(3, 2);
+		fc.jitter[0] = jx;
+		fc.jitter[1] = jy;
+	}
+	fc.jitter[2] = historyValid_ ? 1.0f : 0.0f;
+	// screen space reflections read the picture of the frame before (the temporal history): none without it
+	ssr_ = settings.ssr && f.ssrEnabled != 0 && taa_;
+	fc.ssrParams[0] = ssr_ && historyValid_ ? 1.0f : 0.0f;
+	fc.ssrParams[1] = f.ssrMinSmoothness;
+	fc.ssrParams[2] = std::max(f.ssrSmoothnessFadeStart, f.ssrMinSmoothness);
+	fc.ssrParams[3] = f.ssrScreenFadeDistance;
+	fc.qualityParams[0] = settings.shadowSoftness;
+	memcpy(fc.prevViewProj, prevViewProj_.m, 64);
+	prevViewProj_ = cleanViewProj;
+	fc.postParams[0] = bloomMix_;
+	fc.postParams[1] = bloomScatter_;
+	fc.postParams[2] = motionBlur_;
+	fc.postParams[3] = taa_ ? 1.0f : 0.0f;
 	const Mat4 viewProj = proj * view;
 	const Mat4 invViewProj = Inverse(viewProj);
 	memcpy(fc.view, view.m, 64);
@@ -761,6 +1004,18 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.shadowParams[1] = shadowCascadeSize_ ? 1.0f / float(shadowCascadeSize_ * 2) : 0.0f;
 	fc.shadowParams[2] = 0.0004f;
 	fc.shadowParams[3] = cascades_.empty() ? 0.0f : cascades_[0].texelWorld * 1.5f;
+	for (size_t i = 0; i < cascades_.size() && i < 4; ++i) {
+		fc.cascadeTexel[i] = cascades_[i].texelWorld;
+	}
+	aoActive_ = settings.ssao && f.aoIntensity > 0.0f && f.aoRadius > 0.0f;
+	fc.aoParams[0] = f.aoIntensity;
+	fc.aoParams[1] = f.aoRadius;
+	fc.aoParams[2] = f.aoDirectStrength;
+	fc.aoParams[3] = aoActive_ ? 1.0f : 0.0f;
+	memcpy(fc.smh[0], f.smhShadows, sizeof(f.smhShadows));
+	memcpy(fc.smh[1], f.smhMidtones, sizeof(f.smhMidtones));
+	memcpy(fc.smh[2], f.smhHighlights, sizeof(f.smhHighlights));
+	memcpy(fc.smhLimits, f.smhLimits, sizeof(f.smhLimits));
 	fc.cameraPos[0] = f.cameraPosition[0];
 	fc.cameraPos[1] = f.cameraPosition[1];
 	fc.cameraPos[2] = f.cameraPosition[2];
@@ -780,24 +1035,64 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.sunDirection[1] = sunDirection_.y;
 	fc.sunDirection[2] = sunDirection_.z;
 	fc.sunDirection[3] = hasSun_ ? 1.0f : 0.0f;
+	memcpy(&fc.clusterCounts[3], &sunLayerMask_, sizeof(uint32_t)); // g_ClusterCounts.w: the sun's rendering layers (asuint)
 	fc.sunColor[0] = sunColor_.x;
 	fc.sunColor[1] = sunColor_.y;
 	fc.sunColor[2] = sunColor_.z;
 	fc.sunColor[3] = sunShadows_ && !cascades_.empty() ? 1.0f : 0.0f;
 	memcpy(fc.sh, f.ambientSH, sizeof(fc.sh));
 	SceneTexture* sky = settings.sky && f.skyTexture ? store.Texture(f.skyTexture) : nullptr;
-	SceneTexture* exposure = f.exposureTexture ? store.Texture(f.exposureTexture) : nullptr;
 	fc.exposure[0] = f.exposure > 0 ? f.exposure : 1.0f;
-	fc.exposure[1] = exposure && exposure->srv != UINT32_MAX ? 1.0f : 0.0f;
-	fc.exposure[2] = std::pow(2.0f, settings.exposureEV);
-	fc.exposure[3] = settings.tonemap == "aces" ? 1.0f : settings.tonemap == "neutral" ? 2.0f : 0.0f;
+	// exposure source (y): 0 the constant in x, 2 Aether's own metering of this frame (the host exposes automatically)
+	fc.exposure[1] = 0.0f;
+	ownExposure_ = false;
+	if (f.exposureMode == kAeExposureFixed) {
+		fc.exposure[0] = 1.0f / (1.2f * std::pow(2.0f, f.exposureFixedEV - f.exposureCompensation));
+	} else if (f.exposureMode == kAeExposureAutomatic) {
+		ownExposure_ = true;
+		fc.exposure[1] = 2.0f;
+		fc.exposureParams[0] = f.exposureMinEV;
+		fc.exposureParams[1] = f.exposureMaxEV;
+		fc.exposureParams[2] = f.exposureCompensation;
+		// how far this frame's metering moves the exposure towards what it measured (1: all the way, no value to start
+		// from). The metering of one frame alone follows every highlight that crosses the screen, which shows as flicker.
+		const auto now = std::chrono::steady_clock::now();
+		const float dt = std::clamp(std::chrono::duration<float>(now - exposureTime_).count(), 0.0f, 0.25f);
+		exposureTime_ = now;
+		fc.exposureParams[3] = exposureValid_ ? 1.0f - std::exp(-dt * kExposureAdaptationRate) : 1.0f;
+	}
+	fc.exposure[2] = std::pow(2.0f, settings.exposureEV + f.postExposure);
+	// tone mapping: 0 none, 1 ACES, 2 neutral, 3 the host's custom curve
+	float tone = settings.tonemap == "aces" ? 1.0f : settings.tonemap == "neutral" ? 2.0f : 0.0f;
+	if (settings.tonemap == "host") {
+		switch (f.tonemapMode) {
+		case kAeTonemapNone: tone = 0.0f; break;
+		case kAeTonemapNeutral: tone = 2.0f; break;
+		case kAeTonemapCustom: tone = 3.0f; break;
+		default: tone = 1.0f; break; // ACES, an external LUT (not reproduced) or nothing known
+		}
+	}
+	if (tone == 3.0f) {
+		HableCurve(f.tonemapCurve, fc.toneCurve, fc.toneSegA, fc.toneSegB);
+	}
+	fc.exposure[3] = tone;
 	const auto& views = DebugViewNames();
 	fc.misc[0] = float(std::find(views.begin(), views.end(), settings.debugView) - views.begin());
 	fc.misc[1] = sky && sky->srv != UINT32_MAX ? 1.0f : 0.0f;
+	frameSky_ = fc.misc[1] > 0.5f;
 	fc.misc[2] = sky ? float(std::max<uint32_t>(sky->desc.mipCount, 1)) : 1.0f;
 	fc.misc[3] = f.ambientIntensity;
-	memcpy(fc.fog, f.fogColor, sizeof(f.fogColor));
+	fc.skyParams[0] = f.skyIntensity > 0 ? f.skyIntensity : 1.0f;
+	fc.skyParams[1] = std::cos(f.skyRotation);
+	fc.skyParams[2] = std::sin(f.skyRotation);
+	const bool fogFromSky = (f.fogFlags & kAeFogColorFromSky) != 0;
+	memcpy(fc.fog, fogFromSky ? f.fogTint : f.fogColor, sizeof(f.fogColor));
 	fc.fog[3] = f.fogDensity;
+	fc.fogHeight[0] = f.fogBaseHeight;
+	// HDRP's height fog: the layer's depth times 0.144765 is the height over which the density falls to 1 / e
+	fc.fogHeight[1] = 1.0f / (std::max(0.01f, f.fogMaxHeight - f.fogBaseHeight) * 0.144765f);
+	fc.fogHeight[2] = f.fogMaxDistance;
+	fc.fogHeight[3] = fogFromSky ? 1.0f : 0.0f;
 
 	auto upload = [&](const void* data, size_t bytes, size_t align) -> D3D12_GPU_VIRTUAL_ADDRESS {
 		UploadAllocation a = gpu.Upload(std::max<size_t>(bytes, 16), align);
@@ -812,29 +1107,89 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		instanceData_.resize(sizeof(InstanceData));
 	}
 	instancesVa_ = upload(instanceData_.data(), instanceData_.size(), 16);
+	// ---- particles: a batch that covers what is behind it is drawn back to front
+	particleBatches_.clear();
+	particleData_.clear();
+	particlesVa_ = 0;
+	if (settings.particles && !scene.particles.empty()) {
+		particleData_ = scene.particles;
+		particleBatches_ = scene.particleBatches;
+		const float cx = f.cameraPosition[0], cy = f.cameraPosition[1], cz = f.cameraPosition[2];
+		for (const AeParticleBatch& b : particleBatches_) {
+			if ((b.flags & kAeParticleAdditive) == 0 && b.count > 1) {
+				std::sort(particleData_.begin() + b.first, particleData_.begin() + b.first + b.count, [&](const AeParticle& x, const AeParticle& y) {
+					const float dx = (x.position[0] - cx) * (x.position[0] - cx) + (x.position[1] - cy) * (x.position[1] - cy) + (x.position[2] - cz) * (x.position[2] - cz);
+					const float dy = (y.position[0] - cx) * (y.position[0] - cx) + (y.position[1] - cy) * (y.position[1] - cy) + (y.position[2] - cz) * (y.position[2] - cz);
+					return dx > dy;
+				});
+			}
+		}
+		particlesVa_ = upload(particleData_.data(), particleData_.size() * sizeof(AeParticle), 16);
+	}
 	materialsVa_ = upload(materialData_.data(), materialData_.size(), 16);
 	lightsVa_ = upload(lightData_.data(), lightData_.size(), 16);
 	gridVa_ = upload(clusterGrid_.data(), clusterGrid_.size() * sizeof(uint32_t), 16);
 	indicesVa_ = upload(lightIndices_.data(), lightIndices_.size() * sizeof(uint32_t), 16);
-	if (!frameCb_ || !instancesVa_ || !materialsVa_ || !lightsVa_ || !gridVa_ || !indicesVa_) {
+	// the instance map is written while the passes are recorded: room for every list once per pass that draws it
+	instanceMapCapacity_ = uint32_t(opaque_.size() * 2 + transparent_.size() + decals_.size() + casters_.size() * 4 + 4);
+	const UploadAllocation map = gpu.Upload(size_t(instanceMapCapacity_) * sizeof(uint32_t), 16);
+	instanceMap_ = static_cast<uint32_t*>(map.cpu);
+	instanceMapVa_ = map.gpu;
+	instanceMapUsed_ = itemsDrawn_ = itemsInstanced_ = 0;
+	if (!frameCb_ || !instancesVa_ || !materialsVa_ || !lightsVa_ || !gridVa_ || !indicesVa_ || !instanceMap_) {
 		return false;
 	}
 
 	// this frame's global table: shadow atlas, sky, exposure. A fresh table every frame: the previous frames' lists
 	// may still read theirs.
-	globalsTable_ = gpu.AllocSrv(3);
-	postTable_ = gpu.AllocSrv(1);
+	// ---- reflection probes: the nearest ones whose cube map the store has
+	probesTable_ = gpu.AllocSrv(kMaxProbes);
+	probesInFrame_ = 0;
+	if (probesTable_ != UINT32_MAX) {
+		struct Candidate { const AeProbe* probe; SceneTexture* texture; float distance; };
+		std::vector<Candidate> candidates;
+		for (const AeProbe& p : scene.probes) {
+			SceneTexture* texture = settings.sky ? store.Texture(p.texture) : nullptr;
+			if (!texture || texture->srv == UINT32_MAX || texture->desc.dimension != kAeTextureCube) {
+				continue;
+			}
+			const Vec3 d = Vec3{p.capturePosition[0], p.capturePosition[1], p.capturePosition[2]} - Vec3{f.cameraPosition[0], f.cameraPosition[1], f.cameraPosition[2]};
+			candidates.push_back({&p, texture, Length(d)});
+		}
+		std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.distance < b.distance; });
+		for (uint32_t i = 0; i < kMaxProbes; ++i) {
+			if (i < candidates.size()) {
+				const AeProbe& p = *candidates[i].probe;
+				memcpy(fc.probeRows[i], p.worldToLocal, sizeof(p.worldToLocal));
+				memcpy(fc.probeExtents[i], p.extents, sizeof(p.extents));
+				fc.probeExtents[i][3] = p.blendDistance;
+				memcpy(fc.probeCapture[i], p.capturePosition, sizeof(p.capturePosition));
+				fc.probeCapture[i][3] = p.intensity;
+				fc.probeInfo[i][0] = float(p.flags);
+				fc.probeInfo[i][1] = float(std::max<uint32_t>(candidates[i].texture->desc.mipCount, 1));
+				gpu.CopySrv(probesTable_ + i, candidates[i].texture->srv);
+				++probesInFrame_;
+			} else {
+				gpu.CopySrv(probesTable_ + i, nullCubeSrv_);
+			}
+		}
+		fc.probeCount[0] = float(probesInFrame_);
+	}
+	globalsTable_ = gpu.AllocSrv(kGlobalsTableSize);
+	postTable_ = gpu.AllocSrv(kPostTableSize * kPostTables);
 	if (globalsTable_ == UINT32_MAX || postTable_ == UINT32_MAX) {
 		return false;
 	}
 	gpu.CopySrv(globalsTable_, shadowAtlas_ ? shadowAtlas_->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 1, fc.misc[1] > 0.5f ? sky->srv : nullCubeSrv_);
-	gpu.CopySrv(globalsTable_ + 2, fc.exposure[1] > 0.5f ? exposure->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 2, irradiance_ ? irradiance_->srv : nullTextureSrv_);
+	postNext_ = 4;
+	gpu.CopySrv(globalsTable_ + 3, white_->srv); // replaced by the ambient occlusion texture when that pass runs
+	for (uint32_t i = 0; i < kPostTableSize * kPostTables; ++i) {
+		gpu.CopySrv(postTable_ + i, nullTextureSrv_);
+	}
 	if (sky) {
 		sky->lastUsedFrame = frame_;
-	}
-	if (exposure) {
-		exposure->lastUsedFrame = frame_;
 	}
 	return true;
 }
@@ -850,8 +1205,10 @@ void SceneRenderer::BindCommon(ID3D12GraphicsCommandList* list, bool globals) {
 	list->SetGraphicsRootShaderResourceView(4, lightsVa_);
 	list->SetGraphicsRootShaderResourceView(5, gridVa_);
 	list->SetGraphicsRootShaderResourceView(6, indicesVa_);
+	list->SetGraphicsRootShaderResourceView(11, instanceMapVa_);
 	if (globals) {
 		list->SetGraphicsRootDescriptorTable(8, gpu.SrvGpu(globalsTable_));
+		list->SetGraphicsRootDescriptorTable(10, gpu.SrvGpu(probesTable_));
 	}
 	list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
@@ -862,6 +1219,44 @@ void SceneRenderer::DrawItems(RenderGraph::PassContext& ctx, const std::vector<D
 	ID3D12PipelineState* boundPso = nullptr;
 	const SceneMesh* boundMesh = nullptr;
 	uint32_t boundTable = UINT32_MAX;
+	// a run of items that differ in nothing but the instance is one draw
+	struct Batch { const DrawItem* first = nullptr; ID3D12PipelineState* pso = nullptr; uint32_t table = 0, start = 0, count = 0; } batch;
+	auto flush = [&]() {
+		if (!batch.first) {
+			return;
+		}
+		const DrawItem& item = *batch.first;
+		if (batch.pso != boundPso) {
+			list->SetPipelineState(batch.pso);
+			boundPso = batch.pso;
+		}
+		if (item.mesh != boundMesh) {
+			const SceneMesh& mesh = *item.mesh;
+			D3D12_VERTEX_BUFFER_VIEW views[AE_MAX_STREAMS];
+			for (uint32_t s = 0; s < mesh.desc.streamCount; ++s) {
+				views[s] = {mesh.vertexBuffer[s]->GetGPUVirtualAddress(), mesh.desc.vertexCount * mesh.desc.streamStride[s], mesh.desc.streamStride[s]};
+			}
+			list->IASetVertexBuffers(0, mesh.desc.streamCount, views);
+			list->IASetVertexBuffers(kDefaultsSlot, 1, &defaultsView_);
+			// (sizes were checked against the buffers when the mesh was registered: SceneStore::Apply)
+			D3D12_INDEX_BUFFER_VIEW ib = {mesh.indexBuffer->GetGPUVirtualAddress(), mesh.desc.indexCount * mesh.desc.indexStride, mesh.desc.indexStride == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+			list->IASetIndexBuffer(&ib);
+			boundMesh = item.mesh;
+		}
+		if (batch.table != boundTable && batch.table != UINT32_MAX) {
+			list->SetGraphicsRootDescriptorTable(7, gpu.SrvGpu(batch.table));
+			boundTable = batch.table;
+		}
+		const uint32_t constants[4] = {batch.start, item.materialIndex, uint32_t(std::max(cascade, 0)), (item.mirrored ? 1u : 0u) | (opaqueKind == kForward ? 0u : 2u)}; // bit 1: no screen space occlusion (blended passes)
+		list->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+		const AeSubMesh& sm = item.mesh->subMeshes[item.subMesh];
+		list->DrawIndexedInstanced(sm.indexCount, batch.count, sm.indexStart, INT(sm.baseVertex), 0);
+		ctx.drawCalls++;
+		ctx.triangles += sm.indexCount / 3 * batch.count;
+		itemsDrawn_ += batch.count;
+		itemsInstanced_ += batch.count > 1 ? batch.count : 0;
+		batch.first = nullptr;
+	};
 	for (const DrawItem& item : items) {
 		if (cascade >= 0) {
 			// only what can reach this cascade's box: a sphere against the cascade's bounding sphere, stretched towards the sun
@@ -882,36 +1277,61 @@ void SceneRenderer::DrawItems(RenderGraph::PassContext& ctx, const std::vector<D
 		if (!pso) {
 			continue;
 		}
-		if (pso != boundPso) {
-			list->SetPipelineState(pso);
-			boundPso = pso;
-		}
-		if (item.mesh != boundMesh) {
-			const SceneMesh& mesh = *item.mesh;
-			D3D12_VERTEX_BUFFER_VIEW views[AE_MAX_STREAMS];
-			for (uint32_t s = 0; s < mesh.desc.streamCount; ++s) {
-				views[s] = {mesh.vertexBuffer[s]->GetGPUVirtualAddress(), mesh.desc.vertexCount * mesh.desc.streamStride[s], mesh.desc.streamStride[s]};
-			}
-			list->IASetVertexBuffers(0, mesh.desc.streamCount, views);
-			list->IASetVertexBuffers(kDefaultsSlot, 1, &defaultsView_);
-			// (sizes were checked against the buffers when the mesh was registered: SceneStore::Apply)
-			D3D12_INDEX_BUFFER_VIEW ib = {mesh.indexBuffer->GetGPUVirtualAddress(), mesh.desc.indexCount * mesh.desc.indexStride, mesh.desc.indexStride == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
-			list->IASetIndexBuffer(&ib);
-			boundMesh = item.mesh;
+		if (instanceMapUsed_ >= instanceMapCapacity_) {
+			break; // cannot happen: the map has room for every list in every pass
 		}
 		// a missing material, or one whose table could not be made yet, samples the default textures
 		const uint32_t table = item.material && item.material->table != UINT32_MAX ? item.material->table : fallbackTable_;
-		if (table != boundTable && table != UINT32_MAX) {
-			list->SetGraphicsRootDescriptorTable(7, gpu.SrvGpu(table));
-			boundTable = table;
+		const bool joins = batch.first && batch.pso == pso && batch.table == table && batch.first->mesh == item.mesh && batch.first->subMesh == item.subMesh &&
+			batch.first->materialIndex == item.materialIndex && batch.first->mirrored == item.mirrored;
+		if (joins) {
+			++batch.count;
+		} else {
+			flush();
+			batch.first = &item;
+			batch.pso = pso;
+			batch.table = table;
+			batch.start = instanceMapUsed_;
+			batch.count = 1;
 		}
-		const uint32_t constants[4] = {item.instanceIndex, item.materialIndex, uint32_t(std::max(cascade, 0)), item.mirrored ? 1u : 0u};
-		list->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
-		const AeSubMesh& sm = item.mesh->subMeshes[item.subMesh];
-		list->DrawIndexedInstanced(sm.indexCount, 1, sm.indexStart, INT(sm.baseVertex), 0);
-		ctx.drawCalls++;
-		ctx.triangles += sm.indexCount / 3;
+		instanceMap_[instanceMapUsed_++] = item.instanceIndex;
 	}
+	flush();
+}
+
+bool SceneRenderer::Fullscreen(RenderGraph::PassContext& ctx, FullscreenKind kind, GpuTexture* output, GpuTexture* in0, GpuTexture* in1, GpuTexture* in2, const float* params, GpuTexture* in3) {
+	GpuResources& gpu = GpuResources::Get();
+	ID3D12PipelineState* pso = output ? FullscreenPipeline(kind, output->desc.targetFormat) : nullptr;
+	if (!pso || postNext_ >= kPostTables) {
+		ctx.note = "no pipeline";
+		return false;
+	}
+	const uint32_t table = postTable_ + kPostTableSize * postNext_++;
+	GpuTexture* inputs[kPostTableSize] = {in0, in1, in2, in3};
+	for (uint32_t i = 0; i < kPostTableSize; ++i) {
+		if (inputs[i]) {
+			gpu.CopySrv(table + i, inputs[i]->srv);
+		}
+	}
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(output->target);
+	const D3D12_VIEWPORT viewport = {0, 0, float(output->desc.width), float(output->desc.height), 0, 1};
+	const D3D12_RECT scissor = {0, 0, LONG(output->desc.width), LONG(output->desc.height)};
+	ctx.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+	ctx.list->RSSetViewports(1, &viewport);
+	ctx.list->RSSetScissorRects(1, &scissor);
+	BindCommon(ctx.list, true);
+	ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(table));
+	// the draw constants carry the pass's own four numbers (g_PassParams); z and w default to 1 / the output's size
+	float constants[4] = {0, 0, 1.0f / float(output->desc.width), 1.0f / float(output->desc.height)};
+	if (params) {
+		memcpy(constants, params, sizeof(constants));
+	}
+	ctx.list->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+	ctx.list->SetPipelineState(pso);
+	ctx.list->DrawInstanced(3, 1, 0, 0);
+	ctx.drawCalls = 1;
+	ctx.triangles = 1;
+	return true;
 }
 
 // ------------------------------------------------------------------------------------------------ the frame
@@ -982,6 +1402,12 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	depthDesc.clearDepth = 0.0f;
 	const RenderGraph::ResourceId color = graph_.CreateTransient("SceneColor", colorDesc, ResourceCategory::RenderTarget);
 	const RenderGraph::ResourceId depth = graph_.CreateTransient("SceneDepth", depthDesc, ResourceCategory::DepthBuffer);
+	GpuTextureDesc surfaceDesc = colorDesc;
+	surfaceDesc.format = surfaceDesc.targetFormat = kSurfaceFormat;
+	const RenderGraph::ResourceId surface = graph_.CreateTransient("SceneSurface", surfaceDesc, ResourceCategory::RenderTarget);
+	GpuTextureDesc velocityDesc = colorDesc;
+	velocityDesc.format = velocityDesc.targetFormat = kVelocityFormat;
+	const RenderGraph::ResourceId velocity = graph_.CreateTransient("SceneVelocity", velocityDesc, ResourceCategory::RenderTarget);
 	const RenderGraph::ResourceId shadow = shadowAtlas_ ? graph_.Import(shadowAtlas_) : RenderGraph::kInvalid;
 	const RenderGraph::ResourceId backBuffer = graph_.ImportExternal("BackBuffer", target.backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
 	const bool shadows = !cascades_.empty();
@@ -1012,39 +1438,145 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		BindCommon(ctx.list, false);
 		DrawItems(ctx, opaque_, kDepth, kDepthAlpha, -1);
 	});
+	// ---- the sky's diffuse light: the sky cube convolved with the cosine lobe, per direction (a small octahedral map)
+	if (!irradiance_) {
+		GpuTextureDesc d;
+		d.width = d.height = kIrradianceSize;
+		d.format = d.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		d.renderTarget = true;
+		irradiance_ = gpu.CreateTexture(d, "Scene.SkyIrradiance", ResourceCategory::RenderTarget, Lifetime::Persistent, frame);
+	}
+	const bool skyLight = irradiance_ && frameSky_;
+	const RenderGraph::ResourceId irradiance = irradiance_ ? graph_.Import(irradiance_) : RenderGraph::kInvalid;
+	graph_.AddPass("SkyIrradiance", skyLight, [&](RenderGraph::Builder& b) { b.Write(irradiance, D3D12_RESOURCE_STATE_RENDER_TARGET); }, [&, irradiance](RenderGraph::PassContext& ctx) {
+		Fullscreen(ctx, kFullscreenIrradiance, ctx.Texture(irradiance), nullptr);
+	});
+	// ---- screen space ambient occlusion: from the prepass depth, then a depth aware blur
+	GpuTextureDesc aoDesc;
+	aoDesc.width = target.width;
+	aoDesc.height = target.height;
+	aoDesc.format = aoDesc.targetFormat = DXGI_FORMAT_R8_UNORM;
+	aoDesc.renderTarget = true;
+	aoDesc.clearColor[0] = aoDesc.clearColor[1] = aoDesc.clearColor[2] = aoDesc.clearColor[3] = 1.0f;
+	const bool ao = aoActive_;
+	const RenderGraph::ResourceId aoRaw = ao ? graph_.CreateTransient("SceneAO.Raw", aoDesc, ResourceCategory::RenderTarget) : RenderGraph::kInvalid;
+	const RenderGraph::ResourceId aoFinal = ao ? graph_.CreateTransient("SceneAO", aoDesc, ResourceCategory::RenderTarget) : RenderGraph::kInvalid;
+	auto fullscreenAo = [&, viewport, scissor](RenderGraph::PassContext& ctx, FullscreenKind kind, RenderGraph::ResourceId output, uint32_t table) {
+		ID3D12PipelineState* pso = FullscreenPipeline(kind, DXGI_FORMAT_R8_UNORM);
+		if (!pso) {
+			ctx.note = "no pipeline";
+			return;
+		}
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(output)->target);
+		ctx.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		ctx.list->RSSetViewports(1, &viewport);
+		ctx.list->RSSetScissorRects(1, &scissor);
+		BindCommon(ctx.list, true);
+		ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(table));
+		ctx.list->SetPipelineState(pso);
+		ctx.list->DrawInstanced(3, 1, 0, 0);
+		ctx.drawCalls = 1;
+		ctx.triangles = 1;
+	};
+	graph_.AddPass("AmbientOcclusion", ao, [&](RenderGraph::Builder& b) {
+		b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		b.Write(aoRaw, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}, [&, depth, aoRaw, fullscreenAo](RenderGraph::PassContext& ctx) {
+		gpu.CopySrv(postTable_ + 1, ctx.Texture(depth)->srv);
+		fullscreenAo(ctx, kFullscreenAo, aoRaw, postTable_);
+		ctx.note = Format("radius %.2f m, intensity %.2f", scene.frame.aoRadius, scene.frame.aoIntensity);
+	});
+	graph_.AddPass("AmbientOcclusionBlur", ao, [&](RenderGraph::Builder& b) {
+		b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		b.Read(aoRaw, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		b.Write(aoFinal, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}, [&, depth, aoRaw, aoFinal, fullscreenAo](RenderGraph::PassContext& ctx) {
+		gpu.CopySrv(postTable_ + kPostTableSize, ctx.Texture(aoRaw)->srv);
+		gpu.CopySrv(postTable_ + kPostTableSize + 1, ctx.Texture(depth)->srv);
+		fullscreenAo(ctx, kFullscreenAoBlur, aoFinal, postTable_ + kPostTableSize);
+	});
 	graph_.AddPass("Opaque", true, [&](RenderGraph::Builder& b) {
 		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		b.Write(surface, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		b.Write(velocity, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		b.Write(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		if (ao) {
+			b.Read(aoFinal, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
 		if (shadow != RenderGraph::kInvalid) {
 			b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		}
-	}, [&, color, depth](RenderGraph::PassContext& ctx) {
+		if (skyLight) {
+			b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+	}, [&, color, depth, surface, velocity, ao, aoFinal](RenderGraph::PassContext& ctx) {
+		if (ao) {
+			gpu.CopySrv(globalsTable_ + 3, ctx.Texture(aoFinal)->srv);
+		}
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(color)->target), dsv = gpu.DsvCpu(ctx.Texture(depth)->target);
-		ctx.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+		const D3D12_CPU_DESCRIPTOR_HANDLE targets[3] = {rtv, gpu.RtvCpu(ctx.Texture(surface)->target), gpu.RtvCpu(ctx.Texture(velocity)->target)};
+		ctx.list->OMSetRenderTargets(3, targets, FALSE, &dsv);
 		const float clear[4] = {0, 0, 0, 0};
 		ctx.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+		ctx.list->ClearRenderTargetView(targets[1], clear, 0, nullptr); // (weight 0: nothing reflects there)
+		const float nothing[4] = {1000.0f, 1000.0f, 0, 0};
+		ctx.list->ClearRenderTargetView(targets[2], nothing, 0, nullptr);
 		ctx.list->RSSetViewports(1, &viewport);
 		ctx.list->RSSetScissorRects(1, &scissor);
 		BindCommon(ctx.list, true);
 		DrawItems(ctx, opaque_, kForward, kForward, -1);
 		ctx.note = Format("%u punctual lights in %ux%ux%u clusters", punctualCount_, kClusterX, kClusterY, kClusterZ);
 	});
+	// ---- screen space reflections: what a smooth surface mirrors, where that is on screen. Read from the picture of the
+	// frame before (the temporal history, as the host does it), added on top of the sky / probe reflection the
+	// surface was shaded with.
+	if (ssr_ && historyValid_ && history_[historyIndex_] && history_[historyIndex_]->desc.width == target.width && history_[historyIndex_]->desc.height == target.height) {
+		const RenderGraph::ResourceId before = graph_.Import(history_[historyIndex_]);
+		graph_.AddPass("ScreenSpaceReflections", true, [&, color, depth, surface, before](RenderGraph::Builder& b) {
+			b.Read(before, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, color, depth, surface, before](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenSsr, ctx.Texture(color), ctx.Texture(before), ctx.Texture(depth), ctx.Texture(surface));
+		});
+	}
 	graph_.AddPass("Sky", true, [&](RenderGraph::Builder& b) {
 		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		b.Write(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 	}, [&, color, depth](RenderGraph::PassContext& ctx) {
-		ID3D12PipelineState* pso = FullscreenPipeline(false, kSceneColorFormat);
+		ID3D12PipelineState* pso = FullscreenPipeline(kFullscreenSky, kSceneColorFormat);
 		if (!pso) {
 			ctx.note = "no pipeline";
 			return;
 		}
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(color)->target), dsv = gpu.DsvCpu(ctx.Texture(depth)->target);
 		ctx.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+		ctx.list->RSSetViewports(1, &viewport);
+		ctx.list->RSSetScissorRects(1, &scissor);
 		BindCommon(ctx.list, true);
 		ctx.list->SetPipelineState(pso);
 		ctx.list->DrawInstanced(3, 1, 0, 0);
 		ctx.drawCalls = 1;
 		ctx.triangles = 1;
+	});
+	// ---- decal boxes (the cars' blob shadows): they darken whatever opaque surface lies inside them, found from the depth
+	graph_.AddPass("Decals", !decals_.empty(), [&](RenderGraph::Builder& b) {
+		b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}, [&, color, depth](RenderGraph::PassContext& ctx) {
+		if (postNext_ >= kPostTables) {
+			return;
+		}
+		const uint32_t table = postTable_ + kPostTableSize * postNext_++;
+		gpu.CopySrv(table + 1, ctx.Texture(depth)->srv);
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(color)->target);
+		ctx.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		ctx.list->RSSetViewports(1, &viewport);
+		ctx.list->RSSetScissorRects(1, &scissor);
+		BindCommon(ctx.list, true);
+		ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(table));
+		DrawItems(ctx, decals_, kDecal, kDecal, -1);
 	});
 	graph_.AddPass("Transparent", !transparent_.empty(), [&](RenderGraph::Builder& b) {
 		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1052,29 +1584,230 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		if (shadow != RenderGraph::kInvalid) {
 			b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		}
+		if (skyLight) {
+			b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
 	}, [&, color, depth](RenderGraph::PassContext& ctx) {
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(color)->target), dsv = gpu.DsvCpu(ctx.Texture(depth)->target);
 		ctx.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+		ctx.list->RSSetViewports(1, &viewport);
+		ctx.list->RSSetScissorRects(1, &scissor);
 		BindCommon(ctx.list, true);
 		DrawItems(ctx, transparent_, kForwardBlend, kForwardBlend, -1);
 	});
-	graph_.AddPass("Composite", true, [&](RenderGraph::Builder& b) {
-		b.Read(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	// ---- particles (the game's particle systems, tyre smoke): over everything drawn so far
+	particlesDrawn_ = 0;
+	graph_.AddPass("Particles", particlesVa_ != 0 && !particleBatches_.empty(), [&, color, depth](RenderGraph::Builder& b) {
+		b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		if (shadow != RenderGraph::kInvalid) {
+			b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+		if (skyLight) {
+			b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+	}, [&, color, depth](RenderGraph::PassContext& ctx) {
+		ID3D12PipelineState* pso = ParticlePipeline();
+		if (!pso) {
+			ctx.note = "no pipeline";
+			return;
+		}
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(color)->target);
+		ctx.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		ctx.list->RSSetViewports(1, &viewport);
+		ctx.list->RSSetScissorRects(1, &scissor);
+		BindCommon(ctx.list, true);
+		ctx.list->SetGraphicsRootShaderResourceView(2, particlesVa_); // (the particle buffer takes the instance buffer's place)
+		ctx.list->SetPipelineState(pso);
+		for (const AeParticleBatch& batch : particleBatches_) {
+			if (batch.count == 0 || postNext_ >= kPostTables) {
+				continue;
+			}
+			const uint32_t table = postTable_ + kPostTableSize * postNext_++;
+			SceneTexture* texture = batch.texture ? store.Texture(batch.texture) : nullptr;
+			uint32_t flags = batch.flags;
+			if (texture && texture->srv != UINT32_MAX) {
+				gpu.CopySrv(table, texture->srv);
+				texture->lastUsedFrame = frame;
+			} else {
+				flags |= kAeParticleDisc;
+			}
+			gpu.CopySrv(table + 1, ctx.Texture(depth)->srv);
+			ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(table));
+			const uint32_t constants[4] = {batch.first, 0, 0, flags};
+			ctx.list->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+			ctx.list->DrawInstanced(6, batch.count, 0, 0);
+			ctx.drawCalls += 1;
+			ctx.triangles += batch.count * 2;
+			particlesDrawn_ += batch.count;
+		}
+		ctx.note = Format("%u particles in %u batches", particlesDrawn_, uint32_t(particleBatches_.size()));
+	});
+	// ---- post-processing. `post` is the picture as it stands; every step that runs replaces it.
+	RenderGraph::ResourceId post = color;
+	// temporal antialiasing: this frame (drawn with a sub pixel offset) blended into the picture of the frames before
+	const bool taa = taa_;
+	if (taa) {
+		for (auto& h : history_) {
+			if (h && (h->desc.width != target.width || h->desc.height != target.height)) {
+				gpu.RetireTexture(std::move(h), retireFence, frame);
+				historyValid_ = false;
+			}
+			if (!h) {
+				GpuTextureDesc d = colorDesc;
+				// (with an alpha channel, unlike the scene colour: it keeps whether the pixel showed something that moves by itself)
+				d.format = d.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+				h = gpu.CreateTexture(d, "Scene.History", ResourceCategory::RenderTarget, Lifetime::Persistent, frame);
+				historyValid_ = false;
+			}
+		}
+	}
+	if (taa && history_[0] && history_[1]) {
+		historyIndex_ ^= 1;
+		const RenderGraph::ResourceId current = graph_.Import(history_[historyIndex_]), previous = graph_.Import(history_[historyIndex_ ^ 1]);
+		graph_.AddPass("TemporalAA", true, [&, color, depth, velocity, current, previous](RenderGraph::Builder& b) {
+			b.Read(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(velocity, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(previous, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(current, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, color, depth, velocity, current, previous](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenTaa, ctx.Texture(current), ctx.Texture(color), ctx.Texture(depth), ctx.Texture(previous), nullptr, ctx.Texture(velocity));
+		});
+		post = current;
+		historyValid_ = true;
+	} else {
+		historyValid_ = false;
+	}
+	// motion blur: along the way every still point of the world moved on screen since the frame before (the camera's motion)
+	if (motionBlur_ > 0.0f) {
+		const RenderGraph::ResourceId blurred = graph_.CreateTransient("SceneMotionBlur", colorDesc, ResourceCategory::RenderTarget);
+		const RenderGraph::ResourceId source = post;
+		graph_.AddPass("MotionBlur", true, [&, source, depth, velocity, blurred](RenderGraph::Builder& b) {
+			b.Read(source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(velocity, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(blurred, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, source, depth, velocity, blurred](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenMotionBlur, ctx.Texture(blurred), ctx.Texture(source), ctx.Texture(depth), ctx.Texture(velocity));
+		});
+		post = blurred;
+	}
+	// bloom: the picture scaled down level by level, then added up again from the smallest (the host's scheme: every
+	// level is the level below it scaled up, mixed with its own by the scatter value)
+	RenderGraph::ResourceId bloom = RenderGraph::kInvalid;
+	if (bloomMix_ > 0.0f && target.width >= 64 && target.height >= 64) {
+		RenderGraph::ResourceId down[kBloomLevels], up[kBloomLevels];
+		for (uint32_t i = 0; i < kBloomLevels; ++i) {
+			GpuTextureDesc d = colorDesc;
+			d.width = std::max(1u, target.width >> (i + 1));
+			d.height = std::max(1u, target.height >> (i + 1));
+			down[i] = graph_.CreateTransient(i == 0 ? "Bloom.Down0" : i == 1 ? "Bloom.Down1" : i == 2 ? "Bloom.Down2" : i == 3 ? "Bloom.Down3" : "Bloom.Down4", d, ResourceCategory::RenderTarget);
+			up[i] = i + 1 < kBloomLevels ? graph_.CreateTransient(i == 0 ? "Bloom.Up0" : i == 1 ? "Bloom.Up1" : i == 2 ? "Bloom.Up2" : "Bloom.Up3", d, ResourceCategory::RenderTarget) : down[i];
+			const RenderGraph::ResourceId source = i == 0 ? post : down[i - 1], output = down[i];
+			const float first = i == 0 ? 1.0f : 0.0f;
+			graph_.AddPass(i == 0 ? "BloomDown0" : i == 1 ? "BloomDown1" : i == 2 ? "BloomDown2" : i == 3 ? "BloomDown3" : "BloomDown4", true, [&, source, output](RenderGraph::Builder& b) {
+				b.Read(source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Write(output, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			}, [&, source, output, first](RenderGraph::PassContext& ctx) {
+				GpuTexture* out = ctx.Texture(output);
+				const float params[4] = {first, 0, 1.0f / float(out->desc.width), 1.0f / float(out->desc.height)};
+				Fullscreen(ctx, kFullscreenBloomDown, out, ctx.Texture(source), nullptr, nullptr, params);
+			});
+		}
+		for (int i = int(kBloomLevels) - 2; i >= 0; --i) {
+			const RenderGraph::ResourceId low = up[i + 1], high = down[i], output = up[i];
+			graph_.AddPass(i == 0 ? "BloomUp0" : i == 1 ? "BloomUp1" : i == 2 ? "BloomUp2" : "BloomUp3", true, [&, low, high, output](RenderGraph::Builder& b) {
+				b.Read(low, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Read(high, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Write(output, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			}, [&, low, high, output](RenderGraph::PassContext& ctx) {
+				GpuTexture* out = ctx.Texture(output);
+				GpuTexture* lowTexture = ctx.Texture(low);
+				const float params[4] = {bloomScatter_, 0, 1.0f / float(lowTexture->desc.width), 1.0f / float(lowTexture->desc.height)};
+				Fullscreen(ctx, kFullscreenBloomUp, out, lowTexture, ctx.Texture(high), nullptr, params);
+			});
+		}
+		bloom = up[0];
+	}
+	// ---- Aether's own exposure: the scene's mean luminance into a 1 x 1 target (when the host's is not available)
+	GpuTextureDesc exposureDesc;
+	exposureDesc.width = exposureDesc.height = 1;
+	exposureDesc.format = exposureDesc.targetFormat = DXGI_FORMAT_R16_FLOAT;
+	exposureDesc.renderTarget = true;
+	const bool ownExposure = ownExposure_;
+	// two targets that live across frames: this frame's value starts from the one of the frame before (g_ExposureParams.w)
+	RenderGraph::ResourceId exposureTarget = RenderGraph::kInvalid, exposurePrevious = RenderGraph::kInvalid;
+	if (ownExposure) {
+		for (auto& e : exposureHistory_) {
+			if (!e) {
+				e = gpu.CreateTexture(exposureDesc, "Scene.Exposure", ResourceCategory::RenderTarget, Lifetime::Persistent, frame);
+			}
+		}
+		exposureIndex_ ^= 1;
+		exposureTarget = graph_.Import(exposureHistory_[exposureIndex_]);
+		exposurePrevious = graph_.Import(exposureHistory_[exposureIndex_ ^ 1]);
+	}
+	exposureValid_ = ownExposure; // from the next frame on there is a value to start from
+	graph_.AddPass("Exposure", ownExposure, [&, post, exposureTarget, exposurePrevious](RenderGraph::Builder& b) {
+		b.Read(post, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		b.Read(exposurePrevious, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		b.Write(exposureTarget, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}, [&, post, exposureTarget, exposurePrevious](RenderGraph::PassContext& ctx) {
+		const RenderGraph::ResourceId color = post;
+		ID3D12PipelineState* pso = FullscreenPipeline(kFullscreenExposure, DXGI_FORMAT_R16_FLOAT);
+		if (!pso) {
+			ctx.note = "no pipeline";
+			return;
+		}
+		const uint32_t table = postTable_ + kPostTableSize * 3;
+		gpu.CopySrv(table, ctx.Texture(color)->srv);
+		gpu.CopySrv(table + 2, ctx.Texture(exposurePrevious)->srv);
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(exposureTarget)->target);
+		const D3D12_VIEWPORT one = {0, 0, 1, 1, 0, 1};
+		const D3D12_RECT oneRect = {0, 0, 1, 1};
+		ctx.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		ctx.list->RSSetViewports(1, &one);
+		ctx.list->RSSetScissorRects(1, &oneRect);
+		BindCommon(ctx.list, true);
+		ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(table));
+		ctx.list->SetPipelineState(pso);
+		ctx.list->DrawInstanced(3, 1, 0, 0);
+		ctx.drawCalls = 1;
+		ctx.triangles = 1;
+		ctx.note = Format("metered, EV100 %.2f .. %.2f, compensation %.2f", scene.frame.exposureMinEV, scene.frame.exposureMaxEV, scene.frame.exposureCompensation);
+	});
+	graph_.AddPass("Composite", true, [&, post, bloom](RenderGraph::Builder& b) {
+		b.Read(post, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		if (ownExposure) {
+			b.Read(exposureTarget, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+		if (bloom != RenderGraph::kInvalid) {
+			b.Read(bloom, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
 		b.Write(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
-	}, [&, color](RenderGraph::PassContext& ctx) {
-		ID3D12PipelineState* pso = FullscreenPipeline(true, target.backBufferFormat);
+	}, [&, post, bloom, ownExposure, exposureTarget](RenderGraph::PassContext& ctx) {
+		const RenderGraph::ResourceId color = post;
+		ID3D12PipelineState* pso = FullscreenPipeline(kFullscreenComposite, target.backBufferFormat);
 		if (!pso) {
 			ctx.note = "no pipeline for this back buffer format";
 			return;
 		}
-		gpu.CopySrv(postTable_, ctx.Texture(color)->srv);
+		const uint32_t compositeTable = postTable_ + kPostTableSize * 2;
+		gpu.CopySrv(compositeTable, ctx.Texture(color)->srv);
+		if (ownExposure) {
+			gpu.CopySrv(compositeTable + 2, ctx.Texture(exposureTarget)->srv);
+		}
+		if (bloom != RenderGraph::kInvalid) {
+			gpu.CopySrv(compositeTable + 3, ctx.Texture(bloom)->srv);
+		}
 		ctx.list->OMSetRenderTargets(1, &target.backBufferRtv, FALSE, nullptr);
 		ctx.list->RSSetViewports(1, &viewport);
 		// compare mode: the right half is Aether's, the left half stays the host's picture
 		const D3D12_RECT rect = {compare ? LONG(target.width / 2) : 0, 0, LONG(target.width), LONG(target.height)};
 		ctx.list->RSSetScissorRects(1, &rect);
 		BindCommon(ctx.list, true);
-		ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(postTable_));
+		ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(compositeTable));
 		ctx.list->SetPipelineState(pso);
 		ctx.list->DrawInstanced(3, 1, 0, 0);
 		ctx.drawCalls = 1;
@@ -1083,6 +1816,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	});
 
 	if (!graph_.Compile()) {
+		graph_.End(retireFence); // (the pool is still looked after: a frame that could not get its textures must not keep the old ones)
 		return false;
 	}
 	const bool timing = settings.gpuTiming && timer_.Begin();
@@ -1134,11 +1868,14 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		{"shadowCasterDraws", casters_.size()},
 		{"unsupportedMaterialDraws", unsupportedDraws},
 		{"drawCalls", draws},
+		{"instancing", {{"instancesDrawn", itemsDrawn_}, {"inInstancedDraws", itemsInstanced_}, {"drawCallsSaved", itemsDrawn_ > draws ? itemsDrawn_ - draws : 0}}},
 		{"triangles", triangles},
 		{"pipelineStates", pipelines_.size() + fullscreenPipelines_.size()},
 		{"lights", {{"directional", hasSun_ ? 1 : 0}, {"punctual", punctualCount_}, {"clusters", kClusterX * kClusterY * kClusterZ}, {"clustersWithLights", usedClusters},
 			{"maxLightsInACluster", maxPerCluster}, {"lightIndexEntries", lightIndices_.size()}, {"clusterGrid", {kClusterX, kClusterY, kClusterZ}}}},
 		{"shadows", {{"cascades", cascades_.size()}, {"cascadeSize", shadowCascadeSize_}, {"atlasBytes", shadowAtlas_ ? shadowAtlas_->bytes : 0}}},
+		{"reflectionProbes", {{"host", scene.probes.size()}, {"inFrame", probesInFrame_}}},
+		{"particles", {{"submitted", scene.particles.size()}, {"batches", scene.particleBatches.size()}, {"drawn", particlesDrawn_}}},
 		{"sceneColorFormat", int(kSceneColorFormat)},
 	};
 	{
@@ -1154,11 +1891,15 @@ void SceneRenderer::EndFrame(const HostGfx& host, UINT64 fence) {
 	timer_.Submit(fence, frame_);
 	graph_.End(fence);
 	if (globalsTable_ != UINT32_MAX) {
-		gpu.FreeSrv(globalsTable_, 3, fence);
+		gpu.FreeSrv(globalsTable_, kGlobalsTableSize, fence);
+		if (probesTable_ != UINT32_MAX) {
+			gpu.FreeSrv(probesTable_, kMaxProbes, fence);
+			probesTable_ = UINT32_MAX;
+		}
 		globalsTable_ = UINT32_MAX;
 	}
 	if (postTable_ != UINT32_MAX) {
-		gpu.FreeSrv(postTable_, 1, fence);
+		gpu.FreeSrv(postTable_, kPostTableSize * kPostTables, fence);
 		postTable_ = UINT32_MAX;
 	}
 	gpu.EndFrame(fence);
@@ -1186,6 +1927,12 @@ void SceneRenderer::Release(bool leak) {
 	flatNormal_.reset();
 	black_.reset();
 	shadowAtlas_.reset();
+	irradiance_.reset();
+	history_[0].reset();
+	history_[1].reset();
+	exposureHistory_[0].reset();
+	exposureHistory_[1].reset();
+	exposureValid_ = false;
 	shadowCascadeSize_ = 0;
 	defaultsUploaded_ = false;
 	objectsReady_ = false;

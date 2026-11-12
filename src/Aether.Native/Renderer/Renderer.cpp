@@ -314,6 +314,12 @@ UINT64 Renderer::Completed() {
 				seen = c->fence;
 			}
 		}
+		if (DevOptions::Get().noSignal) {
+			// experiment: nothing of Aether's is signalled on the host's queue; the marker is the only evidence
+			markedSerial_ = std::max(markedSerial_, seen);
+			completedSerial_ = std::max(completedSerial_, markedSerial_);
+			return completedSerial_;
+		}
 		if (seen > markedSerial_ && SUCCEEDED(clock_.queue->Signal(completionFence_.Get(), seen))) {
 			markedSerial_ = seen;
 		}
@@ -569,7 +575,9 @@ void Renderer::PollCaptures(const HostGfx& host) {
 		auto pixels = std::make_shared<std::vector<uint8_t>>();
 		std::string error;
 		void* p = nullptr;
-		D3D12_RANGE range = {0, SIZE_T(c.footprint.Offset + UINT64(c.footprint.Footprint.RowPitch) * h)};
+		// (the buffer ends with the last row's pixels, not with its padding: for a width whose row is not a multiple of
+		// the row alignment, offset + pitch * height lies past the end and Map refuses the range)
+		D3D12_RANGE range = {0, SIZE_T(std::min<UINT64>(c.footprint.Offset + UINT64(c.footprint.Footprint.RowPitch) * h, c.readback->GetDesc().Width))};
 		HRESULT hr = c.readback->Map(0, &range, &p);
 		if (SUCCEEDED(hr)) {
 			if (!ConvertToRgba8(c.format, static_cast<const uint8_t*>(p) + c.footprint.Offset, c.footprint.Footprint.RowPitch, w, h, *pixels)) {
@@ -626,7 +634,36 @@ void Renderer::FrameEnd(const HostGfx& host) {
 		return;
 	}
 	LogSubmissionStats(host, start);
-	CollectGpuResults(host);
+	if (const int probe = DevOptions::Get().probe; probe != 0) {
+		// experiment: one kind of call per frame, nothing else of Aether's
+		if (probe == 1 || probe == 3) {
+			IDXGISwapChain* sc = host.swapChain ? host.swapChain() : nullptr;
+			ComPtr<IDXGISwapChain3> sc3;
+			ComPtr<ID3D12Resource> bb;
+			if (sc && SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3)))) {
+				sc3->GetBuffer(sc3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb));
+			}
+			if (probe == 3 && bb && rtvHeap_) {
+				D3D12_RENDER_TARGET_VIEW_DESC rd = {};
+				rd.Format = ViewFormat(bb->GetDesc().Format);
+				rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+				device_->CreateRenderTargetView(bb.Get(), &rd, rtvHeap_->GetCPUDescriptorHandleForHeapStart());
+			}
+		} else if (probe == 2) {
+			static ComPtr<ID3D12CommandAllocator> allocator;
+			static ComPtr<ID3D12GraphicsCommandList> list;
+			if (!list) {
+				device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+				device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+				list->Close();
+			}
+			allocator->Reset();
+			list->Reset(allocator.Get(), nullptr);
+			list->Close();
+		}
+		finish();
+		return;
+	}	CollectGpuResults(host);
 	PollCaptures(host);
 	const SettingsData& s = CurrentSettings();
 	Overlay& overlay = Overlay::Get();

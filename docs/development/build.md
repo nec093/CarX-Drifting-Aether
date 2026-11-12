@@ -1,5 +1,28 @@
 # ビルドと配置
 
+## ローダー（2026-11-12 から BepInEx が既定）
+
+C# 側はローダーに依存しないコア（`AetherCore`、`IAetherHost`）と、ローダーごとの入口（`src/Aether.Managed/Loaders/`）に分かれています。
+どちらを組み込むかはビルド時に選びます（`-p:Loader=BepInEx|Ksl|None`。`None` はコアだけのコンパイル確認）。`scripts\deploy.ps1` の既定は `-Loader BepInEx` です。
+
+| | BepInEx（既定） | KSL |
+|---|---|---|
+| 入口 | `Loaders/BepInEx/AetherPlugin.cs` | `Loaders/Ksl/AetherKslMod.cs` |
+| 必要なもの | ゲームに BepInEx 5（Mono、x64）を導入 | KSL SDK、`maykr.exe`、ビルドキー（署名） |
+| Aether の置き場所 | `BepInEx\plugins\Aether\`（`Aether.dll`、`native\`、`shaders\`、`hdrp\`、`logs\`、`captures\`、`benchmarks\`） | `kino\mods\Aether.ksm` と `kino\mods\Aether\` |
+| 設定 | `BepInEx\config\Aether\aether.json` | `kino\config\Aether\aether.json` |
+| 署名 / サーバー | 不要 | 必要 |
+| ローダー側の UI | なし（Aether のオーバーレイ F10 のみ） | KSL のパネルに状態表示 |
+
+BepInEx の導入（この環境で行った手順）：
+
+- 入手元：`github.com/BepInEx/BepInEx` のリリース v5.4.23.6、`BepInEx_win_x64_5.4.23.6.zip`（642,076 バイト）。
+- ゲームのフォルダーに `BepInEx\`、`doorstop_config.ini`、`.doorstop_version` を置く。
+- **プロキシ DLL は `winhttp.dll` ではなく `version.dll` という名前で置く。** ゲームのフォルダーの `winhttp.dll` は KSL 本体なので上書きしない（Doorstop はどちらの名前でも動く）。KSL と BepInEx は共存する（確認済み）。
+- 確認：`BepInEx\LogOutput.log` に `Loading [Aether 0.1.0]`、MCP の `get_status` の `managed.loader` が `BepInEx 5.4.23.6`。
+- `deploy.ps1 -Loader BepInEx` は、KSL 側に残っている `kino\mods\Aether.ksm` / `Aether.dll` を削除します（2 つのローダーから二重に起動しないため）。
+
+以下の「必要なもの」「ビルド」「配置」のうち KSL に関する記述は、`-Loader Ksl` を使う場合のものです。
 ## 必要なもの
 
 | もの | 用途 | 備考 |

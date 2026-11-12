@@ -43,7 +43,7 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 | `reload_shader` | なし | シェーダーをディスクから読み直してパイプラインを作り直し、コンパイラの出力を返す |
 | `capture_frame` | `withOverlay`、`includeImage` | 次のフレームを PNG に保存してパスを返す（`includeImage` で画像も） |
 | `capture_render_graph` | なし | レンダーグラフを JSON ファイルに保存 |
-| `run_benchmark` | `seconds`（1〜600）、`label`、`wait` | 指定秒数だけ計測して JSON に保存し、結果を返す（平均 FPS、1% low、フレーム時間、GPU 時間、VRAM の開始 / 終了 / 最大、リソース統計、レンダーグラフ） |
+| `run_benchmark` | `seconds`（1〜600）、`label`、`wait`、`vsync`（`false` で計測中だけ VSync とフレームレート上限を外す） | 指定秒数だけ計測して JSON に保存し、結果を返す（平均 FPS、1% low、フレーム時間、GPU 時間、VRAM の開始 / 終了 / 最大、リソース統計、レンダーグラフ） |
 
 ## 権限
 
@@ -81,3 +81,18 @@ D3D12 のデバイス、リソースの寿命、任意のコードの実行に�
 1 行 1 JSON。要求 `{"id":1,"method":"get_gpu_info","params":{},"control":false}`、
 応答 `{"id":1,"ok":true,"result":{...}}` または `{"id":1,"ok":false,"error":{"code":"...","message":"..."}}`。
 メソッド名はツール名と同じです（ほかに `get_capture`、`stop_benchmark`）。実装は `src/Aether.Native/Ipc/`。
+
+## Phase 3 での変更（2026-11-12）
+
+- `set_render_mode` の `mode`：`aether`（既定。Aether がゲームのレンダーパイプラインになり、HDRP は生成されない）、`standalone`（`aether` と同じ。以前の名前）、`hdrp`（純正のレンダラー。参照用）、`compare`（左が純正、右が Aether）。実行中に切り替えられる。
+- `set_render_mode` の `debugView` に `sun`、`ambient`、`reflection` を追加。
+- `set_render_feature` の機能に `ssao`、`antialiasing`、`bloom`、`motionBlur` を追加（どれも、ゲーム側の設定がオンのときだけ働く）。
+- `get_material_info detail=survey` に追加：`volumes`（シーンのボリューム）、`propertyBlocks`（レンダラーごとの上書き）、`transparentMaterials`、`screenProbes`（画面上の点の下のマテリアル）、ライトの位置と HDRP 用データ、`environment.hostExposureMultiplier`（純正のパイプラインが動いているときの露出の実測値）。
+- `get_scene_info` の `aetherRenderer` に `instancing`（まとめたドロー数）と `reflectionProbes` を追加。
+- `get_status` の `managed.sceneCapture` に、LOD グループ数、画面外の影キャスター数、スキンメッシュのバッファー数、動的メッシュ数を追加。
+
+## Phase 3 での変更 その 2（2026-11-12）
+
+- `set_render_feature` の機能に `ssr`（画面空間反射。ゲームのボリュームで有効、かつ TAA が動いているときだけ働く）と `particles`（ゲームのパーティクルとタイヤスモーク）を追加。
+- `get_scene_info` の `aetherRenderer` に `particles`（送られた数、バッチ数、描いた数）を追加。
+- `get_status` の `managed.sceneCapture` に、パーティクル数（うちタイヤスモーク、パーティクルシステム数）と、メインスレッドの時間（`main thread ms`：走査、毎フレームの更新、フレームの送出）を追加。

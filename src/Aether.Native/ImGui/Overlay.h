@@ -22,6 +22,8 @@ public:
 	void Toggle() { SetVisible(!visible_.load()); }
 	bool WantsFrame() const;  // visible, or an approval prompt is waiting
 	bool WantsInput() const { return WantsFrame() && (wantsMouse_.load() || wantsKeyboard_.load()); }
+	// bit 0: the overlay uses the mouse, bit 1: the keyboard
+	int InputFlags() const { return WantsFrame() ? (wantsMouse_.load() ? 1 : 0) | (wantsKeyboard_.load() ? 2 : 0) : 0; }
 
 	// ---- main thread: subclass the game window for input and the hotkey (restored by DetachWindow)
 	void AttachWindow(HWND hwnd);

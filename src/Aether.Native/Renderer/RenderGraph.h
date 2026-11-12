@@ -85,6 +85,7 @@ private:
 	void Error(const std::string& what);
 
 	uint64_t frame_ = 0;
+	bool grewThisFrame_ = false; // Compile created a pooled texture
 	std::vector<Resource> resources_;
 	std::vector<Pass> passes_;
 	std::vector<PassResult> results_;

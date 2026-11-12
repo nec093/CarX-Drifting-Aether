@@ -241,6 +241,7 @@ void ValidationScene::Register() {
 		d.instance = i.handle;
 		d.mesh = i.mesh;
 		d.flags = i.flags;
+		d.renderingLayerMask = 1;
 		d.materialCount = 1;
 		store.UpsertInstance(&d, &i.material);
 	}
@@ -280,6 +281,15 @@ void ValidationScene::SubmitFrame(uint32_t width, uint32_t height, uint32_t fram
 	f.time = time;
 	f.exposure = 0.35f;
 	f.ambientIntensity = 1;
+	// exercise the host-driven features: ambient occlusion and four shadow cascades
+	f.aoIntensity = 1.0f;
+	f.aoRadius = 1.0f;
+	f.aoDirectStrength = 0.25f;
+	f.shadowDistance = 60.0f;
+	f.shadowCascades = 4;
+	f.shadowSplits[0] = 0.1f;
+	f.shadowSplits[1] = 0.25f;
+	f.shadowSplits[2] = 0.5f;
 	// a flat ambient term (the constant band only): unity_SHA*.w
 	f.ambientSH[0][3] = 0.25f;
 	f.ambientSH[1][3] = 0.30f;
@@ -297,6 +307,7 @@ void ValidationScene::SubmitFrame(uint32_t width, uint32_t height, uint32_t fram
 		frameInstances_.push_back(fi);
 	}
 	AeLight lights[2] = {};
+	lights[0].layerMask = lights[1].layerMask = 0xFFFFFFFFu; // no light layers in the validation scene
 	// the sun travels towards +X and down: shadows fall on the +X side of the boxes
 	const Vec3 travel = Normalize({0.8f, -0.6f, 0.0f});
 	lights[0].type = kAeLightDirectional;

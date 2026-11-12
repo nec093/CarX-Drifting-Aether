@@ -40,8 +40,11 @@ namespace Aether {
 		[DllImport(Dll)] public static extern int Aether_OverlayVisible();
 		[DllImport(Dll)] public static extern void Aether_SetOverlayVisible(int visible);
 		[DllImport(Dll)] public static extern int Aether_OverlayWantsInput();
+		[DllImport(Dll)] public static extern int Aether_OverlayInputFlags();
+		[DllImport(Dll)] public static extern int Aether_BenchmarkWantsUncapped();
 
 		// the scene data contract (SceneCapture/Contract.cs)
+		[DllImport(Dll, CharSet = CharSet.Ansi)] public static extern double Aether_SettingNumber(string key, double fallback);
 		[DllImport(Dll)] public static extern int Aether_SceneContractVersion();
 		[DllImport(Dll)] public static extern int Aether_SceneStructSize(int which);
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneUpsertMesh(AeMeshDesc* desc, AeSubMesh* subMeshes);
@@ -50,6 +53,8 @@ namespace Aether {
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneUpsertInstance(AeInstanceDesc* desc, uint* materials);
 		[DllImport(Dll)] public static extern void Aether_SceneDestroy(int kind, uint handle);
 		[DllImport(Dll)] public static extern void Aether_SceneClear();
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneSetProbes(AeProbe* probes, uint count, uint structSize);
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneSubmitParticles(AeParticleBatch* batches, uint batchCount, AeParticle* particles, uint particleCount, uint particleSize);
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneSubmitFrame(AeFrame* frame, AeFrameInstance* instances, uint instanceCount, AeLight* lights, uint lightCount);
 		[DllImport(Dll)] public static extern int Aether_GetRenderMode();
 		[DllImport(Dll)] public static extern int Aether_DevCaptureFlags();

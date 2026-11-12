@@ -83,9 +83,13 @@ public:
 	std::string StartBenchmark(const std::string& label, double seconds, const std::wstring& outputDir, json context);
 	void StopBenchmark(); // finish early (writes the result with what was recorded)
 	json BenchmarkStatus(); // {state: idle|running|done, progress, result?}
+	// The next benchmark (and only while it runs) wants the host's VSync and frame rate cap off.
+	void SetBenchmarkUncapped(bool uncapped) { benchmarkUncapped_.store(uncapped); }
+	bool BenchmarkWantsUncapped();
 
 private:
 	void FinishBenchmarkLocked();
+	std::atomic<bool> benchmarkUncapped_{false};
 
 	std::mutex mutex_;
 	std::vector<FrameSample> ring_;

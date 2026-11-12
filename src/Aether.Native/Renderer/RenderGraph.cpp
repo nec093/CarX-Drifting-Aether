@@ -3,6 +3,7 @@
 
 namespace aether {
 
+static const uint64_t kPoolKeepAfterGrowth = 2; // ... and this long in a frame that had to create a texture (see End)
 static const uint64_t kPoolKeepFrames = 120; // a pooled texture nobody asked for this long is retired
 
 static const char* StateName(D3D12_RESOURCE_STATES s) {
@@ -165,6 +166,12 @@ bool RenderGraph::Compile() {
 			}
 			pool_.push_back({texture, frame_, -1, 0});
 			found = int(pool_.size() - 1);
+			grewThisFrame_ = true;
+			if ((r.desc.renderTarget || r.desc.depthStencil) && texture->target == UINT32_MAX) {
+				// (the texture stays in the pool and is retired like any other; nothing is drawn this frame)
+				Error("no render target / depth view left for the transient " + r.name);
+				return false;
+			}
 		}
 		PoolEntry& e = pool_[size_t(found)];
 		e.busyFrame = frame_;
@@ -255,8 +262,13 @@ void RenderGraph::Execute(ID3D12GraphicsCommandList* list, const std::function<v
 
 void RenderGraph::End(UINT64 fence) {
 	GpuResources& gpu = GpuResources::Get();
+	// A frame that had to create textures usually follows a change of the picture's size (the window being resized
+	// makes a new size every frame): what the frames before used is then of no use any more, and keeping every size
+	// for kPoolKeepFrames ran out of render target views (and of memory) within a second of dragging the window's edge.
+	const uint64_t keep = grewThisFrame_ ? kPoolKeepAfterGrowth : kPoolKeepFrames;
+	grewThisFrame_ = false;
 	for (size_t i = 0; i < pool_.size();) {
-		if (pool_[i].lastUsedFrame + kPoolKeepFrames < frame_) {
+		if (pool_[i].lastUsedFrame + keep < frame_) {
 			gpu.RetireTexture(std::move(pool_[i].texture), fence, frame_);
 			pool_.erase(pool_.begin() + ptrdiff_t(i));
 		} else {

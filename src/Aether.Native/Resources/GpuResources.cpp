@@ -6,7 +6,7 @@
 
 namespace aether {
 
-static const uint32_t kRtvHeapSize = 64, kDsvHeapSize = 64;
+static const uint32_t kRtvHeapSize = 512, kDsvHeapSize = 128; // (CPU only heaps: a view costs a few bytes)
 static const size_t kArenaSize = 8u << 20; // per frame in flight: constants, instance and light data
 static const size_t kMaxArenas = 8;
 

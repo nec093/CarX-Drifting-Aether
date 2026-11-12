@@ -79,12 +79,15 @@ namespace Aether {
 			}
 		}
 
-		// ---- videos and in-game advertising (Anzu) on Direct3D 12
-		// Found in the stability investigation (docs/development/stability-investigation.md): with the D3D12 debug layer
-		// on, Unity's upload of a video frame (A8_UNORM, 1080x608) goes to a texture that was replaced meanwhile, and the
-		// device is lost or the player crashes. The owner of the project allowed switching these off on DX12.
-		// Opt out with the file kino/config/Aether/keep-game-videos.
-		private static bool videosOff_;
+		// ---- video playback on Direct3D 12
+		// docs/development/stability-investigation.md: the game's advertising SDK (Anzu) plays its video adverts with a
+		// Unity VideoPlayer. On DX12 (which neither the game nor Anzu's native renderer - D3D9 / D3D11 / OpenGL only -
+		// is made for), when the clip changes Unity uploads a video frame (A8_UNORM, 1080x608) to a plane texture that
+		// was replaced meanwhile: an invalid copy that the debug layer reports and that loses the device or crashes the
+		// player. On DX12 the video players are therefore switched off. Image adverts and the rest of Anzu are left alone.
+		//   keep-game-videos   (file in Aether's config folder) switches nothing off
+		//   disable-game-ads   additionally disables Anzu's own components (what the investigation's runs I - K used)
+		private static bool videosOff_, adsOff_;
 		private static float nextVideoCheck_;
 		private static readonly HashSet<string> videoTypes_ = new HashSet<string>();
 		private static int videosDisabled_;
@@ -92,11 +95,13 @@ namespace Aether {
 		public static string VideoStatus { get; private set; } = "not applied";
 
 		public static void InitVideos(string configDir) {
-			videosOff_ = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 && !File.Exists(Path.Combine(configDir, "keep-game-videos"));
+			bool dx12 = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12;
+			videosOff_ = dx12 && !File.Exists(Path.Combine(configDir, "keep-game-videos"));
+			adsOff_ = videosOff_ && File.Exists(Path.Combine(configDir, "disable-game-ads"));
 			VideoStatus = videosOff_ ? "nothing switched off yet" : "not applied";
 		}
 
-		/// <summary>Every two seconds: video players and Anzu's components that are enabled get disabled.</summary>
+		/// <summary>Every two seconds: enabled video players (and, if asked for, Anzu's components) get disabled.</summary>
 		public static void UpdateVideos() {
 			if (!videosOff_ || Time.unscaledTime < nextVideoCheck_) {
 				return;
@@ -109,7 +114,7 @@ namespace Aether {
 						continue;
 					}
 					string type = b.GetType().FullName ?? "";
-					if (type == "UnityEngine.Video.VideoPlayer" || type.IndexOf("Anzu", StringComparison.OrdinalIgnoreCase) >= 0) {
+					if (type == "UnityEngine.Video.VideoPlayer" || (adsOff_ && type.IndexOf("Anzu", StringComparison.OrdinalIgnoreCase) >= 0)) {
 						b.enabled = false;
 						videoTypes_.Add(type);
 						++count;
@@ -118,7 +123,7 @@ namespace Aether {
 				if (count > 0) {
 					videosDisabled_ += count;
 					VideoStatus = "switched off " + videosDisabled_ + " components: " + string.Join(", ", videoTypes_);
-					Native.Log(2, "Game videos / advertising on DX12: " + VideoStatus);
+					Native.Log(2, "Video playback on DX12: " + VideoStatus);
 				}
 			} catch (Exception e) {
 				VideoStatus = "failed: " + e.GetType().Name + ": " + e.Message;

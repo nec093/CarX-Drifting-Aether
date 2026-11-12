@@ -1,5 +1,7 @@
 # D3D12 リソース破損の調査（2026-11-11）
 
+> **状態：クローズ（2026-11-12）。** 原因は ANZU の動画広告（DX12 非対応）と判断し、DX12 では動画を止める対処で確定。経緯と残した条件は 10 章。
+
 対象：D3D12 デバッグレイヤー付き（`launch-game.ps1 -DebugLayer`）でガレージに放置すると、Aether が動いているときに
 Unity が落ちる問題（`docs/development/phase2-report.md` 1 章）。RTX 4070 Ti、1920×1080、各回 300 秒。
 
@@ -86,7 +88,7 @@ Unity が落ちる問題（`docs/development/phase2-report.md` 1 章）。RTX 40
 
 `GameDx12Workarounds`（DX12 のときだけ）：2 秒ごとに、有効な `UnityEngine.Video.VideoPlayer` と、型名に `Anzu` を含むコンポーネントを無効にする。
 ガレージで無効になったもの：`Services.Anzu.AnzuUnityWrapper`、`Services.Anzu.Obstruction.AnzuObstructionItem`、`VideoPlayer` 1 個。
-`kino\config\Aether\keep-game-videos` というファイルを置くと無効化しない。状態は KSL のパネルと Aether のログ。
+2026-11-12 から既定でオフ：設定フォルダーに `disable-game-videos` というファイルを置いたときだけ働く（実験 I〜K の時点では既定でオンだった）。状態は Aether のログ。
 
 影響：ガレージの広告パネルと動画スクリーンが更新されなくなる。広告の配信が止まる。コースでの影響は未確認。
 
@@ -112,3 +114,85 @@ hdrp の 2 回目から、KSL が Mod を読み込まなくなりました（`ki
 - `scripts\soak-test.ps1`：条件を指定して起動、放置、結果を 1 行の JSON に記録。繰り返し可。
 - `kino\config\Aether\dev-options.json`（`src/Aether.Native/Core/DevOptions.h`）：実験用のスイッチ。ファイルが無ければ何も変えない。
   `directSubmit`、`beginFlags` / `endFlags` / `sceneFlags`、`recordOnly`、`sleepMs`、`captureFlags`、`statsSeconds`（提出統計のログ）。
+
+## 8. 追記（2026-11-12）：再調査の結果と現在の対処
+
+前章までの「Aether がシーンを扱っているときだけ起きる」「hdrp は安定」という判断は、回数が少なすぎたための誤りでした。以下に置き換えます。
+
+### 追加の実験（BepInEx、デバッグレイヤー有、動画有効、300 秒）
+
+| 条件 | モード | 異常 / 回数 |
+|---|---|---|
+| シーンイベントのフラグなし（`sceneFlags=0`） | compare | 1 / 2（クラッシュ。両方で描画順の検証エラー 60 件） |
+| シーンイベントを `CommandBuffer` 経由で発行 | compare | 1 / 1（約 30 秒で A8 のエラー、デバイス喪失） |
+| 通常（三角形 + GPU 計測） | hdrp | 3 / 3（クラッシュ） |
+| GPU 計測のみ | hdrp | 1 / 2 |
+| 三角形のみ | hdrp | 2 / 3（クラッシュ） |
+| 三角形のみ、キューへの `Signal` なし | hdrp | 1 / 1（クラッシュ） |
+| 三角形を記録するだけ（提出なし） | hdrp | 2 / 3（クラッシュ 1、検証エラー 1） |
+| `IDXGISwapChain::GetBuffer` と解放だけ | hdrp | 1 / 3 |
+| 自前のアロケーター / リストの Reset と Close だけ | hdrp | 2 / 3 |
+
+- シーンレンダラー、GPU での実行、`ExecuteCommandList`、イベントのフラグ、`Signal`、スワップチェーンへのアクセスは、どれも必須条件ではない。
+- Unity のリソースに一切触れない処理（自前のリストの Reset / Close）だけでも異常が出る。Aether が Unity のオブジェクトを壊しているとは考えにくい。
+- 「Aether が何もしない」条件を長時間（15 分 × 3）回す対照実験は、途中で打ち切った（未実施）。したがって「Aether が無くても起きる」ことは**確認していない**。
+
+### ANZU の中身（ゲームに入っている DLL の文字列とエクスポートから）
+
+- `anzu.dll` は Unity のネイティブ描画プラグイン（`UnityPluginLoad`、テクスチャーの作成 / 更新 / 破棄のコールバック）。対応 API の文字列は `direct3d9`、`direct3d11`、`direct3d11_SRV`、`opengl` だけで、D3D12 は無い。
+- 動画広告は Unity の `VideoPlayer` で再生する（`AnzuUtilities.dll`：`Anzu.Internal.VideoPlayerHost`、`AnzuRenderTexture`、`CopyVideoTextureAndUpdateProgress`、`DestroyUnityVideoObjects`）。ガレージの `VideoPlayer` 1 個がこれにあたる。
+- 画像広告は C# 側でテクスチャーに書く経路（`LoadRawTextureData` / `Apply` / `SetPixels32`）を持つ。
+
+### 原因についての現在の判断
+
+- **確認できた事実**：壊れるのは `VideoPlayer` の動画フレーム（A8、1080×608 = 輝度プレーン）のアップロード。動画と ANZU を止めると出ない（7 / 7）。ゲームも ANZU も DX12 を想定していない。画面上でも、ANZU の動画が切り替わる場面で止まる。
+- **推定**：DX12 では、動画の切り替えでプレーンのテクスチャーが作り直されるときに、フレームのアップロードとの順序が食い違う（Unity / ANZU 側の競合）。Aether の処理は描画スレッドのタイミングを変えて頻度を上げているだけ。
+- Aether 側の誤りとして確定したものは 3 章のとおり（修正済み）。それらは破損の原因ではなかった。
+
+### 現在の対処（`GameDx12Workarounds`）
+
+DX12 では、有効な `UnityEngine.Video.VideoPlayer` を 2 秒ごとに探して無効にする（既定）。ANZU の画像広告とそのほかのコンポーネントには触れない。
+
+| 設定フォルダーに置くファイル | 動作 |
+|---|---|
+| なし | `VideoPlayer` だけ無効化（既定） |
+| `keep-game-videos` | 何も無効化しない |
+| `disable-game-ads` | `VideoPlayer` に加えて、型名に `Anzu` を含むコンポーネントも無効化（実験 I〜K と同じ） |
+
+**検証の状態**：実験 I〜K で安定を確認したのは「`VideoPlayer` と ANZU の両方を無効」にした構成（compare 3 / 3、aether 3 / 3、hdrp 1 / 1）。
+現在の既定である「`VideoPlayer` だけ無効」は、通常起動で無効化されること（`Video playback on DX12: switched off 1 components`）、エラー 0、正常終了を 1 回確認しただけで、
+**デバッグレイヤー付きの 5 分 × 3 回の確認はしていない**（これ以上の実験は行わないという指示による）。成功基準は満たしていない。
+
+## 9. Phase 3 での追記（2026-11-12）
+
+- （この時点の記述。10 章でクローズ）D3D12 の破損問題は未解決の既知の問題のままです。Phase 3 ではこの問題の追加実験はしていません。`VideoPlayer` の停止は残しています。
+- Phase 3 の作業中（ガレージ、`aether` / `hdrp` モードで数十回の起動、各数分）に、新しいクラッシュ・デバイスロスト・検証エラーは記録されていません。長時間の放置テストはしていないので、安定したとは言えません。
+- 既定のモードでは HDRP が生成されなくなりました（`docs/architecture/hdrp-independence.md`）。8 章までの実験はすべて HDRP が動いている構成のものです。HDRP なしの構成で破損問題が出るかどうかは**未確認**です。
+- 描画の不具合として報告された「頂点が暴れる」「一部が表示されない」は、破損問題とは別の原因でした（スキンメッシュのバッファーの追跡、実行時に作られるメッシュの扱い。`phase3-report.md` の 2 章）。
+
+## 10. クローズ（2026-11-12）
+
+プロジェクトの所有者の判断で、この問題は **ANZU の動画広告が原因**としてクローズします。
+
+**判断の根拠（8 章までの事実）**
+
+- 壊れるのは ANZU が Unity の `VideoPlayer` で再生する動画フレームのアップロード（A8、1080×608）。
+- 動画と ANZU を止めると出ない（7 / 7）。
+- ANZU のネイティブ描画は D3D9 / D3D11 / OpenGL だけで、D3D12 に対応していない。ゲーム自体も DX12 での起動を想定していない。
+- Unity のリソースに触れない処理だけでも発生し、Aether 自身の D3D12 の使い方に違反は見つかっていない。
+- `VideoPlayer` を止める対処を入れてから、Phase 3 の作業（ガレージとロビー、数十回の起動と再起動、ウィンドウのリサイズ、モードの切り替え）で、この破損によるクラッシュ・デバイスロストは一度も記録されていない。
+
+**確定した対処**
+
+DX12 では `VideoPlayer` を止める（`GameDx12Workarounds`、既定）。切り替えのファイル（`keep-game-videos`、`disable-game-ads`）は 8 章のまま。これは Aether 側の恒久的な仕様とする。
+
+**クローズ時点で確かめていないこと（記録として残す）**
+
+- 「動画の切り替え時に Unity / ANZU 側で順序が食い違う」という仕組みは推定で、Unity 内部で確かめたものではない。
+- 既定の対処（`VideoPlayer` だけ無効）での、デバッグレイヤー付き 5 分 × 3 回の確認はしていない。
+- Aether なしで同じ破損が出るかどうかの対照実験はしていない。
+- コース走行中、および長時間の連続動作は見ていない。
+
+**再オープンの条件**
+
+`VideoPlayer` を止めた状態で、同じ系統の異常が出たとき：`CopyTextureRegion` の検証エラー、`pResource ... is corrupt`、Unity の遅延解放リストでのクラッシュ（例外 `0x87D`）、原因不明のデバイスロスト。そのときはクラッシュダンプと `Player.log` を取ってから、この文書の 5 章の候補に戻る。

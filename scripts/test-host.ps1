@@ -102,7 +102,7 @@ if ($code -eq 0) {
 	Check 'scene store: 8 instances, 1 mesh, 8 materials, no contract errors' ($stats.instances.registered -eq 8 -and $stats.meshes.count -eq 1 -and $stats.materials.count -eq 8 -and $stats.contractErrors -eq 0) ($stats | ConvertTo-Json -Compress -Depth 4)
 	Check 'scene store: destroys and the scene clear were applied' ($stats.commands.destroys -ge 1 -and $stats.commands.sceneClears -eq 1)
 	$gpu = ($out | Where-Object { $_ -match '^gpu resources: ' }) -replace '^gpu resources: ', '' | ConvertFrom-Json
-	Check "GPU resource manager: retirements done ($($gpu.objectsRetired) objects, $($gpu.pendingRetirements) pending), descriptors $($gpu.descriptors.srvUsed) / peak $($gpu.descriptors.srvPeak)" ($gpu.objectsRetired -gt 0 -and $gpu.pendingRetirements -lt 20 -and $gpu.descriptors.srvUsed -lt 200)
+	Check "GPU resource manager: retirements done ($($gpu.objectsRetired) objects, $($gpu.pendingRetirements) pending), descriptors $($gpu.descriptors.srvUsed) / peak $($gpu.descriptors.srvPeak)" ($gpu.objectsRetired -gt 0 -and $gpu.pendingRetirements -lt 20 -and $gpu.descriptors.srvUsed -lt 400)
 }
 if ($Keep) { Write-Host "  data: $data" } else { Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue }
 

@@ -16,6 +16,13 @@ struct DevOptions {
 	bool directSubmit = false;
 	// Event configuration overrides, -1 = Aether's default. Flags are UnityD3D12EventConfigFlagBits.
 	int beginFlags = -1, endFlags = -1, sceneFlags = -1;
+	// Completion is taken from the markers alone: Aether's own fence is never signalled on the host's queue.
+	bool noSignal = false;
+	// The frame-end event does exactly one kind of D3D12 call and nothing else:
+	//   1 = IDXGISwapChain::GetBuffer on the host's swap chain (and Release)
+	//   2 = Reset and Close of one command allocator / list of Aether's own (nothing recorded, nothing submitted)
+	//   3 = CreateRenderTargetView on the back buffer (GetBuffer included)
+	int probe = 0;
 	// Lists are recorded and closed but never submitted (isolates recording from submission).
 	bool recordOnly = false;
 	// The frame-end event only waits this long on the render thread (no D3D12 call of Aether's is needed for it):
@@ -48,6 +55,8 @@ struct DevOptions {
 		endFlags = j.value("endFlags", endFlags);
 		sceneFlags = j.value("sceneFlags", sceneFlags);
 		recordOnly = j.value("recordOnly", recordOnly);
+		probe = j.value("probe", probe);
+		noSignal = j.value("noSignal", noSignal);
 		sleepMs = j.value("sleepMs", sleepMs);
 		captureFlags = j.value("captureFlags", captureFlags);
 		statsSeconds = j.value("statsSeconds", statsSeconds);
@@ -55,7 +64,7 @@ struct DevOptions {
 	}
 
 	json ToJson() const {
-		return {{"source", source}, {"directSubmit", directSubmit}, {"beginFlags", beginFlags}, {"endFlags", endFlags}, {"sceneFlags", sceneFlags}, {"recordOnly", recordOnly}, {"sleepMs", sleepMs}, {"captureFlags", captureFlags},
+		return {{"source", source}, {"directSubmit", directSubmit}, {"beginFlags", beginFlags}, {"endFlags", endFlags}, {"sceneFlags", sceneFlags}, {"recordOnly", recordOnly}, {"probe", probe}, {"noSignal", noSignal}, {"sleepMs", sleepMs}, {"captureFlags", captureFlags},
 			{"statsSeconds", statsSeconds}};
 	}
 };
