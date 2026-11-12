@@ -46,6 +46,8 @@ namespace Aether {
 			// Unity skins into more than one buffer per renderer and alternates between them from frame to frame: each
 			// buffer is a mesh of its own on the native side, and the instance is pointed at this frame's one
 			public Dictionary<IntPtr, uint> skinnedVariants;
+			public uint rayKey;                 // skinned: the handle its ray tracing tree is kept under (every vertex buffer variant is traced as this)
+			public bool rayIndicesSent, rayReading;
 		}
 
 		private sealed class TrackedMaterial {
@@ -158,6 +160,7 @@ namespace Aether {
 			order_.Clear();
 			skinnedTracked_.Clear();
 			meshes_.Clear();
+			ResetGeometry();
 			dynamicMeshes_.Clear();
 			materials_.Clear();
 			textures_.Clear();
@@ -268,6 +271,10 @@ namespace Aether {
 					scanSetChanged_ = true;
 					if (t.skinned != null) {
 						skinnedTracked_.Remove(t);
+						if (t.rayKey != 0) {
+							Native.Aether_SceneMeshForget(t.rayKey); // (its ray tracing tree goes with it)
+							t.rayKey = 0;
+						}
 					}
 				}
 			}
@@ -434,6 +441,9 @@ namespace Aether {
 			foreach (uint h in remove) {
 				table.Remove(h);
 				Native.Aether_SceneDestroy(kind, h);
+				if (kind == AeConst.KindMesh) {
+					geometryAsked_.Remove(h);
+				}
 			}
 		}
 
@@ -1049,6 +1059,9 @@ namespace Aether {
 					return false;
 				}
 				t.skinnedVariants[pointer] = handle;
+				if (t.rayKey != 0) {
+					Native.Aether_SceneMeshAlias(handle, t.rayKey);
+				}
 				t.meshHandle = handle;
 				t.skinnedPointer = pointer;
 				t.skinnedFailures = 0;
@@ -1148,6 +1161,9 @@ namespace Aether {
 			fixed (AeSubMesh* p = subMeshes_) {
 				if (Native.Aether_SceneUpsertMesh(&d, p) != 0) {
 					meshes_[d.mesh] = mesh;
+					if (stream0 == IntPtr.Zero && !dynamicMeshes_.ContainsKey(handle) && geometryAsked_.Add(handle)) {
+						geometryQueue_.Enqueue(handle); // (its triangles for ray tracing: read back from the GPU, a few meshes at a time)
+					}
 				} else {
 					++UnsupportedFormats;
 					Native.Log(2, "Mesh not drawn: " + mesh.name + " was refused by the renderer (" + d.vertexCount + " vertices, " + indexCount + " indices, " + streams + " streams)");
@@ -1337,6 +1353,239 @@ namespace Aether {
 			RefreshOwnedMaterials();
 			ProcessPending();
 			UpdateDynamicMeshes();
+			UpdateGeometry();
+			UpdateSkinnedGeometry();
+		}
+
+		// ---- geometry for ray tracing. The game's meshes cannot be read on the CPU (not marked readable), so their
+		// vertex and index buffers are read back from the GPU (Unity's asynchronous readback: no stall), once per mesh, and
+		// handed to the native side, which builds the ray tracing tree from them. Skinned and run-time built meshes are
+		// not sent: what they hold changes.
+		private readonly Queue<uint> geometryQueue_ = new Queue<uint>();
+		private readonly HashSet<uint> geometryAsked_ = new HashSet<uint>();
+		private int geometryInFlight_, geometrySent_, geometryFailed_;
+		private uint geometryGeneration_;
+		private const int GeometryAtOnce = 8;
+		public string GeometryStatus => skinnedRayReads_ + " skinned poses read, " + geometrySent_ + " sent, " + geometryQueue_.Count + " waiting, " + geometryInFlight_ + " being read, " + geometryFailed_ + " failed";
+
+		// ---- skinned meshes for ray tracing. Their vertices change every frame (Unity skins on the GPU into the buffer the
+		// renderer draws from), so the tree is built once from the first pose read back, and after that the vertices are
+		// read back again and again, a couple of renderers per frame in turn, and the tree is refitted around them. The
+		// renderer's vertex buffers take turns (one per frame) under different mesh handles: all are traced as one tree.
+		private int skinnedRayCursor_;
+		private int skinnedRayReads_;
+		private int skinnedReadsPerFrame_ = 0;
+		private float nextSkinnedSetting_;
+
+		private unsafe void UpdateSkinnedGeometry() {
+			// (how many per frame is Aether's own setting, none without ray traced reflections; looked up once a second)
+			if (Time.unscaledTime >= nextSkinnedSetting_) {
+				nextSkinnedSetting_ = Time.unscaledTime + 1.0f;
+				skinnedReadsPerFrame_ = Native.Aether_SettingNumber("rayTracedReflections", 1) > 0.5 ? (int)Math.Round(Native.Aether_SettingNumber("skinnedRayUpdates", 0)) : 0;
+			}
+			int count = skinnedTracked_.Count;
+			int first = count > 0 ? skinnedRayCursor_ % count : 0;
+			for (int step = 0, started = 0; step < count && started < skinnedReadsPerFrame_; ++step) {
+				Tracked t = skinnedTracked_[(first + step) % count];
+				if (!t.registered || t.mesh == null || t.skinned == null || t.rayReading || !meshes_.ContainsKey(t.meshHandle) || !t.renderer.isVisible) {
+					continue;
+				}
+				Mesh mesh = t.mesh;
+				uint generation = geometryGeneration_;
+				if (t.rayKey == 0) {
+					t.rayKey = VariantHandle(mesh, t.renderer, 7777777);
+					t.rayIndicesSent = false;
+					Native.Aether_SceneMeshChanging(t.rayKey);
+					if (t.skinnedVariants != null) {
+						foreach (uint variant in t.skinnedVariants.Values) {
+							Native.Aether_SceneMeshAlias(variant, t.rayKey);
+						}
+					}
+				}
+				uint key = t.rayKey;
+				GraphicsBuffer vb = null;
+				try {
+					vb = t.skinned.GetVertexBuffer();
+				} catch (Exception) {
+				}
+				if (vb == null) {
+					continue;
+				}
+				// where the positions are in what skinning writes: at the start, three floats (when the buffer has the mesh's
+				// own layout for stream 0: where the mesh has them)
+				uint stride = (uint)vb.stride, positionOffset = 0, positionFormat = 6; // DXGI_FORMAT_R32G32B32_FLOAT
+				if (vb.stride == mesh.GetVertexBufferStride(0)) {
+					attributes_.Clear();
+					mesh.GetVertexAttributes(attributes_);
+					foreach (VertexAttributeDescriptor a in attributes_) {
+						if (a.attribute == VertexAttribute.Position && a.stream == 0) {
+							positionOffset = (uint)mesh.GetVertexAttributeOffset(a.attribute);
+							byte format = DxgiFormat(a.format, a.dimension);
+							positionFormat = format != 0 ? format : positionFormat;
+						}
+					}
+				}
+				if (!t.rayIndicesSent) {
+					int subMeshes = mesh.subMeshCount;
+					GraphicsBuffer ib = null;
+					try {
+						ib = mesh.GetIndexBuffer();
+					} catch (Exception) {
+					}
+					if (ib == null || subMeshes < 1) {
+						vb.Dispose();
+						continue;
+					}
+					AeSubMesh[] subs = new AeSubMesh[subMeshes];
+					for (int i = 0; i < subMeshes; ++i) {
+						SubMeshDescriptor sm = mesh.GetSubMesh(i);
+						subs[i].indexStart = (uint)sm.indexStart;
+						subs[i].indexCount = sm.topology == MeshTopology.Triangles ? (uint)sm.indexCount : 0u;
+						subs[i].baseVertex = (uint)sm.baseVertex;
+					}
+					uint indexStride = mesh.indexFormat == IndexFormat.UInt16 ? 2u : 4u;
+					t.rayIndicesSent = true;
+					AsyncGPUReadback.Request(ib, (AsyncGPUReadbackRequest r) => {
+						if (!r.hasError && generation == geometryGeneration_) {
+							var data = r.GetData<byte>();
+							fixed (AeSubMesh* p = subs) {
+								Native.Aether_SceneMeshIndices(key, Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data), (uint)data.Length, indexStride, p, (uint)subs.Length);
+							}
+						} else {
+							t.rayIndicesSent = false;
+						}
+						ib.Dispose();
+					});
+				}
+				t.rayReading = true;
+				++started;
+				AsyncGPUReadback.Request(vb, (AsyncGPUReadbackRequest r) => {
+					t.rayReading = false;
+					if (!r.hasError && generation == geometryGeneration_) {
+						var data = r.GetData<byte>();
+						Native.Aether_SceneMeshVertices(key, Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data), (uint)data.Length, stride, positionOffset, positionFormat, 0, 0, 0);
+						++skinnedRayReads_;
+					}
+					vb.Dispose();
+				});
+				skinnedRayCursor_ = (first + step + 1) % count; // (the next frame goes on after the last one read)
+			}
+		}
+
+		private void ResetGeometry() {
+			++geometryGeneration_;
+			foreach (Tracked t in skinnedTracked_) {
+				t.rayKey = 0;
+				t.rayIndicesSent = false;
+			}
+			geometryQueue_.Clear();
+			geometryAsked_.Clear();
+			geometrySent_ = geometryFailed_ = 0;
+		}
+
+		private unsafe void UpdateGeometry() {
+			while (geometryInFlight_ < GeometryAtOnce && geometryQueue_.Count > 0) {
+				uint handle = geometryQueue_.Dequeue();
+				if (!meshes_.TryGetValue(handle, out Mesh mesh) || mesh == null) {
+					continue;
+				}
+				// where the positions are
+				attributes_.Clear();
+				mesh.GetVertexAttributes(attributes_);
+				int stream = -1, offset = 0, uvStream = -1, uvAt = 0;
+				byte format = 0, uvKind = 0;
+				foreach (VertexAttributeDescriptor a in attributes_) {
+					if (a.attribute == VertexAttribute.Position) {
+						stream = a.stream;
+						offset = mesh.GetVertexAttributeOffset(a.attribute);
+						format = DxgiFormat(a.format, a.dimension);
+					} else if (a.attribute == VertexAttribute.TexCoord0) {
+						// (what a ray's hit on this mesh looks its texture up with)
+						uvStream = a.stream;
+						uvAt = mesh.GetVertexAttributeOffset(a.attribute);
+						uvKind = DxgiFormat(a.format, a.dimension);
+					}
+				}
+				if (uvKind == 0) {
+					uvStream = -1;
+				}
+				int subMeshes = mesh.subMeshCount;
+				if (stream < 0 || format == 0 || subMeshes < 1) {
+					++geometryFailed_;
+					continue;
+				}
+				AeSubMesh[] subs = new AeSubMesh[subMeshes];
+				for (int i = 0; i < subMeshes; ++i) {
+					SubMeshDescriptor sm = mesh.GetSubMesh(i);
+					subs[i].indexStart = (uint)sm.indexStart;
+					subs[i].indexCount = sm.topology == MeshTopology.Triangles ? (uint)sm.indexCount : 0u;
+					subs[i].baseVertex = (uint)sm.baseVertex;
+				}
+				GraphicsBuffer vb = null, ib = null, ub = null;
+				try {
+					vb = mesh.GetVertexBuffer(stream);
+					ib = mesh.GetIndexBuffer();
+					if (uvStream >= 0 && uvStream != stream) {
+						ub = mesh.GetVertexBuffer(uvStream);
+					}
+				} catch (Exception) {
+					// (a mesh whose buffers Unity does not hand out)
+				}
+				if (vb == null || ib == null) {
+					vb?.Dispose();
+					ib?.Dispose();
+					ub?.Dispose();
+					++geometryFailed_;
+					continue;
+				}
+				// 0 none, 1 with the positions, 2 in a stream of their own (read back as a third part)
+				uint uvMode = uvStream < 0 ? 0u : uvStream == stream ? 1u : ub != null ? 2u : 0u;
+				uint uvOffset = (uint)uvAt, uvFormat = uvKind;
+				uint generation = geometryGeneration_;
+				if (ub != null) {
+					uint uvStride = (uint)mesh.GetVertexBufferStride(uvStream);
+					++geometryInFlight_;
+					AsyncGPUReadback.Request(ub, (AsyncGPUReadbackRequest r) => {
+						--geometryInFlight_;
+						if (!r.hasError && generation == geometryGeneration_) {
+							var data = r.GetData<byte>();
+							Native.Aether_SceneMeshUvs(handle, Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data), (uint)data.Length, uvStride, uvOffset, uvFormat);
+						}
+						ub.Dispose();
+					});
+				}
+				uint stride = (uint)mesh.GetVertexBufferStride(stream), indexStride = mesh.indexFormat == IndexFormat.UInt16 ? 2u : 4u;
+				uint positionOffset = (uint)offset, positionFormat = format;
+				geometryInFlight_ += 2;
+				AsyncGPUReadback.Request(vb, (AsyncGPUReadbackRequest r) => {
+					--geometryInFlight_;
+					if (!r.hasError && generation == geometryGeneration_) {
+						var data = r.GetData<byte>();
+						if (Native.Aether_SceneMeshVertices(handle, Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data), (uint)data.Length, stride, positionOffset, positionFormat, uvMode, uvOffset, uvFormat) == 0) {
+							++geometryFailed_;
+						}
+					} else if (r.hasError) {
+						++geometryFailed_;
+					}
+					vb.Dispose();
+				});
+				AsyncGPUReadback.Request(ib, (AsyncGPUReadbackRequest r) => {
+					--geometryInFlight_;
+					if (!r.hasError && generation == geometryGeneration_) {
+						var data = r.GetData<byte>();
+						fixed (AeSubMesh* p = subs) {
+							if (Native.Aether_SceneMeshIndices(handle, Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data), (uint)data.Length, indexStride, p, (uint)subs.Length) != 0) {
+								++geometrySent_;
+							} else {
+								++geometryFailed_;
+							}
+						}
+					} else if (r.hasError) {
+						++geometryFailed_;
+					}
+					ib.Dispose();
+				});
+			}
 		}
 
 		// ---- materials seen through a renderer's property block, every frame. The game writes the player's changes
@@ -1579,11 +1828,14 @@ namespace Aether {
 					uint flags = 0;
 					if (enabled && inCamera && r.isVisible) {
 						flags = AeConst.FrameInstanceVisible | (casting == ShadowCastingMode.ShadowsOnly ? AeConst.FrameInstanceShadowOnly : 0u);
-					} else if (enabled && casting != ShadowCastingMode.Off && (t.layerBit & sunMask) != 0 &&
+					} else if (enabled && ((casting != ShadowCastingMode.Off && (t.layerBit & sunMask) != 0) || (inCamera && casting != ShadowCastingMode.ShadowsOnly)) &&
 						(t.lodGroup < 0 || (t.lodGroup < lodGroups_.Count && lodGroups_[t.lodGroup].current >= 0 && (t.lodMask & (1u << lodGroups_[t.lodGroup].current)) != 0))) {
 						// Not seen by the camera (outside the view, hidden by Unity's occlusion data, or on a layer the camera
-						// does not show), but the sun reaches its layer: it can cast a shadow into the view. The native side
-						// culls it against the view and every shadow cascade itself.
+						// does not show), but the sun reaches its layer: it can cast a shadow into the view. Or it casts none
+						// but is something the camera would show: it is part of the surroundings that reflections show (the
+						// reflection cube is drawn all around, whatever the camera looks at; left out, things came and went in
+						// the mirrored picture as the camera turned). The native side culls it against the view, every shadow
+						// cascade and the cube's faces itself.
 						flags = AeConst.FrameInstanceVisible | (inCamera && casting != ShadowCastingMode.ShadowsOnly ? 0u : AeConst.FrameInstanceShadowOnly);
 						++offscreen;
 					}
@@ -1663,7 +1915,7 @@ namespace Aether {
 
 		public string Status() {
 			return order_.Count + " renderers, " + meshes_.Count + " meshes (" + pendingMeshes_.Count + " pending), " + materials_.Count + " materials, " + textures_.Count + " textures (" +
-				pendingTextures_.Count + " pending), " + lights_.Count + " lights, " + lodGroups_.Count + " LOD groups, " + OffscreenCasters + " off-screen shadow casters, " + SkinnedBuffers() + " skinned buffers of " + skinnedTracked_.Count + " skinned renderers, " + dynamicMeshes_.Count + " dynamic meshes; skipped: " + SkinnedSkipped + " skinned renderers, " + UnsupportedFormats + " unsupported meshes / textures; " + particles_.LastCount + " particles (" + particles_.LastSmoke + " tyre smoke, " + particles_.Systems + " particle systems); main thread ms: scan " + scanCost_ + ", tick " + tickCost_ + ", frame " + frameCost_ + ", pipeline " + AetherPipeline.Timing;
+				pendingTextures_.Count + " pending), " + lights_.Count + " lights, " + lodGroups_.Count + " LOD groups, " + OffscreenCasters + " off-screen shadow casters, " + SkinnedBuffers() + " skinned buffers of " + skinnedTracked_.Count + " skinned renderers, " + dynamicMeshes_.Count + " dynamic meshes; ray tracing geometry: " + GeometryStatus + "; skipped: " + SkinnedSkipped + " skinned renderers, " + UnsupportedFormats + " unsupported meshes / textures; " + particles_.LastCount + " particles (" + particles_.LastSmoke + " tyre smoke, " + particles_.Systems + " particle systems); main thread ms: scan " + scanCost_ + ", tick " + tickCost_ + ", frame " + frameCost_ + ", pipeline " + AetherPipeline.Timing;
 		}
 	}
 }

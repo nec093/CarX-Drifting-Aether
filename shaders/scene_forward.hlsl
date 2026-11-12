@@ -1,5 +1,6 @@
 // Aether forward+ scene shaders: vertex shader, depth / shadow pixel shader, lit pixel shader.
 #include "aether_scene.hlsli"
+#include "aether_bvh.hlsli"
 
 struct VSInput {
 	float3 position : POSITION;
@@ -127,6 +128,8 @@ float3 EnvBRDFApprox(float3 f0, float roughness, float NoV) {
 	return f0 * ab.x + ab.y;
 }
 
+#define AE_MATERIALS 1 // 0: the shading as it was before the material work of phase 4 (for comparisons)
+
 struct Surface {
 	float3 albedo;
 	float alpha;
@@ -137,11 +140,62 @@ struct Surface {
 	float3 emissive;
 	float clearCoat;
 	float clearCoatRoughness;
+	float coatF0;      // the clear coat's reflectance at normal incidence
+	float3 coatNormal; // the clear coat's own normal (the base layer's may be a metallic flake's)
+	float3 f0;         // the base layer's reflectance at normal incidence
+	float3 energy;     // what the single scattering specular lobe leaves out (light bounced between microfacets), as a factor
 };
+
+// The base layer's reflectance seen through a clear coat (index 1.5) instead of from air: the step in index at the
+// base is smaller, so it reflects less (the fit is Filament's).
+float3 F0UnderCoat(float3 f0) {
+	return saturate(f0 * (f0 * (0.941892 - 0.263008 * f0) + 0.346479) - 0.0285998);
+}
+
+// Rough surfaces lose energy in a single scattering GGX lobe: light that bounces between microfacets is not counted.
+// Given back as a factor on the lobe (Kulla and Conty's idea in Filament's form); the directional albedo of the lobe
+// comes from the same fit the environment light uses.
+float3 EnergyCompensation(float3 f0, float roughness, float NoV) {
+#if !AE_MATERIALS
+	return 1.0;
+#endif
+	float e = max(EnvBRDFApprox(1.0, roughness, NoV).x, 0.05);
+	return 1.0 + f0 * (1.0 / e - 1.0);
+}
+
+// Specular antialiasing (Tokuyoshi and Kaplanyan, "Improved Geometric Specular Antialiasing"): where the normal
+// changes within a pixel (small curved parts, far normal maps) a narrow lobe turns into flickering sparks; the
+// roughness is raised by the variance of the normal over the pixel.
+// `limit`: how far the roughness may be raised (as variance).
+float FilterRoughness(float3 n, float roughness, float limit = 0.18) {
+#if !AE_MATERIALS
+	return roughness;
+#endif
+	float3 du = ddx(n), dv = ddy(n);
+	float kernel = min(0.5 * (dot(du, du) + dot(dv, dv)), limit);
+	float a = roughness * roughness;
+	return sqrt(sqrt(saturate(a * a + kernel)));
+}
+
+// How much of the mirrored surroundings a place sees when `visibility` of its hemisphere is open (Lagarde, "Moving
+// Frostbite to PBR"): a smooth surface looks through a narrow cone and is hidden later than the ambient light is.
+float SpecularOcclusion(float NoV, float visibility, float roughness) {
+#if !AE_MATERIALS
+	return visibility;
+#endif
+	return saturate(pow(NoV + visibility, exp2(-16.0 * roughness - 1.0)) - 1.0 + visibility);
+}
+
+float Hash31(float3 p) {
+	p = frac(p * float3(0.1031, 0.1030, 0.0973));
+	p += dot(p, p.yzx + 33.33);
+	return frac((p.x + p.y) * p.z);
+}
 
 float3 DirectLight(Surface s, float3 V, float3 L, float3 radiance) {
 	float NoL = saturate(dot(s.normal, L));
-	if (NoL <= 0.0) {
+	float coatNoL = s.clearCoat > 0.0 ? saturate(dot(s.coatNormal, L)) : 0.0;
+	if (NoL <= 0.0 && coatNoL <= 0.0) {
 		return 0.0;
 	}
 	float3 H = normalize(V + L);
@@ -149,20 +203,25 @@ float3 DirectLight(Surface s, float3 V, float3 L, float3 radiance) {
 	float NoH = saturate(dot(s.normal, H));
 	float VoH = saturate(dot(V, H));
 	float a = max(s.roughness * s.roughness, 0.002);
-	float3 f0 = lerp(0.04, s.albedo, s.metallic);
+	float3 f0 = s.f0;
 	// diffuse: Burley's (Disney) model, as the game's own renderer has it: brighter than Lambert on rough surfaces
 	// seen or lit at a grazing angle
 	float fd90 = 0.5 + s.roughness * (1.0 + dot(L, V));
 	float scatter = (1.0 + (fd90 - 1.0) * pow(1.0 - NoL, 5.0)) * (1.0 + (fd90 - 1.0) * pow(1.0 - NoV, 5.0)) / 1.03571;
 	float3 diffuse = s.albedo * (1.0 - s.metallic) * scatter / PI;
 	float3 F = F_Schlick(f0, VoH);
-	float3 specular = D_GGX(NoH, a) * V_SmithGGX(NoV, NoL, a) * F;
+	float3 specular = D_GGX(NoH, a) * V_SmithGGX(NoV, NoL, a) * F * s.energy;
 	float3 base = (diffuse + specular) * NoL;
 	if (s.clearCoat > 0.0) {
-		// a second, dielectric lobe on top (f0 0.04); the base layer loses what the coat reflects
+		// a second, dielectric lobe on top (f0 0.04), on the coat's own smooth normal; the base layer loses what the
+		// coat reflects
 		float ac = max(s.clearCoatRoughness * s.clearCoatRoughness, 0.002);
-		float Fc = (0.04 + 0.96 * pow(1.0 - VoH, 5.0)) * s.clearCoat;
-		float coat = D_GGX(NoH, ac) * V_SmithGGX(NoV, NoL, ac) * Fc * NoL;
+		float Fc = (s.coatF0 + (1.0 - s.coatF0) * pow(1.0 - VoH, 5.0)) * s.clearCoat;
+		float cNoV = max(dot(s.coatNormal, V), 1e-4);
+		float cNoH = saturate(dot(s.coatNormal, H));
+		float coat = D_GGX(cNoH, ac) * V_SmithGGX(cNoV, coatNoL, ac) * Fc * coatNoL;
+		// (and a faint wide lobe round it: the haze every lacquer has, which is the glow round the sun's image)
+		coat += D_GGX(cNoH, 0.03) * V_SmithGGX(cNoV, coatNoL, 0.03) * Fc * coatNoL * 0.05;
 		base = base * (1.0 - Fc) + coat;
 	}
 	return base * radiance;
@@ -244,6 +303,7 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 
 	float4 base = g_BaseMap.Sample(s_Aniso, input.uv);
 	Surface s;
+	float paintMirror = 0.0; // body paint: 1 = chrome
 	s.albedo = base.rgb * mat.baseColor.rgb;
 	s.alpha = base.a * mat.baseColor.a;
 	s.metallic = mat.emissiveMetallic.a;
@@ -251,6 +311,7 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 	s.occlusion = 1.0;
 	s.clearCoat = mat.params2.x;
 	s.clearCoatRoughness = mat.params2.y;
+	s.coatF0 = 0.04;
 	s.emissive = mat.emissiveMetallic.rgb * g_EmissiveMap.Sample(s_Aniso, input.uv).rgb;
 
 	if (mat.params.z >= 0.0) {
@@ -310,6 +371,19 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		// the body's texture is its livery (vinyls, stickers): over the paint by its alpha. baseColor.a = a livery is bound
 		s.albedo = materialClass == CLASS_VEHICLE_PAINT && mat.baseColor.a > 0.5 ? lerp(paint, base.rgb, base.a) : paint;
 		s.alpha = 1.0;
+		if (AE_MATERIALS && materialClass == CLASS_VEHICLE_PAINT) {
+			// Aether's own paint. What kind it is is read from the game's three numbers (seen in the paint menu with
+			// the metallic debug view: "metallic" arrives as roughness 0.33, metalness 0.75, clear coat 0.33):
+			// - chrome: all metal and smooth. A bare mirror, no lacquer, no flakes.
+			// - matt: the game gives it no coat and it is rough. Bare pigment.
+			// - everything else is lacquered: a full, smooth clear coat whatever strength the game's graph uses.
+			paintMirror = smoothstep(0.8, 0.95, s.metallic) * (1.0 - smoothstep(0.1, 0.3, s.roughness));
+			float lacquered = max(saturate(s.clearCoat * 4.0), 1.0 - smoothstep(0.25, 0.45, s.roughness));
+			s.clearCoat = lacquered * (1.0 - paintMirror);
+			s.clearCoatRoughness = 0.03;
+			// (lacquer reflects 4 % head on; the user's choice is a glossier car than that)
+			s.coatF0 = 0.14; // (0.10 at first, then 0.17 on the user's wish for stronger reflections, then a little less)
+		}
 	}
 
 	// ---- normal
@@ -324,11 +398,95 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		N = -N; // double sided materials light their back faces
 	}
 	s.normal = N;
-	s.roughness = clamp(s.roughness, 0.03, 1.0);
+	s.coatNormal = N;
+	s.roughness = FilterRoughness(N, clamp(s.roughness, 0.03, 1.0));
+	// (Body paint's lacquer is filtered very little: on every curved panel the filter took the coat from a mirror to
+	// a satin finish, and the sun in the paint was a wide soft glow instead of a small bright image. What is left
+	// keeps the sun's image a few pixels wide, so that it does not flicker.)
+	s.clearCoatRoughness = FilterRoughness(N, max(s.clearCoatRoughness, 0.03), materialClass == CLASS_VEHICLE_PAINT ? 0.00004 : 0.18);
+
+	// ---- body paint, in the body's own space (what is drawn there stays put on a moving car)
+	if (AE_MATERIALS && materialClass == CLASS_VEHICLE_PAINT) {
+		InstanceData body = g_Instances[input.instance];
+		float3 rel = input.worldPos - float3(body.world[0][3], body.world[1][3], body.world[2][3]);
+		float3 local = body.normalRow0.xyz * rel.x + body.normalRow1.xyz * rel.y + body.normalRow2.xyz * rel.z; // metres
+		// (The coat is a level mirror. An orange peel, waves a few millimetres long leaning its normal, was tried and
+		// taken out again: the user wants the paint as mirror-like as it can be.)
+		// Metallic paint: the flakes in the base layer. Each is a small mirror lying a little off the surface, so the
+		// base layer's highlight breaks up into sparks that come and go with the view, under a coat that stays
+		// smooth. Where a pixel covers several flakes they are no longer drawn one by one: together they are a wider lobe.
+		float flakeAmount = s.metallic * (1.0 - paintMirror) * (mat.baseColor.a > 0.5 ? 1.0 - base.a : 1.0); // (none under the livery)
+		if (flakeAmount > 0.02) {
+			const float kFlakeSize = 0.0005;  // metres (larger than real flakes: what a 4K picture can show up close)
+			const float kFlakeLean = 0.12;    // how far a flake's normal leans
+			// The sparkle is what says "metallic", near and far: real flakes are far smaller than a pixel and a few
+			// of them always catch the light. So the cells grow with the distance (doubling, about a pixel wide: a grain, not tiles:
+			// there is always a grain to see, coarser from afar and weaker.
+			float pixel = length(fwidth(local));
+			float level = max(ceil(log2(max(pixel * 0.22 / kFlakeSize, 1e-3))), 0.0);
+			float3 cell = floor(local / (kFlakeSize * exp2(level))) + level * 13.0;
+			float3 lean = float3(Hash31(cell), Hash31(cell + 17.3), Hash31(cell + 41.7)) * 2.0 - 1.0;
+			// (one flake in four lies well off the surface: those are the sparks; the rest make the grain)
+			float off = Hash31(cell + 71.1) > 0.75 ? 1.0 : 0.4;
+			float strength = kFlakeLean * flakeAmount * off / (1.0 + 0.5 * level);
+			s.normal = normalize(N + lean * strength);
+		}
+	}
+
+	float NoV = max(dot(N, V), 1e-4);
+	float3 f0 = lerp(0.04, s.albedo, s.metallic);
+	if (AE_MATERIALS && materialClass == CLASS_VEHICLE_PAINT) {
+		// Aether's paint, from the base up. The game hands over a colour, how metallic and how rough.
+		// - The pigment: a diffuse layer in the paint's colour.
+		// - Metallic paint: aluminium flakes lying in that pigment. They are bright mirrors (far brighter than the
+		//   colour: a dark metallic grey is not a dark metal); the light reaches them and leaves through the pigment,
+		//   which tints it. The more flakes, the less pigment is seen between them.
+		// - The clear coat over both (set up above). Under it the pigment has no highlight of its own left (lacquer and
+		//   binder have nearly the same index); the flakes keep theirs.
+		float flakes = s.metallic * (1.0 - paintMirror) * (mat.baseColor.a > 0.5 ? 1.0 - base.a : 1.0);
+		float3 flakeColor = saturate(s.albedo); // (not brightened: tried, and a dark grey came out silver)
+		f0 = flakeColor * flakes + 0.04 * (1.0 - s.clearCoat) * (1.0 - flakes);
+		// chrome: the colour is the mirror's
+		f0 = lerp(f0, max(s.albedo, 0.5) * float3(0.62, 0.63, 0.65), paintMirror); // (chrome returns a little over half the light, not all of it)
+		// (metallic paint is dark where the flakes do not mirror anything bright towards the eye: little pigment shows)
+		s.albedo *= (1.0 - 0.85 * flakes) * (1.0 - paintMirror);
+		// Depth. Pigment under lacquer looks like a wet stone: no light scatters off its surface any more, so the
+		// colour is darker and purer (the curve), and darker again towards the panel's edges, where the eye looks
+		// through more of the paint (the flop). Against that the coat mirrors more and more of the surroundings
+		// towards the edges: a panel that goes from a deep colour in the middle to a bright mirror at the rim is what
+		// reads as depth; one even colour with a soft sheen is what reads as plastic.
+		float facing = saturate(dot(N, V));
+		float lacquer = s.clearCoat * (1.0 - paintMirror);
+		s.albedo = lerp(s.albedo, pow(max(s.albedo, 1e-4), 1.45), lacquer);
+		s.albedo *= lerp(1.0, lerp(0.28, 1.08, pow(facing, 0.9)), lacquer); // (stronger than at first: the user found the colour still flat)
+		// (metallic: the flakes mirror most where they are looked at head on and little from the side)
+		f0 *= lerp(1.0, lerp(0.35, 1.15, facing), saturate(flakes * 2.0) * lacquer);
+		s.metallic = 0.0;
+		// (the flakes do not lie level: their lobe is never a mirror's; the coat is what mirrors)
+		s.roughness = max(s.roughness, lerp(s.clearCoatRoughness, 0.17, saturate(flakes * 4.0)));
+	} else if (AE_MATERIALS && materialClass == CLASS_VEHICLE_RIM && s.metallic > 0.5) {
+		// A wheel's metal. The game hands a chromed or polished rim over as a white, fully metallic, smooth surface:
+		// taken as it is, that is a mirror returning all the light, which no metal is, and the wheel came out as a
+		// pale shape the colour of the sky. Chromium returns a little over half, slightly more of the blue; the
+		// darker the game's colour, the more of it is kept (a painted metallic rim is not chrome).
+		float chrome = smoothstep(0.6, 0.95, min(s.albedo.r, min(s.albedo.g, s.albedo.b))) * s.metallic;
+		f0 = lerp(f0, float3(0.55, 0.56, 0.58), chrome);
+		s.roughness = lerp(s.roughness, min(s.roughness, 0.06), chrome); // (plated: smoother than the game's number says)
+		if (s.clearCoat > 0.0) {
+			s.roughness = max(s.roughness, s.clearCoatRoughness);
+		}
+	} else if (AE_MATERIALS && s.clearCoat > 0.0) {
+		// under the coat: the base reflects less, and is never smoother than what it is seen through
+		f0 = lerp(f0, F0UnderCoat(f0), s.clearCoat);
+		s.roughness = max(s.roughness, s.clearCoatRoughness);
+	}
+	s.f0 = f0;
+	s.energy = EnergyCompensation(f0, s.roughness, max(dot(s.normal, V), 1e-4));
 
 	// ---- lighting
 	uint cascade = 0, lightCount = 0;
 	float shadow = SunShadow(input.worldPos, normalize(input.normal) * (outside ? 1.0 : -1.0), input.viewDepth, cascade);
+	shadow *= CloudShadow(input.worldPos); // (the physical sky's clouds drift over the ground)
 	float3 direct = 0.0;
 	float3 sunLight = 0.0;
 	const uint layers = asuint(g_Instances[input.instance].layers.x);
@@ -338,34 +496,38 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 	}
 	direct += PunctualLights(s, input.worldPos, V, input.position.xy, input.viewDepth, layers, lightCount);
 
-	float NoV = max(dot(N, V), 1e-4);
-	float3 f0 = lerp(0.04, s.albedo, s.metallic);
 	float3 ambientDiffuse = AmbientDiffuse(N) * g_Misc.w * s.albedo * (1.0 - s.metallic);
 	float3 R = reflect(-V, N);
 	// a rough surface reflects mostly what lies around its normal, not around the mirror direction
+	// (the base layer's normal: on metallic paint each flake mirrors its own part of the surroundings)
 	float alphaR = s.roughness * s.roughness;
-	float3 dominantR = normalize(lerp(N, R, (sqrt(1.0 - alphaR) + alphaR) * (1.0 - alphaR)));
-	float3 ambientSpecular = EnvironmentSpecular(input.worldPos, dominantR, s.roughness) * EnvBRDFApprox(f0, s.roughness, NoV);
-	float3 ambient = (ambientDiffuse + ambientSpecular) * s.occlusion;
-	float reflectionOcclusion = s.occlusion;
-	// screen space ambient occlusion: all of it on the ambient light, part of it (the host's setting) on direct light
+	float3 baseR = reflect(-V, s.normal);
+	float3 dominantR = normalize(lerp(s.normal, baseR, (sqrt(1.0 - alphaR) + alphaR) * (1.0 - alphaR)));
+	float3 ambientSpecular = EnvironmentSpecular(input.worldPos, dominantR, s.roughness) * EnvBRDFApprox(f0, s.roughness, NoV) * s.energy;
+	// what the surroundings hide: the texture's occlusion and the screen space one. The ambient light takes all of it;
+	// the mirrored light by how narrow its lobe is; direct light a part (the host's setting).
+	float visibility = s.occlusion;
+	float3 bounced = 0.0;
 	if (g_AOParams.w > 0.5 && (g_DrawFlags & 2u) == 0u) {
-		float ao = g_AO.Load(int3(input.position.xy, 0)).r;
-		reflectionOcclusion *= ao;
-		ambient *= ao;
-		float directAo = lerp(1.0, ao, g_AOParams.z);
+		float4 occlusion = g_AO.Load(int3(input.position.xy, 0)); // rgb: light bounced off nearby surfaces, a: ambient occlusion
+		visibility *= occlusion.a;
+		// (the bounced light is diffuse light like the sky's, and is not occluded again: it was gathered around this very place)
+		bounced = occlusion.rgb * g_QualityParams.z * s.albedo * (1.0 - s.metallic) * s.occlusion;
+		float directAo = lerp(1.0, occlusion.a, g_AOParams.z);
 		direct *= directAo;
 		sunLight *= directAo;
 	}
+	float reflectionOcclusion = SpecularOcclusion(NoV, visibility, s.clearCoat > 0.0 ? s.clearCoatRoughness : s.roughness);
+	float3 ambient = ambientDiffuse * visibility + ambientSpecular * SpecularOcclusion(NoV, visibility, s.roughness) + bounced;
 	if (s.clearCoat > 0.0) {
-		float Fc = (0.04 + 0.96 * pow(1.0 - NoV, 5.0)) * s.clearCoat;
-		ambient = ambient * (1.0 - Fc) + EnvironmentSpecular(input.worldPos, R, s.clearCoatRoughness) * Fc * s.occlusion;
+		float Fc = (s.coatF0 + (1.0 - s.coatF0) * pow(1.0 - NoV, 5.0)) * s.clearCoat;
+		ambient = ambient * (1.0 - Fc) + EnvironmentSpecular(input.worldPos, reflect(-V, s.coatNormal), s.clearCoatRoughness) * Fc * reflectionOcclusion;
 	}
 	float3 color = direct + ambient + s.emissive;
 	float alpha = s.alpha;
 	if (s.clearCoat > 0.0) {
 		// the coat is what mirrors: its Fresnel term is the share of the mirrored light
-		surface = float4(OctEncode(N), s.clearCoatRoughness, saturate((0.04 + 0.96 * pow(1.0 - NoV, 5.0)) * s.clearCoat * reflectionOcclusion));
+		surface = float4(OctEncode(s.coatNormal), s.clearCoatRoughness, saturate((s.coatF0 + (1.0 - s.coatF0) * pow(1.0 - NoV, 5.0)) * s.clearCoat * reflectionOcclusion));
 	} else {
 		surface = float4(OctEncode(N), s.roughness, saturate(dot(EnvBRDFApprox(f0, s.roughness, NoV), 1.0 / 3.0) * reflectionOcclusion));
 	}
@@ -380,15 +542,40 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		float tint = max(mat.baseColor.a, 0.12);
 		// (the direct term is mostly the diffuse response of the glass colour, which glass does not have: a small part of
 		// it stands in for the sun's highlight)
-		float3 body = s.albedo * (AmbientDiffuse(N) * g_Misc.w) * 0.05 + direct * 0.08;
-		float3 mirrored = EnvironmentSpecular(input.worldPos, R, 0.03) * fresnel;
+		float3 body = s.albedo * (AmbientDiffuse(N) * g_Misc.w) * 0.05;
+		// what the pane mirrors: a ray through the scene's triangles where those are there to trace (the pane is not in
+		// the reflection pass: that pass works on the opaque picture), else the sky and the probes
+		float3 mirroredFrom;
+		if (g_QualityParams.w > 0.5) {
+			BvhHit hit = BvhTrace(input.worldPos + N * (0.004 * input.viewDepth + 0.01), R, 300.0, false);
+			float4 mirroredSurface = hit.t < 0.0 ? float4(0.0, 0.0, 0.0, 0.0) : BvhHitSurface(input.worldPos + R * hit.t, hit, hit.t, R);
+			// (a hit the texture's alpha cuts away: the sky, as if nothing were there. One ray per pixel here.)
+			mirroredFrom = mirroredSurface.a > 0.5 ? min(mirroredSurface.rgb, 64.0) : SkyRadiance(R, 0.0);
+		} else {
+			mirroredFrom = EnvironmentSpecular(input.worldPos, R, 0.03);
+		}
+		float3 mirrored = mirroredFrom * fresnel;
+		// the sun and the lamps in the glass: a mirror's highlight (no diffuse part: glass has none)
+		Surface pane = s;
+		pane.albedo = 0.0;
+		pane.metallic = 1.0;
+		pane.f0 = GLASS_F0;
+		pane.energy = 1.0;
+		pane.clearCoat = 0.0;
+		pane.roughness = max(s.roughness, 0.05);
+		uint paneLights = 0;
+		if (g_SunDirection.w > 0.5 && (asuint(g_ClusterCounts.w) & layers) != 0u) {
+			mirrored += DirectLight(pane, V, g_SunDirection.xyz, g_SunColor.rgb * shadow);
+		}
+		mirrored += PunctualLights(pane, input.worldPos, V, input.position.xy, input.viewDepth, layers, paneLights);
 		alpha = saturate(tint + fresnel);
 		color = (body * tint + mirrored) / max(alpha, 1e-3); // (blended by alpha: the sum reaches the picture as it is)
 	} else if (materialClass == CLASS_UNLIT) {
 		color = s.albedo + s.emissive;
 	}
 
-	if (g_Fog.a > 0.0) {
+	// (with the volumetric fog on, the opaque picture gets its fog from that pass; what is blended over it still gets it here)
+	if (g_Fog.a > 0.0 && (g_QualityParams.y < 0.5 || (g_DrawFlags & 2u) != 0u)) {
 		// exponential height fog: full density up to the base height, falling off above it
 		float3 toPixel = input.worldPos - g_CameraPos.xyz;
 		float dist = length(toPixel);
@@ -416,7 +603,14 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		if (view == VIEW_ALBEDO) color = s.albedo;
 		else if (view == VIEW_NORMAL) color = N * 0.5 + 0.5;
 		else if (view == VIEW_ROUGHNESS) color = s.roughness;
-		else if (view == VIEW_METALLIC) color = s.metallic;
+		else if (view == VIEW_METALLIC) {
+			color = s.metallic;
+			if (materialClass == CLASS_VEHICLE_PAINT) {
+				// body paint: the game's own three numbers as they arrive (red roughness, green metalness, blue clear
+				// coat), with squares of 0.5 to read them against
+				color = fmod(floor(input.position.x / 48.0) + floor(input.position.y / 48.0), 2.0) > 0.5 ? float3(mat.params.x, mat.emissiveMetallic.a, mat.params2.x) : float3(0.5, 0.5, 0.5);
+			}
+		}
 		else if (view == VIEW_DEPTH) color = frac(input.viewDepth * float3(1.0, 0.1, 0.01));
 		else if (view == VIEW_LIGHTING) color = (direct + ambient) / max(s.albedo, 0.05) * g_Exposure.x;
 		else if (view == VIEW_SHADOW) color = shadow * lerp(float3(1, 0.4, 0.4), float3(0.4, 0.4, 1), cascade / 3.0);

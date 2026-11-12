@@ -76,7 +76,7 @@ try {
 	$init = Send $mcp 'initialize' @{ protocolVersion = '2025-06-18'; capabilities = @{}; clientInfo = @{ name = 'test'; version = '0' } }
 	Check 'initialize' ($init.result.serverInfo.name -eq 'aether' -and $init.result.protocolVersion -eq '2025-06-18')
 	$tools = (Send $mcp 'tools/list' $null).result.tools
-	Check "tools/list ($($tools.Count) tools, each with input and output schema)" ($tools.Count -eq 20 -and @($tools | Where-Object { -not $_.inputSchema -or -not $_.outputSchema }).Count -eq 0)
+	Check "tools/list ($($tools.Count) tools, each with input and output schema)" ($tools.Count -eq 21 -and @($tools | Where-Object { -not $_.inputSchema -or -not $_.outputSchema }).Count -eq 0)
 
 	$r = Call $mcp 'get_status'
 	Check 'get_status' (-not $r.isError -and $r.structuredContent.renderer.state -eq 'ready') ($r.content[0].text)

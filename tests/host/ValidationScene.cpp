@@ -1,5 +1,6 @@
 #include "ValidationScene.h"
 #include "Scene/SceneStore.h"
+#include "Renderer/Bvh.h"
 
 namespace aether::host {
 
@@ -36,6 +37,8 @@ Mat4 Trs(Vec3 t, Vec3 s) {
 
 // A unit box (half size 0.5) with Unity's winding: seen from outside every triangle is clockwise, which in a
 // left-handed space means cross(v1 - v0, v2 - v0) points along the outward normal.
+std::vector<Vertex> g_boxVertices; // (kept for the ray tracing refits in Churn)
+
 void BuildBox(std::vector<Vertex>& vertices, std::vector<uint16_t>& indices) {
 	const Vec3 normals[6] = {{0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
 	for (const Vec3& n : normals) {
@@ -104,6 +107,15 @@ bool ValidationScene::Create(ID3D12Device* device, ID3D12CommandQueue* queue) {
 	BuildBox(vertices, indices);
 	boxVb_ = UploadBuffer(device, vertices.data(), vertices.size() * sizeof(Vertex));
 	boxIb_ = UploadBuffer(device, indices.data(), indices.size() * sizeof(uint16_t));
+	// (the box's triangles for ray tracing: what the managed side reads back from the GPU in the game. Marked as a
+	// mesh whose vertices change, so that Churn can send them again: the refit and its partial upload run under the
+	// debug layer, and the picture must stay what it is.)
+	g_boxVertices = vertices;
+	SceneBvh::Get().MarkChanging(kMeshBox);
+	const AeSubMesh boxTriangles = {0, uint32_t(indices.size()), 0};
+	SceneBvh::Get().SubmitMesh(kMeshBox, vertices.data(), uint32_t(vertices.size() * sizeof(Vertex)), sizeof(Vertex), 0, DXGI_FORMAT_R32G32B32_FLOAT,
+		indices.data(), uint32_t(indices.size() * sizeof(uint16_t)), 2, &boxTriangles, 1,
+		vertices.data(), uint32_t(vertices.size() * sizeof(Vertex)), sizeof(Vertex), 40, DXGI_FORMAT_R32G32_FLOAT);
 	if (!boxVb_ || !boxIb_) {
 		return false;
 	}
@@ -326,6 +338,9 @@ void ValidationScene::SubmitFrame(uint32_t width, uint32_t height, uint32_t fram
 }
 
 void ValidationScene::Churn(uint32_t frameIndex) {
+	if (frameIndex % 7 == 3 && !g_boxVertices.empty()) {
+		SceneBvh::Get().SubmitVertices(kMeshBox, g_boxVertices.data(), uint32_t(g_boxVertices.size() * sizeof(Vertex)), sizeof(Vertex), 0, DXGI_FORMAT_R32G32B32_FLOAT);
+	}
 	SceneStore& store = SceneStore::Get();
 	if (frameIndex == 100) {
 		// an instance goes away, and the texture gets "a new resource" (what texture streaming does)

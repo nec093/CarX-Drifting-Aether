@@ -42,7 +42,7 @@ public:
 	json GraphDescription() { return graph_.Describe(); }
 
 private:
-	enum PassKind { kDepth = 0, kDepthAlpha, kShadow, kShadowAlpha, kForward, kForwardBlend, kForwardAdditive, kDecal, kPassKindCount };
+	enum PassKind { kDepth = 0, kDepthAlpha, kShadow, kShadowAlpha, kForward, kForwardBlend, kForwardAdditive, kDecal, kForwardProbe, kPassKindCount };
 	enum Cull { kCullBack = 0, kCullFront, kCullNone };
 	struct DrawItem {
 		const SceneMesh* mesh;
@@ -65,7 +65,7 @@ private:
 	void UploadDefaults(ID3D12GraphicsCommandList* list);
 	ID3D12PipelineState* Pipeline(uint32_t layoutId, PassKind kind, uint32_t cull);
 	// full screen passes: one pixel shader each (scene_post.hlsl), named in kFullscreenEntry (SceneRenderer.cpp)
-	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenKindCount };
+	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenKindCount };
 	// draws a full screen pass into `output` (its whole size) with up to three inputs; `params` reach the shader as g_PassParams
 	bool Fullscreen(RenderGraph::PassContext& ctx, FullscreenKind kind, GpuTexture* output, GpuTexture* in0, GpuTexture* in1 = nullptr, GpuTexture* in2 = nullptr, const float* params = nullptr, GpuTexture* in3 = nullptr);
 	uint32_t postNext_ = 0; // the next free table of this frame's post tables
@@ -79,6 +79,53 @@ private:
 	float bloomMix_ = 0, bloomScatter_ = 0, motionBlur_ = 0;
 	bool ownExposure_ = false;
 	bool ssr_ = false; // screen space reflections this frame (the host has them on, and Aether's switch)
+	// The physical sky (setting skyMode = physical): Aether's own atmosphere instead of the scene's sky texture, lit by
+	// a sun whose place follows the time of day. The first two LUTs are made once, the sky view every frame.
+	bool physicalSky_ = false;
+	bool atmosphereLutsValid_ = false;
+	float atmosphereScale_ = 1.0f; // the atmosphere's unit (sun illuminance 1 above the air) in scene units
+	std::shared_ptr<GpuTexture> transmittanceLut_, multiScatterLut_, skyViewLut_;
+	// clouds (physical sky): the noise their shape comes from (made once), and the sky with the clouds in it, which
+	// is what reflections and the sky's diffuse light read
+	std::shared_ptr<GpuTexture> cloudNoise_, skyCloudsLut_;
+	bool clouds_ = false;
+	bool volumetricFog_ = false; // this frame: the fog is marched through the shadow map instead of computed per surface
+	// Reflection probes: the still surroundings drawn into cubes that stay where they are in the world (a grid of
+	// places around the camera), a face or two per frame, kept while the camera is near. Every cube is six tiles in
+	// one atlas, with its depth (where a mirrored ray from a surface ends) and a blurred copy for rough surfaces.
+	// No vehicles and nothing that moves in them; the sky is not in them either (alpha 0 = look the sky up).
+	bool reflection_ = false;
+	struct LightProbe {
+		int cell[3] = {0, 0, 0};
+		Vec3 position = {0, 0, 0};
+		uint32_t facesDone = 0;  // bit per face drawn since the probe took this place (0x3F: usable)
+		uint32_t nextFace = 0;
+		uint64_t lastWanted = 0; // the last frame the camera was near
+		uint64_t lastDrawn = 0;
+		uint64_t wholeSince = 0; // the frame its last missing face was drawn (0: not whole yet): it fades in from there
+		bool used = false;
+	};
+	static const uint32_t kProbeSlots = 8;
+	LightProbe lightProbes_[kProbeSlots];
+	Vec3 probeCameraBefore_ = {0, 0, 0};
+	Vec3 probeAhead_ = {0, 0, 0}; // where the camera is heading (its smoothed travel over about half a second)
+	bool probeCameraValid_ = false;
+	struct ProbeFaceJob { uint32_t slot = 0, face = 0; D3D12_GPU_VIRTUAL_ADDRESS cb = 0; float planes[6][4] = {}; };
+	ProbeFaceJob probeJobs_[2];
+	uint32_t probeJobCount_ = 0;
+	void UpdateProbes(const SceneFrame& scene, uint64_t frame);
+	std::shared_ptr<GpuTexture> reflectionAtlas_[2], reflectionDepth_; // [0] the cubes, [1] blurred
+	std::vector<DrawItem> probeItems_;
+	const float (*cullPlanes_)[4] = nullptr; // DrawItems: only what these planes let through
+	uint32_t probeGlobalsTable_ = UINT32_MAX;
+	bool bvhReady_ = false;      // this frame: rays can be traced through the scene's triangles (Bvh.h)
+	bool raysWanted_ = false;    // this frame: something traces rays (reflections, a debug view)
+	bool rayReflections_ = false; // this frame: smooth surfaces mirror what rays find
+	std::vector<uint32_t> rayMaterials_; // per ray instance and sub mesh, two numbers: its index in this frame's material buffer, its base texture's place in the SRV heap (UINT32_MAX: none)
+	D3D12_GPU_VIRTUAL_ADDRESS rayMaterialsVa_ = 0;
+	bool indirect_ = false;      // this frame: the occlusion pass also gathers light bounced off what it finds
+	std::chrono::steady_clock::time_point cloudClock_ = std::chrono::steady_clock::now();
+	float cloudDrift_ = 0.0f;
 	// automatic exposure: the value of the frame before (1 x 1), which this frame's metering moves from
 	std::shared_ptr<GpuTexture> exposureHistory_[2];
 	uint32_t exposureIndex_ = 0;

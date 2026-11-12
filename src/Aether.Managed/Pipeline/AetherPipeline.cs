@@ -101,6 +101,7 @@ namespace Aether {
 			context.Submit();
 			++Frames;
 			EndContextRendering(context, cameras);
+			HostQualitySettings.Enforce(); // (the game's own handler wrote its menu's VSync and LOD bias while the cameras were rendered)
 		}
 
 		protected override void Dispose(bool disposing) {

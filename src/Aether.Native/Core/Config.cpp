@@ -8,12 +8,13 @@
 namespace aether {
 
 static const std::vector<std::string> kQualities = {"low", "medium", "high", "ultra"};
-static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles"};
+static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections"};
 static const std::vector<std::string> kRenderModes = {"hdrp", "aether", "compare", "standalone"};
-static const std::vector<std::string> kTonemaps = {"host", "aces", "neutral", "none"};
+static const std::vector<std::string> kSkyModes = {"physical", "scene"};
+static const std::vector<std::string> kTonemaps = {"host", "agx", "aces", "neutral", "none"};
 static const std::vector<std::string> kControlModes = {"deny", "ask", "allow"};
 static const std::vector<std::string> kLogLevels = {"debug", "info", "warning", "error"};
-static const std::vector<std::string> kDebugViews = {"none", "albedo", "normal", "roughness", "metallic", "depth", "lighting", "shadow", "materialClass", "sun", "ambient", "reflection"};
+static const std::vector<std::string> kDebugViews = {"none", "albedo", "normal", "roughness", "metallic", "depth", "lighting", "shadow", "materialClass", "sun", "ambient", "reflection", "bvh", "bvhCost"};
 
 const std::vector<std::string>& RenderFeatureNames() { return kFeatures; }
 const std::vector<std::string>& QualityNames() { return kQualities; }
@@ -43,7 +44,19 @@ static json ToJsonData(const SettingsData& d) {
 		{"motionBlur", d.motionBlur},
 		{"ssr", d.ssr},
 		{"particles", d.particles},
+		{"volumetricFog", d.volumetricFog},
+		{"indirectLight", d.indirectLight},
+		{"reflectionProbe", d.reflectionProbe},
+		{"rayTracedReflections", d.rayTracedReflections},
+		{"indirectStrength", d.indirectStrength},
+		{"fogStrength", d.fogStrength},
+		{"skinnedRayUpdates", d.skinnedRayUpdates},
 		{"tonemap", d.tonemap},
+		{"skyMode", d.skyMode},
+		{"timeOfDay", d.timeOfDay},
+		{"sunHeading", d.sunHeading},
+		{"cloudCoverage", d.cloudCoverage},
+		{"cloudSpeed", d.cloudSpeed},
 		{"exposureEV", d.exposureEV},
 		{"vramBudgetMB", d.vramBudgetMB},
 		{"vramWarnPercent", d.vramWarnPercent},
@@ -77,9 +90,21 @@ json Settings::Schema() {
 		{"antialiasing", {{"type", "boolean"}, {"description", "Temporal antialiasing"}}},
 		{"bloom", {{"type", "boolean"}, {"description", "Bloom (intensity and scatter follow the game's own settings)"}}},
 		{"motionBlur", {{"type", "boolean"}, {"description", "Motion blur (intensity follows the game's own settings)"}}},
+		{"volumetricFog", {{"type", "boolean"}, {"description", "Fog lit by the sun through the shadow map (light shafts), where the scene has fog"}}},
+		{"indirectLight", {{"type", "boolean"}, {"description", "Light bounced off nearby surfaces (screen space)"}}},
+		{"reflectionProbe", {{"type", "boolean"}, {"description", "Reflections of the surroundings, also of what is off screen: a cube drawn around the camera every frame"}}},
+		{"rayTracedReflections", {{"type", "boolean"}, {"description", "Reflections on smooth surfaces from rays traced through the scene's triangles (what is off screen too)"}}},
+		{"fogStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 20.0}, {"description", "Factor on the scene's fog density"}}},
+		{"skinnedRayUpdates", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "Skinned meshes whose pose is read back from the GPU per frame for ray traced reflections (0 = none, the default: reading every frame makes the game skip frames after a while)"}}},
+		{"indirectStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 3.0}, {"description", "Factor on the bounced light"}}},
 		{"particles", {{"type", "boolean"}, {"description", "Particles (the game's particle systems and tyre smoke)"}}},
 		{"ssr", {{"type", "boolean"}, {"description", "Screen space reflections (on where the game's volumes have them on; needs temporal antialiasing)"}}},
 		{"tonemap", oneOf(kTonemaps, "Tone mapping curve")},
+		{"skyMode", oneOf(kSkyModes, "Sky and sun: physical (Aether's atmosphere at timeOfDay) or scene (the scene's own sky texture and sun)")},
+		{"timeOfDay", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 24.0}, {"description", "Time of day in hours for the physical sky"}}},
+		{"cloudCoverage", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}, {"description", "How much of the sky the clouds take (physical sky; 0 = no clouds)"}}},
+		{"cloudSpeed", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "How fast the clouds drift"}}},
+		{"sunHeading", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 360.0}, {"description", "Turns the sun's path about the up axis, in degrees (physical sky)"}}},
 		{"shadowSoftness", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "How far the sun's shadow edges are blurred, in shadow map texels (0 = hard)"}}},
 		{"motionBlurStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 2.0}, {"description", "Motion blur strength, as a factor on what the scene asks for"}}},
 		{"bloomStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 2.0}, {"description", "Bloom strength, as a factor on what the scene asks for"}}},
@@ -158,7 +183,49 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 	if (key == "motionBlur") return wantBool(d.motionBlur);
 	if (key == "ssr") return wantBool(d.ssr);
 	if (key == "particles") return wantBool(d.particles);
+	if (key == "volumetricFog") return wantBool(d.volumetricFog);
+	if (key == "indirectLight") return wantBool(d.indirectLight);
+	if (key == "reflectionProbe") return wantBool(d.reflectionProbe);
+	if (key == "rayTracedReflections") return wantBool(d.rayTracedReflections);
+	if (key == "skinnedRayUpdates") {
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= 4.0)) {
+			return "skinnedRayUpdates must be a number between 0 and 4";
+		}
+		d.skinnedRayUpdates = float(value.get<double>());
+		return {};
+	}
+	if (key == "fogStrength") {
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= 20.0)) {
+			return "fogStrength must be a number between 0 and 20";
+		}
+		d.fogStrength = float(value.get<double>());
+		return {};
+	}
+	if (key == "indirectStrength") {
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= 3.0)) {
+			return "indirectStrength must be a number between 0 and 3";
+		}
+		d.indirectStrength = float(value.get<double>());
+		return {};
+	}
 	if (key == "tonemap") return wantEnum(d.tonemap, kTonemaps);
+	if (key == "skyMode") return wantEnum(d.skyMode, kSkyModes);
+	if (key == "cloudCoverage" || key == "cloudSpeed") {
+		const double hi = key == "cloudCoverage" ? 1.0 : 4.0;
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= hi)) {
+			return key + " is out of range";
+		}
+		(key == "cloudCoverage" ? d.cloudCoverage : d.cloudSpeed) = float(value.get<double>());
+		return {};
+	}
+	if (key == "timeOfDay" || key == "sunHeading") {
+		const double hi = key == "timeOfDay" ? 24.0 : 360.0;
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= hi)) {
+			return key + " is out of range";
+		}
+		(key == "timeOfDay" ? d.timeOfDay : d.sunHeading) = float(value.get<double>());
+		return {};
+	}
 	if (key == "exposureEV") {
 		if (!value.is_number() || !(value.get<double>() >= -10.0 && value.get<double>() <= 10.0)) {
 			return "exposureEV must be a number between -10 and 10";

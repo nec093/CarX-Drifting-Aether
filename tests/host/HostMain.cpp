@@ -7,6 +7,7 @@
 #include "Core/Config.h"
 #include "Core/Log.h"
 #include "ImGui/Overlay.h"
+#include "Renderer/Bvh.h"
 #include "Renderer/Renderer.h"
 #include "Resources/GpuResources.h"
 #include "Runtime.h"
@@ -265,7 +266,7 @@ int wmain(int argc, wchar_t** argv) {
 	};
 
 	host::ValidationScene scene;
-	uint64_t sceneCaptures[3] = {0, 0, 0};
+	uint64_t sceneCaptures[4] = {0, 0, 0, 0};
 	if (sceneTest) {
 		if (!scene.Create(g.device.Get(), g.queue.Get())) {
 			Die("validation scene", E_FAIL);
@@ -337,7 +338,11 @@ int wmain(int argc, wchar_t** argv) {
 				Settings::Get().Set("debugView", "normal", "host");
 			} else if (frame == 80) {
 				sceneCaptures[1] = Renderer::Get().RequestCapture(data + L"\\captures\\scene-normal.png", false);
-			} else if (frame == 90) {
+			} else if (frame == 84) {
+				Settings::Get().Set("debugView", "bvh", "host"); // the same scene as rays through the ray tracing structure find it
+			} else if (frame == 92) {
+				sceneCaptures[3] = Renderer::Get().RequestCapture(data + L"\\captures\\scene-bvh.png", false);
+			} else if (frame == 97) {
 				Settings::Get().Set("debugView", "none", "host");
 			} else if (frame == 140) {
 				sceneCaptures[2] = Renderer::Get().RequestCapture(data + L"\\captures\\scene-after.png", false);
@@ -391,6 +396,7 @@ int wmain(int argc, wchar_t** argv) {
 	}
 	if (sceneTest) {
 		printf("scene stats: %s\n", Dump(SceneStore::Get().Summary()).c_str());
+		printf("ray tracing: %s\n", Dump(SceneBvh::Get().Stats()).c_str());
 		printf("gpu resources: %s\n", Dump(GpuResources::Get().Report()).c_str());
 	}
 	const bool failed = Renderer::Get().Failed() || session::Dead();

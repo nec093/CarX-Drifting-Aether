@@ -6,7 +6,7 @@ using System.Text;
 namespace Aether {
 	/// <summary>The C interface of AetherNative.dll (src/Aether.Native/include/AetherApi.h).</summary>
 	internal static class Native {
-		public const int ApiVersion = 2;
+		public const int ApiVersion = 5;
 		public const string Dll = "AetherNative";
 
 		public const int EventFrameBegin = 1;
@@ -53,6 +53,13 @@ namespace Aether {
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneUpsertInstance(AeInstanceDesc* desc, uint* materials);
 		[DllImport(Dll)] public static extern void Aether_SceneDestroy(int kind, uint handle);
 		[DllImport(Dll)] public static extern void Aether_SceneClear();
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneMeshVertices(uint mesh, void* data, uint bytes, uint stride, uint positionOffset, uint positionFormat, uint uvMode, uint uvOffset, uint uvFormat);
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneMeshUvs(uint mesh, void* data, uint bytes, uint stride, uint uvOffset, uint uvFormat);
+		[DllImport(Dll)] public static extern unsafe int Aether_SceneMeshIndices(uint mesh, void* data, uint bytes, uint indexStride, AeSubMesh* subMeshes, uint subMeshCount);
+		[DllImport(Dll)] public static extern void Aether_SceneBvhReset();
+		[DllImport(Dll)] public static extern void Aether_SceneMeshChanging(uint mesh);
+		[DllImport(Dll)] public static extern void Aether_SceneMeshAlias(uint alias, uint mesh);
+		[DllImport(Dll)] public static extern void Aether_SceneMeshForget(uint mesh);
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneSetProbes(AeProbe* probes, uint count, uint structSize);
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneSubmitParticles(AeParticleBatch* batches, uint batchCount, AeParticle* particles, uint particleCount, uint particleSize);
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneSubmitFrame(AeFrame* frame, AeFrameInstance* instances, uint instanceCount, AeLight* lights, uint lightCount);

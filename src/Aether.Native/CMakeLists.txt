@@ -40,6 +40,7 @@ add_library(aether_core STATIC
 	Renderer/RenderGraph.cpp
 	Renderer/GpuTimer.cpp
 	Renderer/SceneRenderer.cpp
+	Renderer/Bvh.cpp
 	Profiler/Profiler.cpp
 	Shaders/ShaderManager.cpp
 	Renderer/Renderer.cpp

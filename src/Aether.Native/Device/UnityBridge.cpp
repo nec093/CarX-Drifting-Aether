@@ -1,5 +1,6 @@
 // Aether inside Unity: the Unity native plugin interface (IUnityGraphicsD3D12v7) as the HostGfx, the render events,
 // and the DLL's C exports. See docs/architecture/dx12-integration.md for why each call is made where it is.
+#include "../Renderer/Bvh.h"
 #include "../Core/DevOptions.h"
 #include "../Core/Common.h"
 #include "../Core/Log.h"
@@ -313,8 +314,29 @@ AETHER_API int Aether_SceneUpsertMesh(const AeMeshDesc* desc, const AeSubMesh* s
 AETHER_API int Aether_SceneUpsertTexture(const AeTextureDesc* desc) { return SceneStore::Get().UpsertTexture(desc) ? 1 : 0; }
 AETHER_API int Aether_SceneUpsertMaterial(const AeMaterialDesc* desc) { return SceneStore::Get().UpsertMaterial(desc) ? 1 : 0; }
 AETHER_API int Aether_SceneUpsertInstance(const AeInstanceDesc* desc, const AeHandle* materials) { return SceneStore::Get().UpsertInstance(desc, materials) ? 1 : 0; }
-AETHER_API void Aether_SceneDestroy(int kind, AeHandle handle) { SceneStore::Get().Destroy(kind, handle); }
-AETHER_API void Aether_SceneClear(void) { SceneStore::Get().Clear(); }
+AETHER_API void Aether_SceneDestroy(int kind, AeHandle handle) {
+	SceneStore::Get().Destroy(kind, handle);
+	if (kind == 0) {
+		SceneBvh::Get().Forget(handle); // (a mesh: its ray tracing tree goes with it)
+	}
+}
+AETHER_API void Aether_SceneMeshChanging(AeHandle mesh) { SceneBvh::Get().MarkChanging(mesh); }
+AETHER_API void Aether_SceneMeshAlias(AeHandle alias, AeHandle mesh) { SceneBvh::Get().Alias(alias, mesh); }
+AETHER_API void Aether_SceneMeshForget(AeHandle mesh) { SceneBvh::Get().Forget(mesh); }
+AETHER_API void Aether_SceneClear(void) {
+	SceneStore::Get().Clear();
+	SceneBvh::Get().Clear();
+}
+AETHER_API int Aether_SceneMeshVertices(AeHandle mesh, const void* data, uint32_t bytes, uint32_t stride, uint32_t positionOffset, uint32_t positionFormat, uint32_t uvMode, uint32_t uvOffset, uint32_t uvFormat) {
+	return SceneBvh::Get().SubmitVertices(mesh, data, bytes, stride, positionOffset, positionFormat, uvMode, uvOffset, uvFormat) ? 1 : 0;
+}
+AETHER_API int Aether_SceneMeshUvs(AeHandle mesh, const void* data, uint32_t bytes, uint32_t stride, uint32_t uvOffset, uint32_t uvFormat) {
+	return SceneBvh::Get().SubmitUvs(mesh, data, bytes, stride, uvOffset, uvFormat) ? 1 : 0;
+}
+AETHER_API int Aether_SceneMeshIndices(AeHandle mesh, const void* data, uint32_t bytes, uint32_t indexStride, const AeSubMesh* subMeshes, uint32_t subMeshCount) {
+	return SceneBvh::Get().SubmitIndices(mesh, data, bytes, indexStride, subMeshes, subMeshCount) ? 1 : 0;
+}
+AETHER_API void Aether_SceneBvhReset(void) { SceneBvh::Get().Clear(); }
 AETHER_API int Aether_SceneSetProbes(const AeProbe* probes, uint32_t count, uint32_t structSize) {
 	return SceneStore::Get().SetProbes(probes, count, structSize) ? 1 : 0;
 }

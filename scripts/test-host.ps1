@@ -4,13 +4,13 @@
 #      captures checked pixel by pixel (where things are, what is in front, which side of a face is drawn, a mirrored
 #      instance, shadows, blending, the diagnostic material, a scene unload and reload).
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-host.ps1 [-Config RelWithDebInfo] [-Seconds 6] [-Warp] [-Show] [-Keep] [-SceneOnly]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-host.ps1 [-Config RelWithDebInfo] [-Seconds 12] [-Warp] [-Show] [-Keep] [-SceneOnly]
 #
 # Passes when both runs print HOST OK (no D3D12 errors, no Aether errors, no leaked device objects) and every pixel
 # check holds. -Show: visible, focused windows. -Keep: keep the data folders (logs, captures) and print where they are.
 param(
 	[string]$Config = 'RelWithDebInfo',
-	[double]$Seconds = 6,
+	[double]$Seconds = 12,
 	[switch]$Warp,
 	[switch]$Show,
 	[switch]$Keep,
@@ -97,6 +97,7 @@ if ($code -eq 0) {
 	$c = Get-Pixel 'scene-normal.png' 'red';       Check 'front faces are drawn (back-face culling, winding)' ($c -and $c.B -lt 40 -and [Math]::Abs($c.R - $c.G) -lt 12 -and $c.R -gt 150) (Text $c)
 	$c = Get-Pixel 'scene-normal.png' 'mirrored';  Check 'a mirrored instance still shows its outside (negative determinant)' ($c -and $c.B -lt 40 -and [Math]::Abs($c.R - $c.G) -lt 12 -and $c.R -gt 150) (Text $c)
 	# handles after a destroy, a texture re-upload, a scene clear and a re-register
+	$c = Get-Pixel 'scene-bvh.png' 'red';          $s = Get-Pixel 'scene-bvh.png' 'mirrored'; Check 'rays through the ray tracing structure find the boxes (their faces towards the camera)' ($c -and $s -and $c.B -lt 40 -and [Math]::Abs($c.R - $c.G) -lt 12 -and $c.R -gt 20 -and $s.R -gt 20) (Text $c)
 	$c = Get-Pixel 'scene-after.png' 'blue';       Check 'the scene is back after unload and reload' ($c -and $c.B -gt 2 * $c.R -and $c.B -gt 2 * $c.G) (Text $c)
 	$stats = ($out | Where-Object { $_ -match '^scene stats: ' }) -replace '^scene stats: ', '' | ConvertFrom-Json
 	Check 'scene store: 8 instances, 1 mesh, 8 materials, no contract errors' ($stats.instances.registered -eq 8 -and $stats.meshes.count -eq 1 -and $stats.materials.count -eq 8 -and $stats.contractErrors -eq 0) ($stats | ConvertTo-Json -Compress -Depth 4)

@@ -46,7 +46,12 @@ cbuffer FrameConstants : register(b0) {
 	float4 g_Jitter;          // xy this frame's sub pixel offset in clip space, z 1 = the history is valid
 	float4 g_PostParams;      // x bloom mix (0 = off), y bloom scatter, z motion blur intensity, w 1 = temporal antialiasing
 	float4 g_SsrParams;       // x 1 = on, y smoothness below which there is none, z smoothness from which it is full, w screen fade distance
-	float4 g_QualityParams;   // x how far the sun's shadow edges are blurred, in shadow map texels
+	float4 g_QualityParams;   // x how far the sun's shadow edges are blurred (shadow map texels), y 1 = volumetric fog (no fog per surface), z bounced light strength (0 = off), w 1 = ray traced reflections
+	float4 g_Atmosphere;      // x the physical sky's scale to scene units, y night sky floor, z eye altitude (km), w 1 = physical sky
+	float4 g_Clouds;          // x coverage, yz how far the wind has carried them (noise uv), w 1 = clouds
+	float4 g_ProbeGrid;          // x the probes' spacing on the ground, y in height, z a different number every frame, w 1 = probes on
+	float4 g_ProbePositions[8];  // xyz where the probe stands, w 1 = usable
+	float4 g_ReflectionBasis[18]; // per cube face (+X -X +Y -Y +Z -Z): the directions of its tile's centre, right edge and top edge (w of the first two: near, far)
 };
 
 cbuffer DrawConstants : register(b1) {
@@ -116,6 +121,13 @@ Texture2D g_SceneColor : register(t4, space2); // the pass's main input
 Texture2D g_PostDepth : register(t5, space2);  // scene depth (reversed Z)
 Texture2D g_PostAux : register(t6, space2);
 Texture2D g_PostAux2 : register(t7, space2);
+Texture2D g_SkyView : register(t0, space4);       // the physical sky around the camera, clouds included (PSSkyViewLut / PSSkyCloudsLut)
+Texture2D g_Transmittance : register(t1, space4); // the physical sky's transmittance LUT
+Texture2D g_MultiScatter : register(t2, space4);  // ... and its multiple scattering LUT
+Texture2D g_ProbeAtlas : register(t4, space4);      // the reflection probes: per probe six tiles, 3 x 2; the probes 4 x 2 (a: 0 = sky)
+Texture2D g_ProbeAtlasBlur : register(t5, space4);  // ... blurred, for rough surfaces
+Texture2D g_ProbeAtlasDepth : register(t6, space4); // ... and their depth (reversed Z per tile)
+Texture2D g_CloudNoise : register(t3, space4);    // tiling noise the clouds' shape comes from (PSCloudNoise)
 
 SamplerState s_Aniso : register(s0);
 SamplerState s_LinearClamp : register(s1);
@@ -151,7 +163,9 @@ SamplerState s_PointClamp : register(s3);
 // lit views: one lighting term alone, exposed and tone mapped like the full picture (comparable with it)
 #define VIEW_SUN 9
 #define VIEW_AMBIENT 10
-#define VIEW_REFLECTION 11 // what a mirror would show: sky and reflection probes
+#define VIEW_REFLECTION 11
+#define VIEW_BVH 12      // the scene as rays through the ray tracing structure find it (PSBvhDebug)
+#define VIEW_BVH_COST 13 // ... and what each ray cost // what a mirror would show: sky and reflection probes
 
 // Unity's ShadeSH9: irradiance / PI in the direction n (linear)
 float3 AmbientSH(float3 n) {
@@ -163,13 +177,28 @@ float3 AmbientSH(float3 n) {
 	return max(x1 + x2 + g_SH[6].rgb * c, 0.0);
 }
 
+#include "aether_atmosphere.hlsli"
+#include "aether_clouds.hlsli"
+
 // The sky is the host's own cube map: a plain mip chain (every level the average of the one below), turned about the
 // up axis and scaled to the scene's units.
 float3 SkyDirection(float3 d) {
 	return float3(d.x * g_SkyParams.y - d.z * g_SkyParams.z, d.y, d.x * g_SkyParams.z + d.z * g_SkyParams.y);
 }
 
+float2 OctEncode(float3 n);
+
 float3 SkyRadiance(float3 dir, float roughness) {
+	if (g_Atmosphere.w > 0.5) {
+		// the physical sky: smooth enough to be read as it is; a rough surface sees it blurred towards the sky's
+		// cosine weighted mean around the direction (the irradiance map)
+		float3 sky = PhysicalSky(dir);
+		if (roughness > 0.0) {
+			float3 blurred = g_Irradiance.SampleLevel(s_LinearClamp, OctEncode(dir) * (31.0 / 32.0) + (0.5 / 32.0), 0.0).rgb;
+			sky = lerp(sky, blurred, saturate(roughness * roughness * 2.0));
+		}
+		return sky;
+	}
 	if (g_Misc.y > 0.5) {
 		// a rougher surface reads a level whose texels are about as wide as its reflection lobe: counted from the 1 x 1
 		// end of the chain, so that the result does not depend on the cube's resolution
@@ -188,8 +217,126 @@ float ProbeMip(float roughness, float mipCount) {
 	return min(roughness * (1.7 - 0.7 * roughness) * 6.0, max(mipCount - 1.0, 0.0));
 }
 
+// A reflection probe along a direction: which of its six tiles, and where in it. `tile`: the tile's size in texels
+// (the lookup stays half a texel inside it: the neighbouring tile is another direction, or another probe).
+// `along`: the cosine between the direction and the tile's axis.
+float2 ProbeUv(uint slot, float3 d, float tile, out float along) {
+	float3 a = abs(d);
+	uint face = a.x >= a.y && a.x >= a.z ? (d.x > 0.0 ? 0u : 1u) : a.y >= a.z ? (d.y > 0.0 ? 2u : 3u) : (d.z > 0.0 ? 4u : 5u);
+	float3 c = g_ReflectionBasis[face * 3].xyz, r = g_ReflectionBasis[face * 3 + 1].xyz, u = g_ReflectionBasis[face * 3 + 2].xyz;
+	float dc = max(dot(d, c), 1e-5);
+	along = dc / (length(c) * length(d));
+	float k = dot(c, c) / dc;
+	float2 ndc = float2(dot(d, r) / dot(r, r), dot(d, u) / dot(u, u)) * k;
+	float2 uv = clamp(ndc * float2(0.5, -0.5) + 0.5, 0.5 / tile, 1.0 - 0.5 / tile);
+	return (float2((slot % 4u) * 3u + face % 3u, (slot / 4u) * 2u + face / 3u) + uv) / float2(12.0, 4.0);
+}
+
+float4 ProbeSample(Texture2D atlas, uint slot, float3 d, float tile) {
+	float along;
+	return atlas.SampleLevel(s_LinearClamp, ProbeUv(slot, d, tile, along), 0.0);
+}
+
+// How far the thing a probe shows along a direction is from the probe (very far: the sky).
+// (The depth is read filtered: a distance that jumps from texel to texel showed as blocks in the mirrored picture.)
+float ProbeDistance(uint slot, float3 d) {
+	float along;
+	float2 uv = ProbeUv(slot, d, 128.0, along);
+	float depth = g_ProbeAtlasDepth.SampleLevel(s_LinearClamp, uv, 0.0).r;
+	if (depth <= 1e-6) {
+		return 1e6;
+	}
+	float n = g_ReflectionBasis[0].w, f = g_ReflectionBasis[1].w;
+	return n * f / (depth * (f - n) + n) / max(along, 1e-3);
+}
+
+// A probe was drawn from where it stands, not from the surface that mirrors: looked up along the mirrored direction
+// as it is, everything sits where it would if it were infinitely far. So the mirrored ray is followed from the
+// surface to about where the probe's depth says it ends, and the probe is read along the direction to that place.
+// One estimate and one careful correction: iterating to the end made every depth edge a tear.
+float3 ProbeParallax(uint slot, float3 worldPos, float3 R) {
+	float3 o = worldPos - g_ProbePositions[slot].xyz;
+	float t = ProbeDistance(slot, R);
+	if (t > 1e5) {
+		return R; // the sky
+	}
+	float3 q = o + R * t;
+	float dq = length(q);
+	float D = ProbeDistance(slot, q / dq);
+	if (D < 1e5) {
+		t = clamp(t + 0.5 * (D - dq), 0.5 * t, 2.0 * t);
+	}
+	return normalize(o + R * t);
+}
+
+// The direction a place in a tile stands for (the reverse of ProbeUv).
+float3 ProbeDirection(uint face, float2 uv) {
+	float2 ndc = uv * float2(2.0, -2.0) + float2(-1.0, 1.0);
+	return normalize(g_ReflectionBasis[face * 3].xyz + g_ReflectionBasis[face * 3 + 1].xyz * ndc.x + g_ReflectionBasis[face * 3 + 2].xyz * ndc.y);
+}
+
+// Which probes a place reads: the usable probes on the grid around it count by how near they stand; the two that count
+// most are blended by their weights. (One probe drawn by lot per pixel and frame, for the temporal antialiasing to
+// average, was tried: whenever the camera moved the picture had too little history to average, and every mirrored
+// surface flickered.) x, y: the two slots (-1: none), z: the share of the first.
+float3 ProbesFor(float3 worldPos) {
+	float w0 = 0.0, w1 = 0.0;
+	int s0 = -1, s1 = -1;
+	for (uint s = 0; s < 8; ++s) {
+		float3 d = abs(worldPos - g_ProbePositions[s].xyz) / float3(g_ProbeGrid.x, g_ProbeGrid.y * 2.0, g_ProbeGrid.x);
+		float w = g_ProbePositions[s].w * saturate(1.0 - d.x) * saturate(1.0 - d.z) * saturate(1.5 - d.y);
+		if (w > w0) {
+			w1 = w0;
+			s1 = s0;
+			w0 = w;
+			s0 = int(s);
+		} else if (w > w1) {
+			w1 = w;
+			s1 = int(s);
+		}
+	}
+	return float3(float(s0), float(w1 > 0.0 ? s1 : -1), w0 / max(w0 + w1, 1e-5));
+}
+
+// The probe that counts most for a place (-1: none).
+int ProbeFor(float3 worldPos) {
+	return int(ProbesFor(worldPos).x);
+}
+
+// A probe's picture of what lies along R from a place (premultiplied: alpha is how much of the direction it covers).
+float4 ProbeReflection(uint slot, float3 worldPos, float3 R, float roughness) {
+	float3 Rc = ProbeParallax(slot, worldPos, R);
+	return lerp(ProbeSample(g_ProbeAtlas, slot, Rc, 128.0), ProbeSample(g_ProbeAtlasBlur, slot, Rc, 32.0), saturate((roughness - 0.04) / 0.3));
+}
+
 float3 EnvironmentSpecular(float3 worldPos, float3 R, float roughness) {
 	float3 result = SkyRadiance(R, roughness);
+	if (g_ProbeGrid.w > 0.5) {
+		// the still surroundings from the nearest probes, over the sky (premultiplied: alpha is how much of the
+		// direction is covered). The blurred copy as the surface gets rougher.
+		// Every usable probe on the grid around the place, by how near it stands (the weights fall to nothing at the
+		// next grid point, so a probe comes in and goes out without a step). (Only the two that count most were
+		// blended before: where the second and the third changed places the reflection jumped, and a floor showed a
+		// line between a brighter and a darker part.)
+		float4 near = 0.0;
+		float sum = 0.0;
+		for (uint s = 0; s < 8; ++s) {
+			float3 d = abs(worldPos - g_ProbePositions[s].xyz) / float3(g_ProbeGrid.x, g_ProbeGrid.y * 2.0, g_ProbeGrid.x);
+			float w = g_ProbePositions[s].w * saturate(1.0 - d.x) * saturate(1.0 - d.z) * saturate(1.5 - d.y);
+			if (w > 0.001) {
+				near += ProbeReflection(s, worldPos, R, roughness) * w;
+				sum += w;
+			}
+		}
+		if (sum > 0.0) {
+			// (Not brought up to full strength where the weights add up to less than one: that is the edge of what the
+			// probes cover, a couple of cells around the camera. Normalised there, the last probe with any weight
+			// counted in full right up to the edge and the sky took over at a line across the floor; left as it is,
+			// the probes fade out towards the edge.)
+			near /= max(sum, 1.0);
+			result = result * (1.0 - near.a) + near.rgb;
+		}
+	}
 	uint count = (uint)g_ProbeCount.x;
 	for (uint i = 0; i < count; ++i) {
 		float4 r0 = g_ProbeRows[i * 3], r1 = g_ProbeRows[i * 3 + 1], r2 = g_ProbeRows[i * 3 + 2];
@@ -253,26 +400,35 @@ float3 AmbientDiffuse(float3 n) {
 
 #endif
 
-// The sun's shadow at a world position (1 = lit): the cascade for the view depth, 3 x 3 taps.
+// The sun's shadow at a world position (1 = lit), 3 x 3 taps. The cascade is the finest one whose box holds the
+// point. (It used to be chosen by the point's depth in the view being drawn. That is the camera's depth only in the
+// camera's own passes: a reflection probe's faces, drawn from where the probe stands, looked their points up in the
+// wrong cascade or in none, and the probes had no shadows in them: what they showed was too bright, and so was
+// every reflection that took its colour from them.) `viewDepth` is not used any more.
 float SunShadow(float3 worldPos, float3 normal, float viewDepth, out uint cascade) {
 	cascade = 0;
 	uint count = (uint)g_ShadowParams.x;
 	if (count == 0 || g_SunColor.w < 0.5) {
 		return 1.0;
 	}
-	for (uint i = 0; i < count; ++i) {
-		cascade = i;
-		if (viewDepth < g_CascadeSplits[i]) {
-			break;
+	float4 sc = 0.0;
+	bool found = false;
+	for (uint i = 0; i < count && !found; ++i) {
+		// push the sample off the surface along the normal by about one shadow texel of this cascade
+		float3 p = worldPos + normal * (g_CascadeTexel[i] * 1.5);
+		float4 c = mul(g_ShadowMatrix[i], float4(p, 1.0));
+		// (the cascades are tiles of the atlas, 2 x 2: inside this one's tile, a little off its edge so that the
+		// taps stay in it)
+		float2 local = (c.xy - float2(i % 2u, i / 2u) * 0.5) * 2.0;
+		if (all(local > 0.02) && all(local < 0.98) && c.z > 0.0 && c.z < 1.0) {
+			cascade = i;
+			sc = c;
+			found = true;
 		}
 	}
-	if (viewDepth >= g_CascadeSplits[count - 1]) {
+	if (!found) {
 		return 1.0; // beyond the last cascade
 	}
-	// push the sample off the surface along the normal by about one shadow texel of this cascade
-	float texelWorld = g_CascadeTexel[cascade] * 1.5;
-	float3 p = worldPos + normal * texelWorld;
-	float4 sc = mul(g_ShadowMatrix[cascade], float4(p, 1.0));
 	float depth = sc.z - g_ShadowParams.z;
 	float texel = g_ShadowParams.y;
 	// 3 x 3 taps (each already the mean of four comparisons) spread over the softness the user chose; 5 x 5 where

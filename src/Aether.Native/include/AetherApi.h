@@ -10,7 +10,7 @@
 #define AETHER_API extern "C" __declspec(dllimport)
 #endif
 
-#define AETHER_API_VERSION 2
+#define AETHER_API_VERSION 5
 
 // Render events for GL.IssuePluginEvent(Aether_GetRenderEventFunc(), id)
 #define AETHER_EVENT_FRAME_BEGIN 1 // first thing in the frame (GPU timestamp)
@@ -74,6 +74,21 @@ AETHER_API int Aether_SceneSetProbes(const AeProbe* probes, uint32_t count, uint
 AETHER_API int Aether_SceneSubmitParticles(const AeParticleBatch* batches, uint32_t batchCount, const AeParticle* particles, uint32_t particleCount, uint32_t particleSize);
 AETHER_API int Aether_SceneSubmitFrame(const AeFrame* frame, const AeFrameInstance* instances, uint32_t instanceCount, const AeLight* lights, uint32_t lightCount);
 // 0 hdrp (the managed side captures nothing), 1 aether, 2 compare
+// A mesh's geometry for ray tracing, read back from the GPU by the caller (the two halves in any order; the tree is
+// built when both have arrived). positionFormat: the DXGI_FORMAT of the position element. Return 0 when refused.
+// uvMode: 0 no texture coordinates, 1 they are in this stream (uvOffset, uvFormat: where and the DXGI_FORMAT), 2 they
+// are in another stream, sent with Aether_SceneMeshUvs (the tree waits for it).
+AETHER_API int Aether_SceneMeshVertices(AeHandle mesh, const void* data, uint32_t bytes, uint32_t stride, uint32_t positionOffset, uint32_t positionFormat, uint32_t uvMode, uint32_t uvOffset, uint32_t uvFormat);
+AETHER_API int Aether_SceneMeshUvs(AeHandle mesh, const void* data, uint32_t bytes, uint32_t stride, uint32_t uvOffset, uint32_t uvFormat);
+AETHER_API int Aether_SceneMeshIndices(AeHandle mesh, const void* data, uint32_t bytes, uint32_t indexStride, const AeSubMesh* subMeshes, uint32_t subMeshCount);
+// A mesh whose vertices change (skinned): call before its geometry is sent. Vertices sent again later refit its tree.
+AETHER_API void Aether_SceneMeshChanging(AeHandle mesh);
+// Instances of `alias` are traced as `mesh` (a skinned renderer's vertex buffers take turns: one tree serves them all).
+AETHER_API void Aether_SceneMeshAlias(AeHandle alias, AeHandle mesh);
+// The ray tracing tree of a handle that is not a scene mesh (see above) goes. Scene meshes: Aether_SceneDestroy does it.
+AETHER_API void Aether_SceneMeshForget(AeHandle mesh);
+// Every tree goes (the set of loaded scenes changed): the caller sends the geometry of what is still there again.
+AETHER_API void Aether_SceneBvhReset(void);
 AETHER_API int Aether_GetRenderMode(void);
 // Experiment switches for the scene capture (Core/DevOptions.h); 0 in normal operation.
 AETHER_API int Aether_DevCaptureFlags();

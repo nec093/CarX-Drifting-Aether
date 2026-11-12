@@ -338,6 +338,27 @@ Renderer::Context* Renderer::Acquire(const HostGfx& host) {
 	const UINT64 completed = Completed();
 	const UINT64 hostCompleted = host.completedFenceValue ? host.completedFenceValue() : UINT64_MAX;
 	++acquireTick_;
+	{
+		// (for the status: why the lists that are not free are not free)
+		uint32_t gpu = 0, hostBusy = 0, delay = 0;
+		for (auto& c : contexts_) {
+			if (!c->submitted) {
+				continue;
+			}
+			if (c->fence > completed) {
+				++gpu;
+			} else if (c->hostFence > hostCompleted) {
+				++hostBusy;
+			} else if (acquireTick_ < c->submitTick + kReuseDelay) {
+				++delay;
+			}
+		}
+		statLists_ = uint32_t(contexts_.size());
+		statBusyGpu_ = gpu;
+		statBusyHost_ = hostBusy;
+		statBusyDelay_ = delay;
+		++statAcquires_;
+	}
 	for (auto& c : contexts_) {
 		// A list is used again only when (1) the GPU finished it (Aether's own clock), (2) the host's frame fence passed
 		// the value the host returned for it and (3) a few submissions went by: the host keeps its own record of a list
@@ -359,6 +380,7 @@ Renderer::Context* Renderer::Acquire(const HostGfx& host) {
 		return c.get();
 	}
 	if (contexts_.size() >= kMaxContexts) {
+		++statSkipped_;
 		return nullptr; // the host fence is not advancing: skip this frame rather than pile up lists
 	}
 	auto c = std::make_unique<Context>();
@@ -1082,6 +1104,10 @@ json Renderer::State() {
 	j["mainRenderer"] = "HDRP (Unity). Aether runs alongside it and composites its passes onto the back buffer.";
 	j["graphicsApi"] = "Direct3D 12";
 	j["frame"] = Profiler::Get().FrameCount();
+	// command lists: a list is used again when the GPU is done with it, the host's fence passed it and a few
+	// submissions went by. When none is free a frame's work is skipped (the picture then lacks Aether's part).
+	j["commandLists"] = {{"lists", statLists_.load()}, {"waitingForGpu", statBusyGpu_.load()}, {"waitingForHostFence", statBusyHost_.load()}, {"waitingForReuseDelay", statBusyDelay_.load()},
+		{"acquires", statAcquires_.load()}, {"noneFree", statSkipped_.load()}};
 	std::lock_guard lock(stateMutex_);
 	j["host"] = hostName_;
 	j["backBuffer"] = backBufferInfo_;

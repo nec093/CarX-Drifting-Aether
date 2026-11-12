@@ -1,6 +1,7 @@
 // The runtime's API: what an MCP tool call turns into. Read methods answer from snapshots. Control methods go through
 // Authorize (the MCP server's --allow-control switch, the mcpControl setting, the in-game approval) and then through
 // the same validated entry points the overlay uses. Nothing here touches the device or a resource's lifetime.
+#include "../Renderer/Bvh.h"
 #include "PipeServer.h"
 #include "../Core/Config.h"
 #include "../Core/Log.h"
@@ -218,6 +219,7 @@ json HandleRequest(const json& request) {
 		// what Aether's own renderer captured and drew (render mode aether / compare)
 		out["aetherScene"] = SceneStore::Get().Summary();
 		out["aetherRenderer"] = SceneRenderer::Get().Stats();
+		out["rayTracing"] = SceneBvh::Get().Stats();
 		return Ok(id, out);
 	}
 	if (method == "get_logs") {
@@ -303,6 +305,31 @@ json HandleRequest(const json& request) {
 		}
 		return Ok(id, {{"feature", feature}, {"enabled", enabled}});
 	}
+	if (method == "set_graphics_option") {
+		// one of Aether's own graphics options (the same ones the overlay's Settings tab shows)
+		static const char* const kOptions[] = {"skyMode", "timeOfDay", "sunHeading", "cloudCoverage", "cloudSpeed", "shadowSoftness", "indirectStrength", "fogStrength", "skinnedRayUpdates", "motionBlurStrength", "bloomStrength", "smokeOpacity", "lodBias", "anisotropicLevel", "vsync", "exposureEV", "tonemap"};
+		std::string option;
+		if (!GetString(params, "option", "", option, error)) {
+			return Fail(id, error);
+		}
+		bool known = false;
+		std::string list;
+		for (const char* o : kOptions) {
+			known |= option == o;
+			list += (list.empty() ? "" : ", ") + std::string(o);
+		}
+		if (!known || !params.contains("value") || !(params["value"].is_number() || params["value"].is_string())) {
+			return Fail(id, {"E_INVALID_PARAMS", "option must be one of: " + list + "; value a number or a string"});
+		}
+		if (!Authorize(request, method, params, error)) {
+			return Fail(id, error);
+		}
+		std::string why = Settings::Get().Set(option, params["value"], "mcp");
+		if (!why.empty()) {
+			return Fail(id, {"E_INVALID_PARAMS", why});
+		}
+		return Ok(id, {{"option", option}, {"value", Settings::Get().ToJson()[option]}});
+	}
 	if (method == "set_render_mode") {
 		std::string mode, debugView;
 		if (!GetString(params, "mode", "", mode, error) || !GetString(params, "debugView", "", debugView, error)) {
@@ -314,7 +341,7 @@ json HandleRequest(const json& request) {
 			return Fail(id, {"E_INVALID_PARAMS", "mode must be one of: hdrp, aether, compare"});
 		}
 		if (!debugView.empty() && std::find(views.begin(), views.end(), debugView) == views.end()) {
-			return Fail(id, {"E_INVALID_PARAMS", "debugView must be one of: none, albedo, normal, roughness, metallic, depth, lighting, shadow, materialClass, sun, ambient, reflection"});
+			return Fail(id, {"E_INVALID_PARAMS", "debugView must be one of: none, albedo, normal, roughness, metallic, depth, lighting, shadow, materialClass, sun, ambient, reflection, bvh, bvhCost"});
 		}
 		if (mode.empty() && debugView.empty()) {
 			return Fail(id, {"E_INVALID_PARAMS", "give mode, debugView or both"});

@@ -1,3 +1,4 @@
+#include "Bvh.h"
 #include "SceneRenderer.h"
 #include "../Core/Log.h"
 #include "../Resources/GpuResources.h"
@@ -12,17 +13,24 @@ namespace {
 const DXGI_FORMAT kSceneColorFormat = DXGI_FORMAT_R11G11B10_FLOAT;
 const uint32_t kClusterX = 16, kClusterY = 9, kClusterZ = 24;
 const uint32_t kMaxLightsPerCluster = 64;
-const uint32_t kGlobalsTableSize = 4; // shadow atlas, sky, sky irradiance, ambient occlusion
+const uint32_t kGlobalsTableSize = 11; // (8: the reflection probes' atlas, 9: its blurred copy, 10: its depth) shadow atlas, sky, sky irradiance, ambient occlusion | physical sky: sky (with clouds), transmittance LUT, multiple scattering LUT, cloud noise
 const uint32_t kPostTableSize = 4;    // per full screen pass: colour / main input, depth, two auxiliary inputs
 const float kExposureAdaptationRate = 2.0f; // per second: the automatic exposure covers 63 % of a change in half a second
 const uint32_t kPostTables = 64;     // 0..3: ambient occlusion, its blur, composite, exposure metering; the rest handed out per pass (Fullscreen)
 const uint32_t kIrradianceSize = 32;  // octahedral map of the sky's diffuse light
-const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr"};
+const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace"};
+// reflection probes: each is six square tiles (3 x 2: +X -X +Y | -Y +Z -Z); the atlas holds them 4 x 2
+const uint32_t kProbeFace = 128, kProbeBlurFace = 32;
+const float kProbeCell = 12.0f;      // the grid's spacing on the ground (m)
+const float kProbeCellHeight = 3.0f; // ... and in height
+const float kReflectionNear = 0.3f, kReflectionFar = 200.0f;
+const DXGI_FORMAT kReflectionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; // a: 1 = something was drawn there (0: the sky)
 const uint32_t kBloomLevels = 5;
 // xy: how far each pixel moved on screen since the frame before (uv units; x = 1000: nothing drawn there),
 // z: 1 = the surface belongs to something that moves by itself (a car). (The scene colour target has no alpha
 // channel, so this cannot live there: a mask written to its alpha read back as 1 everywhere.)
 const DXGI_FORMAT kVelocityFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+const DXGI_FORMAT kOcclusionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; // rgb: light bounced off nearby surfaces, a: ambient occlusion
 const DXGI_FORMAT kSurfaceFormat = DXGI_FORMAT_R16G16B16A16_UNORM; // normal (octahedral, xy), roughness of the reflecting lobe, its weight
 const uint32_t kMaxProbes = 4;        // reflection probes blended per frame (the nearest to the camera)
 const uint32_t kDefaultsSlot = 7; // vertex buffer slot that feeds the semantics a mesh does not have
@@ -67,6 +75,11 @@ struct FrameConstants {
 	float postParams[4];      // bloom mix (0 = off), bloom scatter, motion blur intensity, 1 = temporal antialiasing
 	float ssrParams[4];       // 1 = on, smoothness below which there is none, smoothness from which it is full, screen fade distance
 	float qualityParams[4];   // x: how far the sun's shadow edges are blurred, in shadow map texels
+	float atmosphere[4];      // x: the physical sky's scale to scene units, y: night sky floor, z: eye altitude (km), w: 1 = physical sky
+	float clouds[4];          // x: coverage, yz: how far the wind has carried them (noise uv), w: 1 = clouds
+	float probeGrid[4];          // x: the grid's spacing, y: its spacing in height, z: a different number every frame, w: 1 = probes on
+	float probePositions[8][4];  // xyz: where the probe stands, w: 1 = usable
+	float reflectionBasis[6][3][4]; // per cube face: the directions of the tile's centre, its right edge and its top edge (w of the first two: near, far)
 };
 
 // HDRP's "Custom" tone mapping is John Hable's piecewise filmic curve (toe, linear part, shoulder), with the parameters
@@ -250,6 +263,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	psParticle_ = sm.Compile("scene_particles.hlsl", "PSParticle", "ps_5_1");
 	particlePipeline_.Reset();
 	particlePipelineFailed_ = false;
+	atmosphereLutsValid_ = false; // (the LUT shaders may have changed)
 	failedShaders_ = !vsMain_ || !vsShadow_ || !psForward_ || !psDepthAlpha_ || !psShadowAlpha_ || !vsFullscreen_ || !psDecal_;
 	static_assert(_countof(kFullscreenEntry) == kFullscreenKindCount, "one entry point per full screen pass");
 	for (int k = 0; k < kFullscreenKindCount; ++k) {
@@ -263,10 +277,26 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	if (!root_) {
 		D3D12_DESCRIPTOR_RANGE materialRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kAeSlotCount, 0, 1, 0};
 		// space2: t0 shadow atlas, t1 sky, t2 exposure, t3 ambient occlusion | t4..t6 the inputs of a full screen pass
-		D3D12_DESCRIPTOR_RANGE globalsRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kGlobalsTableSize, 0, 2, 0};
+		// (two ranges in one table: t0..t3 of space2, then t0..t3 of space4 for the physical sky's textures)
+		D3D12_DESCRIPTOR_RANGE globalsRange[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 2, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7, 0, 4, 4}}; // (space4 t4..t6: the reflection probes)
 		D3D12_DESCRIPTOR_RANGE postRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kPostTableSize, 4, 2, 0};
 		D3D12_DESCRIPTOR_RANGE probesRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxProbes, 0, 3, 0}; // space3: reflection probe cubes
-		D3D12_ROOT_PARAMETER params[12] = {};
+		D3D12_ROOT_PARAMETER params[18] = {};
+		// space5: every texture in the SRV heap, by its index there (a ray's hit reads the base texture of whatever
+		// material it landed on: there is no telling which beforehand)
+		static const D3D12_DESCRIPTOR_RANGE allTexturesRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GpuResources::kSrvHeapSize, 0, 5, 0};
+		params[17].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[17].DescriptorTable = {1, &allTexturesRange};
+		params[17].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		params[16].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t10: the ray instances' materials
+		params[16].Descriptor = {10, 0};
+		params[16].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		// t6..t9: the ray tracing buffers (pooled nodes, pooled triangles, this frame's instance tree, its instances)
+		for (UINT i = 0; i < 4; ++i) {
+			params[12 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+			params[12 + i].Descriptor = {6 + i, 0};
+			params[12 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		}
 		params[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t5: the instance map
 		params[11].Descriptor = {5, 0};
 		params[11].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -285,7 +315,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 		params[7].DescriptorTable = {1, &materialRange};
 		params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[8].DescriptorTable = {1, &globalsRange};
+		params[8].DescriptorTable = {2, globalsRange};
 		params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		params[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 		params[9].DescriptorTable = {1, &postRange};
@@ -474,6 +504,7 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 	if (hasPosition) {
 		const bool shadow = kind == kShadow || kind == kShadowAlpha;
 		const bool forward = kind >= kForward;
+		const bool probe = kind == kForwardProbe;
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
 		d.pRootSignature = root_.Get();
 		ID3DBlob* vs = shadow ? vsShadow_.Get() : vsMain_.Get();
@@ -493,7 +524,7 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 		}
 		// (a decal box is drawn without a depth buffer: its pixel shader reads the scene depth and decides itself)
 		d.DepthStencilState.DepthEnable = kind == kDecal ? FALSE : TRUE;
-		d.DepthStencilState.DepthWriteMask = forward ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+		d.DepthStencilState.DepthWriteMask = forward && !probe ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL; // (the reflection cube has no depth prepass)
 		d.DepthStencilState.DepthFunc = shadow ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_GREATER_EQUAL;
 		d.DSVFormat = kind == kDecal ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_D32_FLOAT;
 		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
@@ -510,7 +541,7 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 		if (forward) {
 			// the opaque pass also writes what the reflection pass needs to know about each surface
 			d.NumRenderTargets = kind == kForward ? 3 : 1;
-			d.RTVFormats[0] = kSceneColorFormat;
+			d.RTVFormats[0] = probe ? kReflectionFormat : kSceneColorFormat;
 			d.RTVFormats[1] = kind == kForward ? kSurfaceFormat : DXGI_FORMAT_UNKNOWN;
 			d.RTVFormats[2] = kind == kForward ? kVelocityFormat : DXGI_FORMAT_UNKNOWN;
 		}
@@ -582,6 +613,17 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI
 	d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
 	d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 	d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	if (kind == kFullscreenFogApply) {
+		// picture * what the fog lets through + the fog's own light (the shader returns the light in rgb, the rest in a)
+		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
+		blend.BlendEnable = TRUE;
+		blend.SrcBlend = D3D12_BLEND_ONE;
+		blend.DestBlend = D3D12_BLEND_SRC_ALPHA;
+		blend.BlendOp = D3D12_BLEND_OP_ADD;
+		blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+		blend.DestBlendAlpha = D3D12_BLEND_ONE;
+		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	}
 	if (kind == kFullscreenSsr) {
 		// added to the picture (the shader returns the reflection minus what the surface already shows there)
 		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
@@ -619,6 +661,9 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI
 void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 	SceneStore& store = SceneStore::Get();
 	opaque_.clear();
+	probeItems_.clear();
+	rayMaterials_.clear();
+	const Vec3 cameraNow = {scene.frame.cameraPosition[0], scene.frame.cameraPosition[1], scene.frame.cameraPosition[2]};
 	decals_.clear();
 	transparent_.clear();
 	casters_.clear();
@@ -655,7 +700,14 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 		const float radius = Length(Vec3{mesh->desc.boundsExtents[0], mesh->desc.boundsExtents[1], mesh->desc.boundsExtents[2]}) * scale;
 		const bool inView = !inst.shadowOnly && SphereVisible(planes, center, radius);
 		const bool castsShadow = (inst.desc.flags & kAeInstanceCastShadows) != 0;
-		if (!inView && !castsShadow) {
+		// (the reflection cube: what is near enough and large enough to be seen in a reflection)
+		// (the reflection probes stand near the camera: what is near enough and large enough to show in them, and stands still)
+		const float probeDistance = Length(center - cameraNow);
+		const bool inProbe = reflection_ && probeJobCount_ > 0 && !inst.shadowOnly && !inst.moved && probeDistance - radius < kReflectionFar &&
+			radius > 0.2f && radius > std::max(probeDistance - 30.0f, 0.0f) * 0.01f;
+		// (rays may find anything the camera would show, in view or not)
+		const bool inRays = raysWanted_ && !inst.shadowOnly;
+		if (!inView && !castsShadow && !inProbe && !inRays) {
 			continue;
 		}
 		const bool mirrored = Determinant3x3(world) < 0;
@@ -744,6 +796,14 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 			if (item.castsShadow) {
 				casters_.push_back(item);
 			}
+			if (inProbe && material && !(flags & kAeMaterialBlend)) {
+				const uint32_t cls = material->desc.materialClass;
+				const bool vehicle = cls == kAeMaterialVehiclePaint || cls == kAeMaterialVehicleGeneric || cls == kAeMaterialVehicleGlass || cls == kAeMaterialVehicleRim ||
+					cls == kAeMaterialVehicleStitches || cls == kAeMaterialVehicleLights || cls == kAeMaterialVehicleTire;
+				if (!vehicle && cls != kAeMaterialBlobShadow && cls != kAeMaterialUnsupported) {
+					probeItems_.push_back(item);
+				}
+			}
 			if (!inView) {
 				continue;
 			}
@@ -757,12 +817,200 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 				opaque_.push_back(item);
 			}
 		}
+		if (inRays) {
+			// Not there for rays: what is not a surface (the cars' blob shadow boxes, helper geometry, materials Aether does
+			// not translate) and what light goes through (glass, anything blended): a bit per sub mesh. The others'
+			// materials go into the table a hit looks its colour up in.
+			uint32_t skip = 0, kept = 0, twoSided = 0;
+			const uint32_t materialOffset = uint32_t(rayMaterials_.size() / 2);
+			const uint32_t count = uint32_t(inst.materials.size());
+			for (uint32_t s = 0; s < count; ++s) {
+				const SceneMaterial* material = inst.materials[s] ? store.Material(inst.materials[s]) : nullptr;
+				const uint32_t cls = material ? material->desc.materialClass : uint32_t(kAeMaterialUnsupported);
+				const bool solid = material && cls != kAeMaterialUnsupported && cls != kAeMaterialSkip && cls != kAeMaterialBlobShadow && !(material->desc.flags & kAeMaterialBlend);
+				if (solid) {
+					++kept;
+				} else if (s < 32) {
+					skip |= 1u << s;
+				}
+				if (material && (material->desc.flags & kAeMaterialDoubleSided) && s < 32) {
+					twoSided |= 1u << s;
+				}
+				rayMaterials_.push_back(material && material->frameStamp == frame ? material->frameIndex : 0);
+				// (the texture a hit on this sub mesh is coloured with)
+				SceneTexture* base = material && material->desc.textures[kAeSlotBase] ? store.Texture(material->desc.textures[kAeSlotBase]) : nullptr;
+				rayMaterials_.push_back(base && base->srv != UINT32_MAX && base->desc.dimension != kAeTextureCube ? base->srv : UINT32_MAX);
+				if (base) {
+					base->lastUsedFrame = frame;
+				}
+			}
+			if (kept > 0) {
+				SceneBvh::Get().AddInstance(inst.desc.mesh, world, skip, materialOffset, twoSided, mirrored);
+			}
+		}
 	}
 	// equal keys next to each other, sub mesh by sub mesh: DrawItems turns such runs into one instanced draw
+	if (rayMaterials_.empty()) {
+		rayMaterials_.push_back(0);
+		rayMaterials_.push_back(UINT32_MAX);
+	}
 	auto byKey = [](const DrawItem& a, const DrawItem& b) { return a.sortKey != b.sortKey ? a.sortKey < b.sortKey : a.subMesh < b.subMesh; };
 	std::sort(opaque_.begin(), opaque_.end(), byKey);
 	std::sort(casters_.begin(), casters_.end(), byKey);
+	std::sort(probeItems_.begin(), probeItems_.end(), byKey);
 	std::sort(transparent_.begin(), transparent_.end(), [](const DrawItem& a, const DrawItem& b) { return a.depth > b.depth; }); // back to front
+}
+
+// ---- reflection probes: where they stand and which faces are drawn this frame
+//
+// The probes stand on a grid in the world. The four places around the camera (a little ahead of it when it moves)
+// are wanted; a wanted place without a probe takes the slot that has gone unwanted longest. A new probe's faces come
+// first (two a frame); when every wanted probe is whole, the one drawn longest ago is drawn again, face by face: the
+// light changes with the time of day.
+void SceneRenderer::UpdateProbes(const SceneFrame& scene, uint64_t frame) {
+	const Vec3 camera = {scene.frame.cameraPosition[0], scene.frame.cameraPosition[1], scene.frame.cameraPosition[2]};
+	// Where the camera is heading: its travel, smoothed. (A view that jumps, another camera or the player swinging
+	// the view round the car, is not travel: taken at face value it sent the probes metres away for a few frames, the
+	// ones around the camera were given up for them, and the picture showed the sky's reflection until they were
+	// drawn again: a flash.)
+	if (probeCameraValid_) {
+		const Vec3 step = camera - probeCameraBefore_;
+		if (Length(step) < 3.0f) { // (3 m in a frame is 650 km/h at 60 frames a second: more is a cut)
+			probeAhead_ = probeAhead_ * 0.92f + step * (30.0f * 0.08f);
+			const float len = Length(probeAhead_);
+			if (len > 24.0f) {
+				probeAhead_ = probeAhead_ * (24.0f / len);
+			}
+		}
+	} else {
+		probeAhead_ = {0, 0, 0};
+	}
+	probeCameraBefore_ = camera;
+	probeCameraValid_ = true;
+	// The four places around the camera are always wanted; then the four around where it is heading, as far as there
+	// are slots nobody wants this frame (so that they are drawn before the camera gets there).
+	const int cy = int(std::floor(camera.y / kProbeCellHeight + 0.5f));
+	int wanted[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+	for (int k = 0; k < 8; ++k) {
+		const Vec3 at = k < 4 ? camera : camera + probeAhead_;
+		const int cx = int(std::floor(at.x / kProbeCell)), cz = int(std::floor(at.z / kProbeCell));
+		const int cell[3] = {cx + (k & 1), cy, cz + ((k >> 1) & 1)};
+		int slot = -1;
+		for (uint32_t s = 0; s < kProbeSlots; ++s) {
+			if (lightProbes_[s].used && lightProbes_[s].cell[0] == cell[0] && lightProbes_[s].cell[1] == cell[1] && lightProbes_[s].cell[2] == cell[2]) {
+				slot = int(s);
+			}
+		}
+		if (slot < 0) {
+			// the slot unwanted longest (an unused one first); never one wanted this frame
+			uint64_t oldest = UINT64_MAX;
+			for (uint32_t s = 0; s < kProbeSlots; ++s) {
+				const uint64_t age = lightProbes_[s].used ? lightProbes_[s].lastWanted : 0;
+				if (age < oldest && !(lightProbes_[s].used && lightProbes_[s].lastWanted == frame)) {
+					oldest = age;
+					slot = int(s);
+				}
+			}
+			// (for a place ahead, a probe that still stands near the camera is not given up either)
+			if (slot >= 0 && k >= 4 && lightProbes_[slot].used && Length(lightProbes_[slot].position - camera) < kProbeCell * 2.0f) {
+				slot = -1;
+			}
+			if (slot < 0) {
+				continue;
+			}
+			LightProbe& p = lightProbes_[slot];
+			p = LightProbe();
+			p.used = true;
+			memcpy(p.cell, cell, sizeof(cell));
+			// (a metre above the grid's level: the level nearest the camera's height is about where the ground is)
+			p.position = {float(cell[0]) * kProbeCell, float(cell[1]) * kProbeCellHeight + 1.0f, float(cell[2]) * kProbeCell};
+		}
+		lightProbes_[slot].lastWanted = frame;
+		wanted[k] = slot;
+	}
+	// this frame's faces: unfinished probes first (the nearest to the camera), else the probe drawn longest ago
+	for (uint32_t j = 0; j < _countof(probeJobs_); ++j) {
+		int best = -1;
+		float bestScore = 0;
+		for (int k = 0; k < 8; ++k) {
+			if (wanted[k] < 0) {
+				continue;
+			}
+			const LightProbe& p = lightProbes_[wanted[k]];
+			const bool whole = p.facesDone == 0x3Fu;
+			const float score = whole ? float(frame - p.lastDrawn) : 1e9f - Length(p.position - camera);
+			if (best < 0 || score > bestScore) {
+				best = wanted[k];
+				bestScore = score;
+			}
+		}
+		if (best < 0) {
+			break;
+		}
+		LightProbe& p = lightProbes_[best];
+		uint32_t face = p.nextFace % 6;
+		if (p.facesDone != 0x3Fu) {
+			while (p.facesDone & (1u << face)) {
+				face = (face + 1) % 6;
+			}
+		}
+		ProbeFaceJob& job = probeJobs_[probeJobCount_++];
+		job.slot = uint32_t(best);
+		job.face = face;
+		// (bit 0 of cb, until the constants are uploaded: this face is drawn for the first time, the probe is not whole before the frame is over)
+		job.cb = (p.facesDone & (1u << face)) ? 0 : 1;
+		p.facesDone |= 1u << face;
+		if (p.facesDone == 0x3Fu && p.wholeSince == 0) {
+			p.wholeSince = frame;
+		}
+		p.nextFace = face + 1;
+		p.lastDrawn = frame;
+	}
+}
+
+// ---- the physical sky's sun (the atmosphere's numbers are the same as in shaders/aether_atmosphere.hlsli)
+
+// Where the sun stands at `hours` (0 .. 24) for a place at 35 degrees north in early summer; north is +Z, east +X.
+static Vec3 SunDirectionAt(float hours, float headingDegrees) {
+	const float kPi = 3.14159265f;
+	const float latitude = 35.0f * kPi / 180.0f, declination = 15.0f * kPi / 180.0f;
+	const float hourAngle = (hours - 12.0f) * 15.0f * kPi / 180.0f;
+	const float sinElevation = std::sin(latitude) * std::sin(declination) + std::cos(latitude) * std::cos(declination) * std::cos(hourAngle);
+	const float elevation = std::asin(std::min(std::max(sinElevation, -1.0f), 1.0f));
+	const float cosElevation = std::max(std::cos(elevation), 1e-4f);
+	float cosAzimuth = (std::sin(declination) - sinElevation * std::sin(latitude)) / (cosElevation * std::cos(latitude));
+	float azimuth = std::acos(std::min(std::max(cosAzimuth, -1.0f), 1.0f)); // from north, towards the east
+	if (hourAngle > 0.0f) {
+		azimuth = 2.0f * kPi - azimuth; // afternoon: in the west
+	}
+	azimuth += headingDegrees * kPi / 180.0f;
+	return Normalize(Vec3{cosElevation * std::sin(azimuth), sinElevation, cosElevation * std::cos(azimuth)});
+}
+
+// What is left of the sun's light at the ground when the sun stands at `cosZenith` (1 = overhead).
+static Vec3 AtmosphereTransmittance(float cosZenith) {
+	const double ground = 6360.0, top = 6460.0;
+	const double r0 = ground + 0.05;
+	const double c = std::min(std::max(double(cosZenith), -1.0), 1.0), s = std::sqrt(std::max(0.0, 1.0 - c * c));
+	// the ray (0, r0) + t (s, c): to the top sphere; behind the ground: nothing
+	const double b = r0 * c;
+	if (c < 0.0 && b * b - (r0 * r0 - ground * ground) > 0.0) {
+		return {0, 0, 0};
+	}
+	const double end = -b + std::sqrt(std::max(0.0, b * b - (r0 * r0 - top * top)));
+	const int steps = 64;
+	double depth[3] = {0, 0, 0};
+	for (int i = 0; i < steps; ++i) {
+		const double t = end * (i + 0.5) / steps;
+		const double x = s * t, y = r0 + c * t;
+		const double h = std::max(std::sqrt(x * x + y * y) - ground, 0.0);
+		const double densityR = std::exp(-h / 8.0), densityM = std::exp(-h / 1.2), ozone = std::max(0.0, 1.0 - std::abs(h - 25.0) / 15.0);
+		const double rayleigh[3] = {5.802e-3, 13.558e-3, 33.1e-3}, absorb[3] = {0.650e-3, 1.881e-3, 0.085e-3};
+		for (int k = 0; k < 3; ++k) {
+			depth[k] += (rayleigh[k] * densityR + (3.996e-3 + 4.40e-3) * densityM + absorb[k] * ozone) * end / steps;
+		}
+	}
+	return {float(std::exp(-depth[0])), float(std::exp(-depth[1])), float(std::exp(-depth[2]))};
 }
 
 void SceneRenderer::BuildCascades(const SceneFrame& scene, const SettingsData& settings) {
@@ -783,6 +1031,27 @@ void SceneRenderer::BuildCascades(const SceneFrame& scene, const SettingsData& s
 			sunColor_ = {l.color[0], l.color[1], l.color[2]};
 			sunShadows_ = (l.flags & kAeLightCastsShadows) != 0;
 			sunLayerMask_ = l.layerMask;
+		}
+	}
+	// ---- the physical sky: the sun stands where the time of day puts it, and has the colour the air leaves it.
+	// The scene's own sun only sets the scale: at the height the scene had its sun, the physical sun is as bright as
+	// that one was, so the scene's exposure and the cars' lamps keep their meaning.
+	physicalSky_ = settings.skyMode == "physical" && settings.sky;
+	if (physicalSky_) {
+		const float sceneCos = hasSun_ ? std::max(sunDirection_.y, 0.1f) : 0.7f;
+		const Vec3 atScene = AtmosphereTransmittance(sceneCos);
+		const float atSceneLum = std::max(atScene.x * 0.2126f + atScene.y * 0.7152f + atScene.z * 0.0722f, 1e-3f);
+		atmosphereScale_ = (hasSun_ && best > 0 ? best : 30.0f) / atSceneLum;
+		if (!hasSun_) {
+			sunShadows_ = true;
+			sunLayerMask_ = ~0u;
+		}
+		sunDirection_ = SunDirectionAt(settings.timeOfDay, settings.sunHeading);
+		const Vec3 through = AtmosphereTransmittance(sunDirection_.y);
+		sunColor_ = {through.x * atmosphereScale_, through.y * atmosphereScale_, through.z * atmosphereScale_};
+		hasSun_ = sunDirection_.y > -0.02f && (sunColor_.x + sunColor_.y + sunColor_.z) > 0.0f;
+		if (!hasSun_) {
+			sunColor_ = {0, 0, 0};
 		}
 	}
 	if (!hasSun_ || !sunShadows_ || !settings.shadows || !shadowAtlas_) {
@@ -978,11 +1247,56 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.jitter[2] = historyValid_ ? 1.0f : 0.0f;
 	// screen space reflections read the picture of the frame before (the temporal history): none without it
 	ssr_ = settings.ssr && f.ssrEnabled != 0 && taa_;
-	fc.ssrParams[0] = ssr_ && historyValid_ ? 1.0f : 0.0f;
+	fc.ssrParams[0] = ssr_ && historyValid_ && history_[historyIndex_] && history_[historyIndex_]->desc.width == target.width && history_[historyIndex_]->desc.height == target.height ? 1.0f : 0.0f;
 	fc.ssrParams[1] = f.ssrMinSmoothness;
 	fc.ssrParams[2] = std::max(f.ssrSmoothnessFadeStart, f.ssrMinSmoothness);
 	fc.ssrParams[3] = f.ssrScreenFadeDistance;
 	fc.qualityParams[0] = settings.shadowSoftness;
+	// volumetric fog: where there is fog and a sun to light it
+	volumetricFog_ = settings.volumetricFog && f.fogDensity * settings.fogStrength > 0.0f;
+	fc.qualityParams[1] = volumetricFog_ ? 1.0f : 0.0f;
+	fc.qualityParams[3] = rayReflections_ ? 1.0f : 0.0f; // (smooth surfaces mirror what rays through the scene find)
+	// bounced light: read from the picture of the frame before, so only with the temporal history
+	// ---- reflection probes: the faces' directions (the same for every probe) and where the usable probes stand
+	if (reflection_) {
+		static const Vec3 kForward[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+		static const Vec3 kUp[6] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
+		const Mat4 faceProj = PerspectiveReversedZ(3.14159265f * 0.5f, 1.0f, kReflectionNear, kReflectionFar);
+		for (int i = 0; i < 6; ++i) {
+			const Mat4 inv = Inverse(faceProj * LookAlong({0, 0, 0}, kForward[i], kUp[i]));
+			// (the tile's centre, right edge and top edge as directions: what the lookups turn a direction into a place with)
+			const Vec3 c = TransformProjective(inv, {0, 0, 0.5f}), r = TransformProjective(inv, {1, 0, 0.5f}), u = TransformProjective(inv, {0, 1, 0.5f});
+			const Vec3 basis[3] = {c, r - c, u - c};
+			fc.reflectionBasis[i][0][3] = kReflectionNear; // (the cubes' depth range, for reading distances from their depth)
+			fc.reflectionBasis[i][1][3] = kReflectionFar;
+			for (int k = 0; k < 3; ++k) {
+				fc.reflectionBasis[i][k][0] = basis[k].x;
+				fc.reflectionBasis[i][k][1] = basis[k].y;
+				fc.reflectionBasis[i][k][2] = basis[k].z;
+			}
+		}
+		fc.probeGrid[0] = kProbeCell;
+		fc.probeGrid[1] = kProbeCellHeight;
+		fc.probeGrid[2] = float(frame_ % 1024) * 0.61803f;
+		fc.probeGrid[3] = 1.0f;
+		for (uint32_t s = 0; s < kProbeSlots; ++s) {
+			const LightProbe& p = lightProbes_[s];
+			fc.probePositions[s][0] = p.position.x;
+			fc.probePositions[s][1] = p.position.y;
+			fc.probePositions[s][2] = p.position.z;
+			// (usable: every face drawn, not counting the ones being drawn this frame for the first time)
+			uint32_t done = p.facesDone;
+			for (uint32_t j = 0; j < probeJobCount_; ++j) {
+				if (probeJobs_[j].slot == s && p.lastDrawn == frame_ && (probeJobs_[j].cb & 1ull) != 0) {
+					done &= ~(1u << probeJobs_[j].face);
+				}
+			}
+			// (a probe that has just become whole comes in over half a second, not at once)
+			fc.probePositions[s][3] = p.used && done == 0x3Fu && p.wholeSince ? std::min(float(frame_ - p.wholeSince) / 30.0f, 1.0f) : 0.0f;
+		}
+	}
+	indirect_ = settings.indirectLight && settings.ssao && taa_ && historyValid_;
+	fc.qualityParams[2] = indirect_ ? settings.indirectStrength : 0.0f;
 	memcpy(fc.prevViewProj, prevViewProj_.m, 64);
 	prevViewProj_ = cleanViewProj;
 	fc.postParams[0] = bloomMix_;
@@ -1063,7 +1377,7 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	}
 	fc.exposure[2] = std::pow(2.0f, settings.exposureEV + f.postExposure);
 	// tone mapping: 0 none, 1 ACES, 2 neutral, 3 the host's custom curve
-	float tone = settings.tonemap == "aces" ? 1.0f : settings.tonemap == "neutral" ? 2.0f : 0.0f;
+	float tone = settings.tonemap == "aces" ? 1.0f : settings.tonemap == "neutral" ? 2.0f : settings.tonemap == "agx" ? 4.0f : 0.0f;
 	if (settings.tonemap == "host") {
 		switch (f.tonemapMode) {
 		case kAeTonemapNone: tone = 0.0f; break;
@@ -1078,7 +1392,69 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.exposure[3] = tone;
 	const auto& views = DebugViewNames();
 	fc.misc[0] = float(std::find(views.begin(), views.end(), settings.debugView) - views.begin());
-	fc.misc[1] = sky && sky->srv != UINT32_MAX ? 1.0f : 0.0f;
+	const bool skyTexture = sky && sky->srv != UINT32_MAX;
+	fc.misc[1] = skyTexture || physicalSky_ ? 1.0f : 0.0f; // (a sky there is: its texture, or the physical one)
+	fc.atmosphere[0] = atmosphereScale_;
+	fc.atmosphere[1] = atmosphereScale_ * 2.0e-5f; // what a moonless night leaves (airglow, stars): keeps the night from being black
+	fc.atmosphere[2] = std::min(std::max(f.cameraPosition[1], 0.0f) * 0.001f + 0.05f, 60.0f);
+	fc.atmosphere[3] = physicalSky_ ? 1.0f : 0.0f;
+	if (physicalSky_) {
+		// (the direction also when the sun is down: the twilight sky needs it)
+		fc.sunDirection[0] = sunDirection_.x;
+		fc.sunDirection[1] = sunDirection_.y;
+		fc.sunDirection[2] = sunDirection_.z;
+		// the scene's exposure range is made for its own sky: evenings and nights need far more room
+		fc.exposureParams[0] -= 14.0f;
+		GpuTextureDesc d;
+		d.format = d.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		d.renderTarget = true;
+		if (!transmittanceLut_) {
+			d.width = 256;
+			d.height = 64;
+			transmittanceLut_ = gpu.CreateTexture(d, "Sky.Transmittance", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+			atmosphereLutsValid_ = false;
+		}
+		if (!multiScatterLut_) {
+			d.width = d.height = 32;
+			multiScatterLut_ = gpu.CreateTexture(d, "Sky.MultipleScattering", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+			atmosphereLutsValid_ = false;
+		}
+		if (!skyViewLut_) {
+			d.width = 192;
+			d.height = 108;
+			skyViewLut_ = gpu.CreateTexture(d, "Sky.View", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		}
+		if (!cloudNoise_) {
+			GpuTextureDesc n;
+			n.width = n.height = 512;
+			n.format = n.targetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+			n.renderTarget = true;
+			cloudNoise_ = gpu.CreateTexture(n, "Sky.CloudNoise", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+			atmosphereLutsValid_ = false;
+		}
+		if (!skyCloudsLut_) {
+			d.width = 384;
+			d.height = 216;
+			skyCloudsLut_ = gpu.CreateTexture(d, "Sky.WithClouds", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		}
+		if (!transmittanceLut_ || !multiScatterLut_ || !skyViewLut_ || !cloudNoise_ || !skyCloudsLut_) {
+			physicalSky_ = false;
+			fc.atmosphere[3] = 0.0f;
+			fc.misc[1] = skyTexture ? 1.0f : 0.0f;
+		}
+	}
+	// clouds: with the physical sky, where the setting asks for any (set here: the constants are uploaded right below)
+	clouds_ = physicalSky_ && settings.cloudCoverage > 0.01f;
+	{
+		const auto now = std::chrono::steady_clock::now();
+		cloudDrift_ += std::min(std::chrono::duration<float>(now - cloudClock_).count(), 0.25f) * settings.cloudSpeed * 0.0012f;
+		cloudDrift_ -= std::floor(cloudDrift_ / 64.0f) * 64.0f;
+		cloudClock_ = now;
+	}
+	fc.clouds[0] = clouds_ ? settings.cloudCoverage : 0.0f;
+	fc.clouds[1] = cloudDrift_;
+	fc.clouds[2] = cloudDrift_ * 0.37f;
+	fc.clouds[3] = clouds_ ? 1.0f : 0.0f;
 	frameSky_ = fc.misc[1] > 0.5f;
 	fc.misc[2] = sky ? float(std::max<uint32_t>(sky->desc.mipCount, 1)) : 1.0f;
 	fc.misc[3] = f.ambientIntensity;
@@ -1087,7 +1463,7 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.skyParams[2] = std::sin(f.skyRotation);
 	const bool fogFromSky = (f.fogFlags & kAeFogColorFromSky) != 0;
 	memcpy(fc.fog, fogFromSky ? f.fogTint : f.fogColor, sizeof(f.fogColor));
-	fc.fog[3] = f.fogDensity;
+	fc.fog[3] = f.fogDensity * settings.fogStrength;
 	fc.fogHeight[0] = f.fogBaseHeight;
 	// HDRP's height fog: the layer's depth times 0.144765 is the height over which the density falls to 1 / e
 	fc.fogHeight[1] = 1.0f / (std::max(0.01f, f.fogMaxHeight - f.fogBaseHeight) * 0.144765f);
@@ -1103,6 +1479,42 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		return a.gpu;
 	};
 	frameCb_ = upload(&fc, sizeof(fc), 256);
+	// (a probe's face is drawn with the frame's constants, seen from the probe: no screen space inputs, no clusters,
+	// fog per surface, and no probes: they are what is being drawn)
+	for (uint32_t j = 0; j < probeJobCount_; ++j) {
+		static const Vec3 kForward[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+		static const Vec3 kUp[6] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
+		ProbeFaceJob& job = probeJobs_[j];
+		FrameConstants face = fc;
+		const Vec3 eye = lightProbes_[job.slot].position;
+		face.cameraPos[0] = eye.x;
+		face.cameraPos[1] = eye.y;
+		face.cameraPos[2] = eye.z;
+		const Mat4 faceView = LookAlong(eye, kForward[job.face], kUp[job.face]);
+		const Mat4 faceProj = PerspectiveReversedZ(3.14159265f * 0.5f, 1.0f, kReflectionNear, kReflectionFar);
+		const Mat4 faceViewProj = faceProj * faceView;
+		memcpy(face.view, faceView.m, sizeof(face.view));
+		memcpy(face.proj, faceProj.m, sizeof(face.proj));
+		memcpy(face.viewProj, faceViewProj.m, sizeof(face.viewProj));
+		memcpy(face.invViewProj, Inverse(faceViewProj).m, sizeof(face.invViewProj));
+		memcpy(face.prevViewProj, faceViewProj.m, sizeof(face.prevViewProj));
+		face.screenSize[0] = face.screenSize[1] = float(kProbeFace);
+		face.screenSize[2] = face.screenSize[3] = 1.0f / float(kProbeFace);
+		face.jitter[0] = face.jitter[1] = face.jitter[2] = 0;
+		face.clusterCounts[0] = 0;
+		face.aoParams[3] = 0;
+		face.qualityParams[1] = 0;
+		face.qualityParams[2] = 0;
+		face.misc[0] = 0;
+		face.ssrParams[0] = 0;
+		face.probeGrid[3] = 0;
+		face.probeCount[0] = 0;
+		FrustumPlanes(faceViewProj, reinterpret_cast<Plane*>(job.planes));
+		job.cb = upload(&face, sizeof(face), 256);
+		if (!job.cb) {
+			probeJobCount_ = 0;
+		}
+	}
 	if (instanceData_.empty()) {
 		instanceData_.resize(sizeof(InstanceData));
 	}
@@ -1127,11 +1539,12 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		particlesVa_ = upload(particleData_.data(), particleData_.size() * sizeof(AeParticle), 16);
 	}
 	materialsVa_ = upload(materialData_.data(), materialData_.size(), 16);
+	rayMaterialsVa_ = upload(rayMaterials_.data(), rayMaterials_.size() * sizeof(uint32_t), 16);
 	lightsVa_ = upload(lightData_.data(), lightData_.size(), 16);
 	gridVa_ = upload(clusterGrid_.data(), clusterGrid_.size() * sizeof(uint32_t), 16);
 	indicesVa_ = upload(lightIndices_.data(), lightIndices_.size() * sizeof(uint32_t), 16);
 	// the instance map is written while the passes are recorded: room for every list once per pass that draws it
-	instanceMapCapacity_ = uint32_t(opaque_.size() * 2 + transparent_.size() + decals_.size() + casters_.size() * 4 + 4);
+	instanceMapCapacity_ = uint32_t(opaque_.size() * 2 + transparent_.size() + decals_.size() + casters_.size() * 4 + probeItems_.size() * 2 + 4);
 	const UploadAllocation map = gpu.Upload(size_t(instanceMapCapacity_) * sizeof(uint32_t), 16);
 	instanceMap_ = static_cast<uint32_t*>(map.cpu);
 	instanceMapVa_ = map.gpu;
@@ -1149,7 +1562,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		struct Candidate { const AeProbe* probe; SceneTexture* texture; float distance; };
 		std::vector<Candidate> candidates;
 		for (const AeProbe& p : scene.probes) {
-			SceneTexture* texture = settings.sky ? store.Texture(p.texture) : nullptr;
+			// (not with the physical sky: the scene's probes were baked with the scene's own sky and sun in them)
+			SceneTexture* texture = settings.sky && !physicalSky_ ? store.Texture(p.texture) : nullptr;
 			if (!texture || texture->srv == UINT32_MAX || texture->desc.dimension != kAeTextureCube) {
 				continue;
 			}
@@ -1181,7 +1595,31 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		return false;
 	}
 	gpu.CopySrv(globalsTable_, shadowAtlas_ ? shadowAtlas_->srv : nullTextureSrv_);
-	gpu.CopySrv(globalsTable_ + 1, fc.misc[1] > 0.5f ? sky->srv : nullCubeSrv_);
+	gpu.CopySrv(globalsTable_ + 1, skyTexture ? sky->srv : nullCubeSrv_);
+	gpu.CopySrv(globalsTable_ + 4, physicalSky_ ? (clouds_ ? skyCloudsLut_->srv : skyViewLut_->srv) : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 5, physicalSky_ ? transmittanceLut_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 6, physicalSky_ ? multiScatterLut_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 7, physicalSky_ ? cloudNoise_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 8, reflection_ && reflectionAtlas_[0] ? reflectionAtlas_[0]->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 9, reflection_ && reflectionAtlas_[1] ? reflectionAtlas_[1]->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 10, reflection_ && reflectionDepth_ ? reflectionDepth_->srv : nullTextureSrv_);
+	// (the table the cube's own faces are drawn with: the same, without the cube and without screen space occlusion)
+	probeGlobalsTable_ = reflection_ ? gpu.AllocSrv(kGlobalsTableSize) : UINT32_MAX;
+	if (probeGlobalsTable_ != UINT32_MAX) {
+		gpu.CopySrv(probeGlobalsTable_, shadowAtlas_ ? shadowAtlas_->srv : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 1, skyTexture ? sky->srv : nullCubeSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 2, irradiance_ ? irradiance_->srv : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 3, white_->srv);
+		gpu.CopySrv(probeGlobalsTable_ + 4, physicalSky_ ? (clouds_ ? skyCloudsLut_->srv : skyViewLut_->srv) : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 5, physicalSky_ ? transmittanceLut_->srv : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 6, physicalSky_ ? multiScatterLut_->srv : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 7, physicalSky_ ? cloudNoise_->srv : nullTextureSrv_);
+		for (uint32_t i = 0; i < 3; ++i) {
+			gpu.CopySrv(probeGlobalsTable_ + 8 + i, nullTextureSrv_);
+		}
+	} else {
+		reflection_ = false;
+	}
 	gpu.CopySrv(globalsTable_ + 2, irradiance_ ? irradiance_->srv : nullTextureSrv_);
 	postNext_ = 4;
 	gpu.CopySrv(globalsTable_ + 3, white_->srv); // replaced by the ambient occlusion texture when that pass runs
@@ -1206,6 +1644,14 @@ void SceneRenderer::BindCommon(ID3D12GraphicsCommandList* list, bool globals) {
 	list->SetGraphicsRootShaderResourceView(5, gridVa_);
 	list->SetGraphicsRootShaderResourceView(6, indicesVa_);
 	list->SetGraphicsRootShaderResourceView(11, instanceMapVa_);
+	// (always something valid in the slots: only passes that run when bvhReady_ read them)
+	SceneBvh& bvh = SceneBvh::Get();
+	list->SetGraphicsRootShaderResourceView(12, bvhReady_ ? bvh.NodesVa() : instancesVa_);
+	list->SetGraphicsRootShaderResourceView(13, bvhReady_ ? bvh.TrisVa() : instancesVa_);
+	list->SetGraphicsRootShaderResourceView(14, bvhReady_ ? bvh.TlasNodesVa() : instancesVa_);
+	list->SetGraphicsRootShaderResourceView(15, bvhReady_ ? bvh.TlasInstancesVa() : instancesVa_);
+	list->SetGraphicsRootShaderResourceView(16, bvhReady_ && rayMaterialsVa_ ? rayMaterialsVa_ : instancesVa_);
+	list->SetGraphicsRootDescriptorTable(17, gpu.SrvGpu(0));
 	if (globals) {
 		list->SetGraphicsRootDescriptorTable(8, gpu.SrvGpu(globalsTable_));
 		list->SetGraphicsRootDescriptorTable(10, gpu.SrvGpu(probesTable_));
@@ -1247,7 +1693,7 @@ void SceneRenderer::DrawItems(RenderGraph::PassContext& ctx, const std::vector<D
 			list->SetGraphicsRootDescriptorTable(7, gpu.SrvGpu(batch.table));
 			boundTable = batch.table;
 		}
-		const uint32_t constants[4] = {batch.start, item.materialIndex, uint32_t(std::max(cascade, 0)), (item.mirrored ? 1u : 0u) | (opaqueKind == kForward ? 0u : 2u)}; // bit 1: no screen space occlusion (blended passes)
+		const uint32_t constants[4] = {batch.start, item.materialIndex, uint32_t(std::max(cascade, 0)), (item.mirrored ? 1u : 0u) | (opaqueKind == kForward || opaqueKind == kForwardProbe ? 0u : 2u)}; // bit 1: no screen space occlusion (blended passes)
 		list->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
 		const AeSubMesh& sm = item.mesh->subMeshes[item.subMesh];
 		list->DrawIndexedInstanced(sm.indexCount, batch.count, sm.indexStart, INT(sm.baseVertex), 0);
@@ -1267,6 +1713,9 @@ void SceneRenderer::DrawItems(RenderGraph::PassContext& ctx, const std::vector<D
 			if (Length(lateral) > c.radius + item.radius || along < -(c.radius + item.radius)) {
 				continue;
 			}
+		}
+		if (cullPlanes_ && !SphereVisible(reinterpret_cast<const Plane*>(cullPlanes_), item.center, item.radius)) {
+			continue;
 		}
 		const uint32_t flags = item.material ? item.material->desc.flags : 0;
 		PassKind kind = (flags & kAeMaterialAlphaTest) ? alphaKind : opaqueKind;
@@ -1378,7 +1827,48 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	if (settings.shadows) {
 		EnsureShadowAtlas(cascadeSize, frame, retireFence);
 	}
+	// ---- reflection probes: their textures (made once), then which places want a probe and which faces are drawn now
+	reflection_ = settings.reflectionProbe;
+	for (int i = 0; i < 2 && reflection_; ++i) {
+		if (!reflectionAtlas_[i]) {
+			const uint32_t tile = i == 0 ? kProbeFace : kProbeBlurFace;
+			GpuTextureDesc d;
+			d.width = tile * 12;
+			d.height = tile * 4;
+			d.format = d.targetFormat = kReflectionFormat;
+			d.renderTarget = true;
+			reflectionAtlas_[i] = gpu.CreateTexture(d, i == 0 ? "Scene.ReflectionProbes" : "Scene.ReflectionProbes.Blur", ResourceCategory::RenderTarget, Lifetime::Persistent, frame);
+			for (LightProbe& p : lightProbes_) {
+				p = LightProbe();
+			}
+		}
+		reflection_ = reflectionAtlas_[i] != nullptr;
+	}
+	if (reflection_ && !reflectionDepth_) {
+		GpuTextureDesc d;
+		d.width = kProbeFace * 12;
+		d.height = kProbeFace * 4;
+		d.format = DXGI_FORMAT_R32_TYPELESS;
+		d.srvFormat = DXGI_FORMAT_R32_FLOAT;
+		d.targetFormat = DXGI_FORMAT_D32_FLOAT;
+		d.depthStencil = true;
+		d.clearDepth = 0.0f;
+		reflectionDepth_ = gpu.CreateTexture(d, "Scene.ReflectionProbes.Depth", ResourceCategory::DepthBuffer, Lifetime::Persistent, frame);
+		reflection_ = reflectionDepth_ != nullptr;
+	}
+	probeJobCount_ = 0;
+	if (reflection_) {
+		UpdateProbes(scene, frame);
+	}
+	// ---- ray tracing: the trees that arrived; the tree over this frame's instances is filled while the draw lists are
+	// built (the same walk over the instances) and built after it
+	raysWanted_ = settings.rayTracedReflections || settings.debugView == "bvh" || settings.debugView == "bvhCost";
+	SceneBvh::Get().BeginFrame(device_, list, retireFence, frame);
+	SceneBvh::Get().BeginInstances();
+	raysWanted_ = raysWanted_ && SceneBvh::Get().HasTrees();
 	BuildDrawLists(scene, frame);
+	bvhReady_ = raysWanted_ && SceneBvh::Get().EndInstances();
+	rayReflections_ = bvhReady_ && settings.rayTracedReflections;
 	BuildCascades(scene, settings);
 	BuildClusters(scene);
 	if (!UploadFrameData(scene, target, settings)) {
@@ -1446,6 +1936,53 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		d.renderTarget = true;
 		irradiance_ = gpu.CreateTexture(d, "Scene.SkyIrradiance", ResourceCategory::RenderTarget, Lifetime::Persistent, frame);
 	}
+	// ---- the physical sky's LUTs: transmittance and multiple scattering once, the sky around the camera every frame
+	if (physicalSky_) {
+		const RenderGraph::ResourceId transmittance = graph_.Import(transmittanceLut_), multiScatter = graph_.Import(multiScatterLut_), skyView = graph_.Import(skyViewLut_);
+		const RenderGraph::ResourceId cloudNoise = graph_.Import(cloudNoise_), skyClouds = graph_.Import(skyCloudsLut_);
+		if (!atmosphereLutsValid_) {
+			graph_.AddPass("SkyTransmittance", true, [&, transmittance](RenderGraph::Builder& b) { b.Write(transmittance, D3D12_RESOURCE_STATE_RENDER_TARGET); }, [&, transmittance](RenderGraph::PassContext& ctx) {
+				Fullscreen(ctx, kFullscreenTransmittanceLut, ctx.Texture(transmittance), nullptr);
+			});
+			graph_.AddPass("SkyMultipleScattering", true, [&, transmittance, multiScatter](RenderGraph::Builder& b) {
+				b.Read(transmittance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Write(multiScatter, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			}, [&, multiScatter](RenderGraph::PassContext& ctx) {
+				Fullscreen(ctx, kFullscreenMultiScatterLut, ctx.Texture(multiScatter), nullptr);
+			});
+			graph_.AddPass("CloudNoise", true, [&, cloudNoise](RenderGraph::Builder& b) { b.Write(cloudNoise, D3D12_RESOURCE_STATE_RENDER_TARGET); }, [&, cloudNoise](RenderGraph::PassContext& ctx) {
+				Fullscreen(ctx, kFullscreenCloudNoise, ctx.Texture(cloudNoise), nullptr);
+			});
+			atmosphereLutsValid_ = true;
+		}
+		graph_.AddPass("SkyView", true, [&, transmittance, multiScatter, skyView](RenderGraph::Builder& b) {
+			b.Read(transmittance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(multiScatter, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(skyView, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, skyView](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenSkyView, ctx.Texture(skyView), nullptr);
+		});
+		// the sky with the clouds in it (for reflections and the sky's diffuse light): the air's sky, then the clouds over it
+		if (clouds_) {
+			graph_.AddPass("SkyClouds", true, [&, transmittance, multiScatter, skyView, cloudNoise, skyClouds](RenderGraph::Builder& b) {
+				b.Read(transmittance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Read(multiScatter, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Read(skyView, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Read(cloudNoise, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Write(skyClouds, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			}, [&, skyView, skyClouds](RenderGraph::PassContext& ctx) {
+				Fullscreen(ctx, kFullscreenSkyClouds, ctx.Texture(skyClouds), ctx.Texture(skyView));
+			});
+		}
+		// (every later pass reads these through the globals table: this puts them into the state for that)
+		graph_.AddPass("SkyViewReady", true, [&, transmittance, multiScatter, skyView, cloudNoise, skyClouds](RenderGraph::Builder& b) {
+			b.Read(transmittance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(multiScatter, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(skyView, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(cloudNoise, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(skyClouds, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}, [](RenderGraph::PassContext&) {});
+	}
 	const bool skyLight = irradiance_ && frameSky_;
 	const RenderGraph::ResourceId irradiance = irradiance_ ? graph_.Import(irradiance_) : RenderGraph::kInvalid;
 	graph_.AddPass("SkyIrradiance", skyLight, [&](RenderGraph::Builder& b) { b.Write(irradiance, D3D12_RESOURCE_STATE_RENDER_TARGET); }, [&, irradiance](RenderGraph::PassContext& ctx) {
@@ -1455,14 +1992,14 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	GpuTextureDesc aoDesc;
 	aoDesc.width = target.width;
 	aoDesc.height = target.height;
-	aoDesc.format = aoDesc.targetFormat = DXGI_FORMAT_R8_UNORM;
+	aoDesc.format = aoDesc.targetFormat = kOcclusionFormat;
 	aoDesc.renderTarget = true;
 	aoDesc.clearColor[0] = aoDesc.clearColor[1] = aoDesc.clearColor[2] = aoDesc.clearColor[3] = 1.0f;
 	const bool ao = aoActive_;
 	const RenderGraph::ResourceId aoRaw = ao ? graph_.CreateTransient("SceneAO.Raw", aoDesc, ResourceCategory::RenderTarget) : RenderGraph::kInvalid;
 	const RenderGraph::ResourceId aoFinal = ao ? graph_.CreateTransient("SceneAO", aoDesc, ResourceCategory::RenderTarget) : RenderGraph::kInvalid;
 	auto fullscreenAo = [&, viewport, scissor](RenderGraph::PassContext& ctx, FullscreenKind kind, RenderGraph::ResourceId output, uint32_t table) {
-		ID3D12PipelineState* pso = FullscreenPipeline(kind, DXGI_FORMAT_R8_UNORM);
+		ID3D12PipelineState* pso = FullscreenPipeline(kind, kOcclusionFormat);
 		if (!pso) {
 			ctx.note = "no pipeline";
 			return;
@@ -1478,11 +2015,18 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		ctx.drawCalls = 1;
 		ctx.triangles = 1;
 	};
-	graph_.AddPass("AmbientOcclusion", ao, [&](RenderGraph::Builder& b) {
+	// (bounced light: the occlusion pass reads the picture of the frame before where its samples land)
+	const bool bounce = ao && indirect_ && history_[historyIndex_] && history_[historyIndex_]->desc.width == target.width && history_[historyIndex_]->desc.height == target.height;
+	const RenderGraph::ResourceId bounceSource = bounce ? graph_.Import(history_[historyIndex_]) : RenderGraph::kInvalid;
+	graph_.AddPass("AmbientOcclusion", ao, [&, bounce, bounceSource](RenderGraph::Builder& b) {
 		b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		if (bounce) {
+			b.Read(bounceSource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
 		b.Write(aoRaw, D3D12_RESOURCE_STATE_RENDER_TARGET);
-	}, [&, depth, aoRaw, fullscreenAo](RenderGraph::PassContext& ctx) {
+	}, [&, depth, aoRaw, fullscreenAo, bounce, bounceSource](RenderGraph::PassContext& ctx) {
 		gpu.CopySrv(postTable_ + 1, ctx.Texture(depth)->srv);
+		gpu.CopySrv(postTable_ + 2, bounce ? ctx.Texture(bounceSource)->srv : black_->srv);
 		fullscreenAo(ctx, kFullscreenAo, aoRaw, postTable_);
 		ctx.note = Format("radius %.2f m, intensity %.2f", scene.frame.aoRadius, scene.frame.aoIntensity);
 	});
@@ -1495,7 +2039,67 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		gpu.CopySrv(postTable_ + kPostTableSize + 1, ctx.Texture(depth)->srv);
 		fullscreenAo(ctx, kFullscreenAoBlur, aoFinal, postTable_ + kPostTableSize);
 	});
+	// ---- reflection probes: this frame's faces, then the blurred copy of the atlas
+	RenderGraph::ResourceId reflectionId[3] = {RenderGraph::kInvalid, RenderGraph::kInvalid, RenderGraph::kInvalid};
+	const RenderGraph::ResourceId reflectionDepth = reflection_ ? graph_.Import(reflectionDepth_) : RenderGraph::kInvalid;
+	if (reflection_) {
+		for (int i = 0; i < 2; ++i) {
+			reflectionId[i] = graph_.Import(reflectionAtlas_[i]);
+		}
+		const RenderGraph::ResourceId sharp = reflectionId[0], blurred = reflectionId[1];
+		graph_.AddPass("ReflectionProbes", probeJobCount_ > 0, [&, sharp, reflectionDepth](RenderGraph::Builder& b) {
+			b.Write(sharp, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			b.Write(reflectionDepth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+			if (shadow != RenderGraph::kInvalid) {
+				b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			if (skyLight) {
+				b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+		}, [&, sharp, reflectionDepth](RenderGraph::PassContext& ctx) {
+			D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(sharp)->target), dsv = gpu.DsvCpu(ctx.Texture(reflectionDepth)->target);
+			ctx.list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+			BindCommon(ctx.list, true);
+			ctx.list->SetGraphicsRootDescriptorTable(8, gpu.SrvGpu(probeGlobalsTable_));
+			const LONG size = LONG(kProbeFace);
+			std::string note;
+			for (uint32_t j = 0; j < probeJobCount_; ++j) {
+				const ProbeFaceJob& job = probeJobs_[j];
+				// (only this face's tile is cleared: the atlas's other tiles are other faces and other probes)
+				const LONG x = LONG((job.slot % 4) * 3 + job.face % 3) * size, y = LONG((job.slot / 4) * 2 + job.face / 3) * size;
+				const D3D12_RECT rect = {x, y, x + size, y + size};
+				const D3D12_VIEWPORT vp = {float(x), float(y), float(size), float(size), 0, 1};
+				const float clear[4] = {0, 0, 0, 0};
+				ctx.list->ClearRenderTargetView(rtv, clear, 1, &rect);
+				ctx.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 1, &rect);
+				ctx.list->RSSetViewports(1, &vp);
+				ctx.list->RSSetScissorRects(1, &rect);
+				ctx.list->SetGraphicsRootConstantBufferView(0, job.cb);
+				cullPlanes_ = job.planes;
+				DrawItems(ctx, probeItems_, kForwardProbe, kForwardProbe, -1);
+				note += Format("%sprobe %u face %u", j ? ", " : "", job.slot, job.face);
+			}
+			cullPlanes_ = nullptr;
+			ctx.note = note + Format(" (%u still things near the camera)", uint32_t(probeItems_.size()));
+		});
+		graph_.AddPass("ReflectionProbeBlur", probeJobCount_ > 0, [&, sharp, blurred](RenderGraph::Builder& b) {
+			b.Read(sharp, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(blurred, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, sharp, blurred](RenderGraph::PassContext& ctx) {
+			// x: the blur's angle (radians), y: the tile size of the input, z: the tile size of the output
+			const float params[4] = {0.22f, float(kProbeFace), float(kProbeBlurFace), 0};
+			Fullscreen(ctx, kFullscreenReflectionBlur, ctx.Texture(blurred), ctx.Texture(sharp), nullptr, nullptr, params);
+		});
+	}
 	graph_.AddPass("Opaque", true, [&](RenderGraph::Builder& b) {
+		for (int i = 0; i < 3; ++i) {
+			if (reflectionId[i] != RenderGraph::kInvalid) {
+				b.Read(reflectionId[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+		}
+		if (reflectionDepth != RenderGraph::kInvalid) {
+			b.Read(reflectionDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); // (distances: where a mirrored ray from a surface ends)
+		}
 		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		b.Write(surface, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		b.Write(velocity, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1530,21 +2134,72 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	// ---- screen space reflections: what a smooth surface mirrors, where that is on screen. Read from the picture of the
 	// frame before (the temporal history, as the host does it), added on top of the sky / probe reflection the
 	// surface was shaded with.
-	if (ssr_ && historyValid_ && history_[historyIndex_] && history_[historyIndex_]->desc.width == target.width && history_[historyIndex_]->desc.height == target.height) {
-		const RenderGraph::ResourceId before = graph_.Import(history_[historyIndex_]);
-		graph_.AddPass("ScreenSpaceReflections", true, [&, color, depth, surface, before](RenderGraph::Builder& b) {
-			b.Read(before, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	const bool screenReflections = ssr_ && historyValid_ && history_[historyIndex_] && history_[historyIndex_]->desc.width == target.width && history_[historyIndex_]->desc.height == target.height;
+	if (screenReflections || rayReflections_) {
+		const RenderGraph::ResourceId before = screenReflections ? graph_.Import(history_[historyIndex_]) : RenderGraph::kInvalid;
+		// The rays are traced for one pixel of every 2 x 2 (a different one each frame, so that the temporal antialiasing
+		// gathers all four): a quarter of the rays. The reflection pass lays them over the full picture by depth.
+		const float rayOffset[4] = {float(frame & 1), float((frame >> 1) & 1), 0, 0};
+		RenderGraph::ResourceId rays = RenderGraph::kInvalid;
+		if (rayReflections_) {
+			GpuTextureDesc rayDesc = colorDesc;
+			rayDesc.width = std::max((target.width + 1) / 2, 1u);
+			rayDesc.height = std::max((target.height + 1) / 2, 1u);
+			rayDesc.format = rayDesc.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; // rgb what the ray brought back, a how far the surface is (0: no ray)
+			rays = graph_.CreateTransient("SceneReflectionRays", rayDesc, ResourceCategory::RenderTarget);
+			graph_.AddPass("ReflectionRays", true, [&, depth, surface, before, rays](RenderGraph::Builder& b) {
+				if (before != RenderGraph::kInvalid) {
+					b.Read(before, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				}
+				b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Read(surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Write(rays, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			}, [&, depth, surface, before, rays, rayOffset](RenderGraph::PassContext& ctx) {
+				Fullscreen(ctx, kFullscreenRayTrace, ctx.Texture(rays), before != RenderGraph::kInvalid ? ctx.Texture(before) : nullptr, ctx.Texture(depth), ctx.Texture(surface), rayOffset);
+			});
+		}
+		graph_.AddPass("Reflections", true, [&, color, depth, surface, before, rays](RenderGraph::Builder& b) {
+			if (before != RenderGraph::kInvalid) {
+				b.Read(before, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			if (rays != RenderGraph::kInvalid) {
+				b.Read(rays, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
 			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 			b.Read(surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 			b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		}, [&, color, depth, surface, before](RenderGraph::PassContext& ctx) {
-			Fullscreen(ctx, kFullscreenSsr, ctx.Texture(color), ctx.Texture(before), ctx.Texture(depth), ctx.Texture(surface));
+		}, [&, color, depth, surface, before, rays, rayOffset](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenSsr, ctx.Texture(color), before != RenderGraph::kInvalid ? ctx.Texture(before) : nullptr, ctx.Texture(depth), ctx.Texture(surface), rayOffset,
+				rays != RenderGraph::kInvalid ? ctx.Texture(rays) : nullptr);
+			ctx.note = rayReflections_ ? (screenReflections ? "screen, then rays" : "rays") : "screen";
 		});
 	}
-	graph_.AddPass("Sky", true, [&](RenderGraph::Builder& b) {
+	// ---- the clouds as the camera sees them: marched at half resolution, laid over the sky by the sky pass
+	RenderGraph::ResourceId cloudLayer = RenderGraph::kInvalid;
+	const RenderGraph::ResourceId airSky = physicalSky_ ? graph_.Import(skyViewLut_) : RenderGraph::kInvalid;
+	if (clouds_) {
+		GpuTextureDesc cloudDesc = colorDesc;
+		cloudDesc.width = std::max(target.width / 2, 1u);
+		cloudDesc.height = std::max(target.height / 2, 1u);
+		cloudDesc.format = cloudDesc.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		cloudLayer = graph_.CreateTransient("SceneClouds", cloudDesc, ResourceCategory::RenderTarget);
+		graph_.AddPass("Clouds", true, [&, airSky, cloudLayer](RenderGraph::Builder& b) {
+			b.Read(airSky, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(cloudLayer, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, airSky, cloudLayer](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenClouds, ctx.Texture(cloudLayer), ctx.Texture(airSky));
+		});
+	}
+	graph_.AddPass("Sky", true, [&, airSky, cloudLayer](RenderGraph::Builder& b) {
 		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		b.Write(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-	}, [&, color, depth](RenderGraph::PassContext& ctx) {
+		if (airSky != RenderGraph::kInvalid) {
+			b.Read(airSky, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+		if (cloudLayer != RenderGraph::kInvalid) {
+			b.Read(cloudLayer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+	}, [&, color, depth, airSky, cloudLayer](RenderGraph::PassContext& ctx) {
 		ID3D12PipelineState* pso = FullscreenPipeline(kFullscreenSky, kSceneColorFormat);
 		if (!pso) {
 			ctx.note = "no pipeline";
@@ -1555,6 +2210,17 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		ctx.list->RSSetViewports(1, &viewport);
 		ctx.list->RSSetScissorRects(1, &scissor);
 		BindCommon(ctx.list, true);
+		// (the physical sky: the air's sky in the pass's first input, the cloud layer in its third)
+		if (postNext_ < kPostTables) {
+			const uint32_t table = postTable_ + kPostTableSize * postNext_++;
+			if (airSky != RenderGraph::kInvalid) {
+				gpu.CopySrv(table, ctx.Texture(airSky)->srv);
+			}
+			if (cloudLayer != RenderGraph::kInvalid) {
+				gpu.CopySrv(table + 2, ctx.Texture(cloudLayer)->srv);
+			}
+			ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(table));
+		}
 		ctx.list->SetPipelineState(pso);
 		ctx.list->DrawInstanced(3, 1, 0, 0);
 		ctx.drawCalls = 1;
@@ -1595,6 +2261,34 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		BindCommon(ctx.list, true);
 		DrawItems(ctx, transparent_, kForwardBlend, kForwardBlend, -1);
 	});
+	// ---- volumetric fog: the light the fog scatters towards the camera on the way to each pixel (the sun through the
+	// shadow map and the clouds, the sky from all around), marched at half resolution, then laid over the picture
+	if (volumetricFog_) {
+		GpuTextureDesc fogDesc = colorDesc;
+		fogDesc.width = std::max(target.width / 2, 1u);
+		fogDesc.height = std::max(target.height / 2, 1u);
+		fogDesc.format = fogDesc.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		const RenderGraph::ResourceId fog = graph_.CreateTransient("SceneFog", fogDesc, ResourceCategory::RenderTarget);
+		graph_.AddPass("VolumetricFog", true, [&, depth, fog](RenderGraph::Builder& b) {
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			if (shadow != RenderGraph::kInvalid) {
+				b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			if (skyLight) {
+				b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			b.Write(fog, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, depth, fog](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenFog, ctx.Texture(fog), nullptr, ctx.Texture(depth));
+		});
+		graph_.AddPass("VolumetricFogApply", true, [&, color, depth, fog](RenderGraph::Builder& b) {
+			b.Read(fog, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, color, depth, fog](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenFogApply, ctx.Texture(color), ctx.Texture(fog), ctx.Texture(depth));
+		});
+	}
 	// ---- particles (the game's particle systems, tyre smoke): over everything drawn so far
 	particlesDrawn_ = 0;
 	graph_.AddPass("Particles", particlesVa_ != 0 && !particleBatches_.empty(), [&, color, depth](RenderGraph::Builder& b) {
@@ -1642,6 +2336,12 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 			particlesDrawn_ += batch.count;
 		}
 		ctx.note = Format("%u particles in %u batches", particlesDrawn_, uint32_t(particleBatches_.size()));
+	});
+	// ---- debug views of the ray tracing structure: the scene as rays from the camera find it (its geometry, or what each ray cost)
+	const bool bvhView = settings.debugView == "bvh" || settings.debugView == "bvhCost";
+	graph_.AddPass("BvhDebug", bvhView && bvhReady_, [&, color](RenderGraph::Builder& b) { b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET); }, [&, color](RenderGraph::PassContext& ctx) {
+		const float params[4] = {settings.debugView == "bvhCost" ? 1.0f : 0.0f, 0, 0, 0};
+		Fullscreen(ctx, kFullscreenBvhDebug, ctx.Texture(color), nullptr, nullptr, nullptr, params);
 	});
 	// ---- post-processing. `post` is the picture as it stands; every step that runs replaces it.
 	RenderGraph::ResourceId post = color;
@@ -1898,6 +2598,10 @@ void SceneRenderer::EndFrame(const HostGfx& host, UINT64 fence) {
 		}
 		globalsTable_ = UINT32_MAX;
 	}
+	if (probeGlobalsTable_ != UINT32_MAX) {
+		gpu.FreeSrv(probeGlobalsTable_, kGlobalsTableSize, fence);
+		probeGlobalsTable_ = UINT32_MAX;
+	}
 	if (postTable_ != UINT32_MAX) {
 		gpu.FreeSrv(postTable_, kPostTableSize * kPostTables, fence);
 		postTable_ = UINT32_MAX;
@@ -1930,6 +2634,23 @@ void SceneRenderer::Release(bool leak) {
 	irradiance_.reset();
 	history_[0].reset();
 	history_[1].reset();
+	transmittanceLut_.reset();
+	multiScatterLut_.reset();
+	skyViewLut_.reset();
+	cloudNoise_.reset();
+	skyCloudsLut_.reset();
+	for (auto& t : reflectionAtlas_) {
+		t.reset();
+	}
+	for (LightProbe& p : lightProbes_) {
+		p = LightProbe();
+	}
+	probeCameraValid_ = false;
+	SceneBvh::Get().Release(leak);
+	bvhReady_ = false;
+	reflectionDepth_.reset();
+	probeGlobalsTable_ = UINT32_MAX;
+	atmosphereLutsValid_ = false;
 	exposureHistory_[0].reset();
 	exposureHistory_[1].reset();
 	exposureValid_ = false;

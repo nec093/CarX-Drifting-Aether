@@ -739,11 +739,47 @@ void SettingsTab() {
 	ImGui::TextDisabled("Quality sets the shadow cascades' resolution and distance of Aether's scene renderer.");
 	ImGui::SeparatorText("Graphics");
 	ImGui::TextDisabled("These are Aether's own options. The game's graphics menu is not used.");
+	static const char* skyModes[] = {"physical", "scene"};
+	static const char* skyText[] = {"Physical sky (time of day)", "The scene's own sky"};
+	int skyMode = s.skyMode == "scene" ? 1 : 0;
+	if (ImGui::Combo("Sky and sun", &skyMode, skyText, 2)) {
+		settings.Set("skyMode", skyModes[skyMode], "overlay");
+	}
+	if (skyMode == 0) {
+		float hours = s.timeOfDay;
+		if (ImGui::SliderFloat("Time of day (hours)", &hours, 0.0f, 24.0f, "%.2f")) {
+			settings.Set("timeOfDay", hours, "overlay");
+		}
+		float heading = s.sunHeading;
+		if (ImGui::SliderFloat("Sun heading (degrees)", &heading, 0.0f, 360.0f, "%.0f")) {
+			settings.Set("sunHeading", heading, "overlay");
+		}
+		float coverage = s.cloudCoverage;
+		if (ImGui::SliderFloat("Clouds (coverage)", &coverage, 0.0f, 1.0f, "%.2f")) {
+			settings.Set("cloudCoverage", coverage, "overlay");
+		}
+		float speed = s.cloudSpeed;
+		if (ImGui::SliderFloat("Cloud speed", &speed, 0.0f, 4.0f, "%.1f")) {
+			settings.Set("cloudSpeed", speed, "overlay");
+		}
+	}
+	static const char* tonemaps[] = {"host", "agx", "aces", "neutral", "none"};
+	static const char* tonemapText[] = {"The scene's own curve", "AgX", "ACES", "Neutral", "None"};
+	int tonemap = 0;
+	for (int i = 0; i < 5; ++i) {
+		if (s.tonemap == tonemaps[i]) {
+			tonemap = i;
+		}
+	}
+	if (ImGui::Combo("Tone mapping", &tonemap, tonemapText, 5)) {
+		settings.Set("tonemap", tonemaps[tonemap], "overlay");
+	}
 	struct Toggle { const char* key; const char* label; bool value; };
 	Toggle toggles[] = {
 		{"antialiasing", "Antialiasing (temporal)", s.antialiasing}, {"shadows", "Sun shadows", s.shadows}, {"ssao", "Ambient occlusion", s.ssao},
 		{"ssr", "Screen space reflections", s.ssr}, {"bloom", "Bloom", s.bloom}, {"motionBlur", "Motion blur", s.motionBlur},
-		{"particles", "Particles and tyre smoke", s.particles},
+		{"particles", "Particles and tyre smoke", s.particles}, {"volumetricFog", "Volumetric fog (light shafts)", s.volumetricFog},
+		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections},
 	};
 	for (Toggle& t : toggles) {
 		if (ImGui::Checkbox(t.label, &t.value)) {
@@ -753,6 +789,9 @@ void SettingsTab() {
 	struct Slider { const char* key; const char* label; float value, lo, hi; const char* format; };
 	Slider sliders[] = {
 		{"shadowSoftness", "Shadow softness (texels)", s.shadowSoftness, 0.0f, 4.0f, "%.1f"},
+		{"indirectStrength", "Indirect light strength", s.indirectStrength, 0.0f, 3.0f, "%.2f"},
+		{"fogStrength", "Fog density (factor)", s.fogStrength, 0.0f, 20.0f, "%.1f"},
+		{"skinnedRayUpdates", "Skinned poses read per frame (reflections)", s.skinnedRayUpdates, 0.0f, 4.0f, "%.0f"},
 		{"motionBlurStrength", "Motion blur strength", s.motionBlurStrength, 0.0f, 2.0f, "%.2f"},
 		{"bloomStrength", "Bloom strength", s.bloomStrength, 0.0f, 2.0f, "%.2f"},
 		{"smokeOpacity", "Tyre smoke opacity", s.smokeOpacity, 0.0f, 2.0f, "%.2f"},

@@ -29,7 +29,8 @@ if ($Arguments.Count -gt 0) {
 			if ($i -lt 1) { Write-Host "not a key=value argument: $pair"; exit 1 }
 			$value = $pair.Substring($i + 1)
 			$number = 0L
-			$map[$pair.Substring(0, $i)] = if ($value -eq 'true') { $true } elseif ($value -eq 'false') { $false } elseif ([long]::TryParse($value, [ref]$number)) { $number } else { $value }
+			$real = 0.0
+			$map[$pair.Substring(0, $i)] = if ($value -eq 'true') { $true } elseif ($value -eq 'false') { $false } elseif ([long]::TryParse($value, [ref]$number)) { $number } elseif ([double]::TryParse($value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$real)) { $real } else { $value }
 		}
 		$json = $map | ConvertTo-Json -Compress
 	}

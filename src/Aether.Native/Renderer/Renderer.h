@@ -8,6 +8,7 @@
 //  - a command list and its allocator are reused only after the host's frame fence passed the value execute returned;
 //  - any failed HRESULT stops Aether's rendering for the session (Fail) and leaves the game running.
 #pragma once
+#include <atomic>
 #include "../Core/Common.h"
 #include "../Core/Config.h"
 #include "../Core/Json.h"
@@ -111,6 +112,9 @@ private:
 	uint64_t sceneFrame_ = 0;
 	DWORD debugCookie_ = 0;
 	uint64_t skippedFrames_ = 0;
+	// what the last look for a free command list found (any thread reads these: State())
+	std::atomic<uint64_t> statSkipped_{0}, statAcquires_{0};
+	std::atomic<uint32_t> statLists_{0}, statBusyGpu_{0}, statBusyHost_{0}, statBusyDelay_{0};
 	double lastFrameEnd_ = 0;
 	UINT64 lastSubmittedFence_ = 0;
 
