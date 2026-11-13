@@ -28,8 +28,10 @@ struct SettingsData {
 	bool ssr = true;                 // screen space reflections as the game's volumes set them
 	bool volumetricFog = true;       // fog lit by the sun through the shadow map (light shafts), where the scene has fog
 	bool followSceneNight = true;    // the physical sky turns to night when the game's scene does (its day / night switch)
+	bool rayTracedGi = true;         // the ambient light per pixel from long rays (with rayTracedLighting); the probe grid stops meanwhile
+	bool rayTracedLighting = true;   // the sun's shadow and the ambient occlusion from rays (NRD SIGMA, REBLUR); off: shadow map and screen space occlusion
 	bool lensFlare = true;           // ghosts, a halo and rays from the sun and from bright lamps, as a camera's lens makes them
-	bool probeGi = true;             // indirect light from a grid of probes around the camera that trace rays (needs the ray tracing geometry)
+	bool probeGi = true;             // indirect light from a grid of probes around the camera that trace rays (needs the ray tracing geometry; not while rayTracedGi runs)
 	bool reflectionProbe = true;     // the surroundings drawn into a cube around the camera every frame, for reflections
 	bool rayTracedReflections = true; // smooth surfaces mirror what rays through the scene's triangles find (also off screen)
 	bool indirectLight = true;       // light bounced off nearby surfaces (screen space, with the ambient occlusion pass)

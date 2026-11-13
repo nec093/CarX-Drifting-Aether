@@ -42,6 +42,8 @@ add_library(aether_core STATIC
 	Renderer/SceneRenderer.cpp
 	Renderer/Bvh.cpp
 	Renderer/ReflectionDenoiser.cpp
+	Renderer/NrdInstance.cpp
+	Renderer/LightingDenoiser.cpp
 	Profiler/Profiler.cpp
 	Shaders/ShaderManager.cpp
 	Renderer/Renderer.cpp
@@ -80,13 +82,15 @@ if(EXISTS "${AETHER_NRD_DIR}/Include/NRD.h" AND EXISTS "${AETHER_DXC_EXE}")
 	# Aether's passes around NRD (they use NRD.hlsli): compiled now, embedded as DXIL
 	set(AETHER_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
 	add_custom_command(
-		OUTPUT "${AETHER_GENERATED_DIR}/NrdPrepare.h" "${AETHER_GENERATED_DIR}/NrdResolve.h"
+		OUTPUT "${AETHER_GENERATED_DIR}/NrdPrepare.h" "${AETHER_GENERATED_DIR}/NrdResolve.h" "${AETHER_GENERATED_DIR}/NrdLightPrepare.h" "${AETHER_GENERATED_DIR}/NrdLightResolve.h"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${AETHER_GENERATED_DIR}"
 		COMMAND "${AETHER_DXC_EXE}" -nologo -T cs_6_5 -E CSPrepare -O3 -I "${AETHER_NRD_DIR}/Shaders" "${CMAKE_CURRENT_SOURCE_DIR}/Renderer/NrdPasses.hlsl" -Fh "${AETHER_GENERATED_DIR}/NrdPrepare.h" -Vn kNrdPrepare
 		COMMAND "${AETHER_DXC_EXE}" -nologo -T cs_6_5 -E CSResolve -O3 -I "${AETHER_NRD_DIR}/Shaders" "${CMAKE_CURRENT_SOURCE_DIR}/Renderer/NrdPasses.hlsl" -Fh "${AETHER_GENERATED_DIR}/NrdResolve.h" -Vn kNrdResolve
+		COMMAND "${AETHER_DXC_EXE}" -nologo -T cs_6_5 -E CSLightPrepare -O3 -I "${AETHER_NRD_DIR}/Shaders" "${CMAKE_CURRENT_SOURCE_DIR}/Renderer/NrdPasses.hlsl" -Fh "${AETHER_GENERATED_DIR}/NrdLightPrepare.h" -Vn kNrdLightPrepare
+		COMMAND "${AETHER_DXC_EXE}" -nologo -T cs_6_5 -E CSLightResolve -O3 -I "${AETHER_NRD_DIR}/Shaders" "${CMAKE_CURRENT_SOURCE_DIR}/Renderer/NrdPasses.hlsl" -Fh "${AETHER_GENERATED_DIR}/NrdLightResolve.h" -Vn kNrdLightResolve
 		DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Renderer/NrdPasses.hlsl" "${AETHER_NRD_DIR}/Shaders/NRD.hlsli"
 		COMMENT "Aether: NRD passes (DXIL)")
-	add_custom_target(aether_nrd_passes DEPENDS "${AETHER_GENERATED_DIR}/NrdPrepare.h" "${AETHER_GENERATED_DIR}/NrdResolve.h")
+	add_custom_target(aether_nrd_passes DEPENDS "${AETHER_GENERATED_DIR}/NrdPrepare.h" "${AETHER_GENERATED_DIR}/NrdResolve.h" "${AETHER_GENERATED_DIR}/NrdLightPrepare.h" "${AETHER_GENERATED_DIR}/NrdLightResolve.h")
 	add_dependencies(aether_core aether_nrd_passes)
 	target_include_directories(aether_core PRIVATE "${AETHER_GENERATED_DIR}")
 	target_compile_definitions(aether_core PUBLIC AETHER_HAS_NRD=1)

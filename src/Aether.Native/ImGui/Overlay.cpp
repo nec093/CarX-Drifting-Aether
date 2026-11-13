@@ -779,7 +779,7 @@ void SettingsTab() {
 		{"antialiasing", "Antialiasing (temporal)", s.antialiasing}, {"shadows", "Sun shadows", s.shadows}, {"ssao", "Ambient occlusion", s.ssao},
 		{"ssr", "Screen space reflections", s.ssr}, {"bloom", "Bloom", s.bloom}, {"motionBlur", "Motion blur", s.motionBlur},
 		{"particles", "Particles and tyre smoke", s.particles}, {"volumetricFog", "Volumetric fog (light shafts)", s.volumetricFog},
-		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections}, {"probeGi", "Global illumination (probe grid, ray traced)", s.probeGi}, {"lensFlare", "Lens flare", s.lensFlare}, {"followSceneNight", "Night when the game's scene is at night", s.followSceneNight},
+		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections}, {"probeGi", "Global illumination (probe grid; when per pixel is off)", s.probeGi}, {"lensFlare", "Lens flare", s.lensFlare}, {"rayTracedLighting", "Ray traced shadows and ambient occlusion (NVIDIA NRD)", s.rayTracedLighting}, {"rayTracedGi", "Ray traced ambient light per pixel (NVIDIA NRD)", s.rayTracedGi}, {"followSceneNight", "Night when the game's scene is at night", s.followSceneNight},
 	};
 	for (Toggle& t : toggles) {
 		if (ImGui::Checkbox(t.label, &t.value)) {

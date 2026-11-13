@@ -8,7 +8,7 @@
 namespace aether {
 
 static const std::vector<std::string> kQualities = {"low", "medium", "high", "ultra"};
-static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections", "followSceneNight", "probeGi", "lensFlare"};
+static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections", "followSceneNight", "probeGi", "lensFlare", "rayTracedLighting", "rayTracedGi"};
 static const std::vector<std::string> kRenderModes = {"hdrp", "aether", "compare", "standalone"};
 static const std::vector<std::string> kSkyModes = {"physical", "scene"};
 static const std::vector<std::string> kTonemaps = {"host", "agx", "aces", "neutral", "none"};
@@ -50,6 +50,8 @@ static json ToJsonData(const SettingsData& d) {
 		{"reflectionProbe", d.reflectionProbe},
 		{"probeGi", d.probeGi},
 		{"lensFlare", d.lensFlare},
+		{"rayTracedLighting", d.rayTracedLighting},
+		{"rayTracedGi", d.rayTracedGi},
 		{"followSceneNight", d.followSceneNight},
 		{"rayTracedReflections", d.rayTracedReflections},
 		{"indirectStrength", d.indirectStrength},
@@ -104,7 +106,9 @@ json Settings::Schema() {
 		{"reflectionProbe", {{"type", "boolean"}, {"description", "Reflections of the surroundings, also of what is off screen: a cube drawn around the camera every frame"}}},
 		{"followSceneNight", {{"type", "boolean"}, {"description", "The physical sky turns to night (about midnight, moon up) while the game's own day / night switch is on night"}}},
 		{"lensFlare", {{"type", "boolean"}, {"description", "Lens flare: ghosts, a halo and rays from the sun and from bright lamps"}}},
-		{"probeGi", {{"type", "boolean"}, {"description", "Indirect light from a grid of probes around the camera: each traces rays through the scene's triangles every frame (roofs shut out the sky, lit surfaces light their surroundings)"}}},
+		{"rayTracedLighting", {{"type", "boolean"}, {"description", "The sun's shadow and the ambient occlusion (with the light bounced off nearby surfaces) from rays, denoised by NVIDIA NRD (SIGMA, REBLUR); off: the shadow map and screen space occlusion. Needs DXR 1.1"}}},
+		{"rayTracedGi", {{"type", "boolean"}, {"description", "The ambient light per pixel from rays up to 60 m (the sky where they get out, the lit surface where they meet one), denoised with the occlusion (NRD REBLUR). Needs rayTracedLighting; while it runs the probe grid (probeGi) stops"}}},
+		{"probeGi", {{"type", "boolean"}, {"description", "Indirect light from a grid of probes around the camera: each traces rays through the scene's triangles every frame (roofs shut out the sky, lit surfaces light their surroundings). Used when rayTracedGi does not run"}}},
 		{"rayTracedReflections", {{"type", "boolean"}, {"description", "Reflections on smooth surfaces from rays traced through the scene's triangles (what is off screen too)"}}},
 		{"moonlight", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "The moon's light at night, as a factor"}}},
 		{"fogStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 20.0}, {"description", "Factor on the scene's fog density"}}},
@@ -205,6 +209,8 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 	if (key == "reflectionProbe") return wantBool(d.reflectionProbe);
 	if (key == "probeGi") return wantBool(d.probeGi);
 	if (key == "lensFlare") return wantBool(d.lensFlare);
+	if (key == "rayTracedLighting") return wantBool(d.rayTracedLighting);
+	if (key == "rayTracedGi") return wantBool(d.rayTracedGi);
 	if (key == "followSceneNight") return wantBool(d.followSceneNight);
 	if (key == "rayTracedReflections") return wantBool(d.rayTracedReflections);
 	if (key == "skinnedRayUpdates") {

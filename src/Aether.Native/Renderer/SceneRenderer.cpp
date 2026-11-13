@@ -1,5 +1,6 @@
 #include "Bvh.h"
 #include "ReflectionDenoiser.h"
+#include "LightingDenoiser.h"
 #include "SceneRenderer.h"
 #include "../Core/Log.h"
 #include "../Resources/GpuResources.h"
@@ -19,12 +20,12 @@ const int kGiCounts[3] = {24, 8, 24};
 const float kGiSpacing = 3.0f, kGiSpacingY = 2.5f; // metres between probes on the ground / in height
 const uint32_t kGiTile = 8;                         // a probe's tile: 8 x 8 directions
 // (11: the GI probes' irradiance, 12: their distances)
-const uint32_t kGlobalsTableSize = 13; // (8: the reflection probes' atlas, 9: its blurred copy, 10: its depth) shadow atlas, sky, sky irradiance, ambient occlusion | physical sky: sky (with clouds), transmittance LUT, multiple scattering LUT, cloud noise
+const uint32_t kGlobalsTableSize = 15; // (8: the reflection probes' atlas, 9: its blurred copy, 10: its depth, 13: the ray traced sun shadow, 14: the untraced casters' shadow map) shadow atlas, sky, sky irradiance, ambient occlusion | physical sky: sky (with clouds), transmittance LUT, multiple scattering LUT, cloud noise
 const uint32_t kPostTableSize = 4;    // per full screen pass: colour / main input, depth, two auxiliary inputs
 const float kExposureAdaptationRate = 2.0f; // per second: the automatic exposure covers 63 % of a change in half a second
 const uint32_t kPostTables = 64;     // 0..3: ambient occlusion, its blur, composite, exposure metering; the rest handed out per pass (Fullscreen)
 const uint32_t kIrradianceSize = 32;  // octahedral map of the sky's diffuse light
-const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace", "PSGiRays", "PSGiIrradiance", "PSGiDepth", "PSLensFlare", "PSSmokeApply"};
+const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace", "PSGiRays", "PSGiIrradiance", "PSGiDepth", "PSLensFlare", "PSSmokeApply", "PSSunRays", "PSAoRays"};
 // reflection probes: each is six square tiles (3 x 2: +X -X +Y | -Y +Z -Z); the atlas holds them 4 x 2
 const uint32_t kProbeFace = 128, kProbeBlurFace = 32;
 const float kProbeCell = 12.0f;      // the grid's spacing on the ground (m)
@@ -36,6 +37,7 @@ const uint32_t kBloomLevels = 5;
 // z: 1 = the surface belongs to something that moves by itself (a car). (The scene colour target has no alpha
 // channel, so this cannot live there: a mask written to its alpha read back as 1 everywhere.)
 const DXGI_FORMAT kVelocityFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+const DXGI_FORMAT kGuideNormalFormat = DXGI_FORMAT_R16G16_UNORM; // the depth prepass's normal (octahedral): the ray traced lighting's guide
 const DXGI_FORMAT kOcclusionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; // rgb: light bounced off nearby surfaces, a: ambient occlusion
 const DXGI_FORMAT kSurfaceFormat = DXGI_FORMAT_R16G16B16A16_UNORM; // normal (octahedral, xy), roughness of the reflecting lobe, its weight
 const uint32_t kMaxProbes = 4;        // reflection probes blended per frame (the nearest to the camera)
@@ -89,6 +91,7 @@ struct FrameConstants {
 	float giGrid[4];             // xyz: the grid cell of the GI volume's lowest corner, w: 1 = probe grid GI on
 	float giPrev[4];             // xyz: the same the frame before, w: 1 = the probes hold something
 	float giParams[4];           // x: metres between probes on the ground, y: in height, z: a different number every frame, w: number of punctual lights
+	float rayParams[4];          // x: 1 = rays this frame, y: 1 = the ray traced sun shadow is there for the opaque pass, z: tan of the sun's angular radius
 };
 
 // HDRP's "Custom" tone mapping is John Hable's piecewise filmic curve (toe, linear part, shoulder), with the parameters
@@ -266,7 +269,8 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	vsMain_ = sm.Compile("scene_forward.hlsl", "VSMain", "vs_6_5", rays);
 	vsShadow_ = sm.Compile("scene_forward.hlsl", "VSShadow", "vs_6_5", rays);
 	psForward_ = sm.Compile("scene_forward.hlsl", "PSForward", "ps_6_5", rays);
-	psDepthAlpha_ = sm.Compile("scene_forward.hlsl", "PSDepthAlphaTest", "ps_6_5", rays);
+	psPrepass_ = sm.Compile("scene_forward.hlsl", "PSPrepass", "ps_6_5", rays);
+	psDepthAlpha_ = sm.Compile("scene_forward.hlsl", "PSPrepassAlphaTest", "ps_6_5", rays);
 	psShadowAlpha_ = sm.Compile("scene_forward.hlsl", "PSShadowAlphaTest", "ps_6_5", rays);
 	vsFullscreen_ = sm.Compile("scene_post.hlsl", "VSFullscreen", "vs_6_5", rays);
 	psDecal_ = sm.Compile("scene_forward.hlsl", "PSBlobDecal", "ps_6_5", rays);
@@ -277,7 +281,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	smokePipeline_.Reset();
 	particlePipelineFailed_ = false;
 	atmosphereLutsValid_ = false; // (the LUT shaders may have changed)
-	failedShaders_ = !vsMain_ || !vsShadow_ || !psForward_ || !psDepthAlpha_ || !psShadowAlpha_ || !vsFullscreen_ || !psDecal_;
+	failedShaders_ = !vsMain_ || !vsShadow_ || !psForward_ || !psPrepass_ || !psDepthAlpha_ || !psShadowAlpha_ || !vsFullscreen_ || !psDecal_;
 	static_assert(_countof(kFullscreenEntry) == kFullscreenKindCount, "one entry point per full screen pass");
 	for (int k = 0; k < kFullscreenKindCount; ++k) {
 		psFullscreen_[k] = sm.Compile("scene_post.hlsl", kFullscreenEntry[k], "ps_6_5", rays);
@@ -291,7 +295,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 		D3D12_DESCRIPTOR_RANGE materialRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kAeSlotCount, 0, 1, 0};
 		// space2: t0 shadow atlas, t1 sky, t2 exposure, t3 ambient occlusion | t4..t6 the inputs of a full screen pass
 		// (two ranges in one table: t0..t3 of space2, then t0..t3 of space4 for the physical sky's textures)
-		D3D12_DESCRIPTOR_RANGE globalsRange[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 2, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 9, 0, 4, 4}}; // (space4 t4..t6: the reflection probes)
+		D3D12_DESCRIPTOR_RANGE globalsRange[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 2, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 11, 0, 4, 4}}; // (space4 t4..t6: the reflection probes, t9: the ray traced sun shadow, t10: the untraced casters' shadow map)
 		D3D12_DESCRIPTOR_RANGE postRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kPostTableSize, 4, 2, 0};
 		D3D12_DESCRIPTOR_RANGE probesRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxProbes, 0, 3, 0}; // space3: reflection probe cubes
 		D3D12_ROOT_PARAMETER params[17] = {};
@@ -522,7 +526,7 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 		d.pRootSignature = root_.Get();
 		ID3DBlob* vs = shadow ? vsShadow_.Get() : vsMain_.Get();
 		d.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-		ID3DBlob* ps = kind == kDecal ? psDecal_.Get() : forward ? psForward_.Get() : kind == kDepthAlpha ? psDepthAlpha_.Get() : kind == kShadowAlpha ? psShadowAlpha_.Get() : nullptr;
+		ID3DBlob* ps = kind == kDecal ? psDecal_.Get() : forward ? psForward_.Get() : kind == kDepth ? psPrepass_.Get() : kind == kDepthAlpha ? psDepthAlpha_.Get() : kind == kShadowAlpha ? psShadowAlpha_.Get() : nullptr;
 		if (ps) {
 			d.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
 		}
@@ -550,6 +554,13 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 			blend.SrcBlendAlpha = D3D12_BLEND_ONE;
 			blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
 			blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		}
+		if (kind == kDepth || kind == kDepthAlpha) {
+			// the depth prepass also writes the normal and the motion (the ray traced lighting's guides)
+			d.NumRenderTargets = 2;
+			d.RTVFormats[0] = kGuideNormalFormat;
+			d.RTVFormats[1] = kVelocityFormat;
+			d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 		}
 		if (forward) {
 			// the opaque pass also writes what the reflection pass needs to know about each surface
@@ -707,6 +718,8 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 	decals_.clear();
 	transparent_.clear();
 	casters_.clear();
+	untracedCasters_.clear();
+	rayMaterialPadded_ = 0;
 	instanceData_.clear();
 	materialData_.clear();
 	instanceCount_ = 0;
@@ -769,6 +782,7 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 		memcpy(instanceData_.data() + size_t(instanceIndex) * sizeof(InstanceData), &id, sizeof(id));
 
 		const Vec3 viewPos = TransformPoint(view, center);
+		const size_t castersBefore = casters_.size();
 		const uint32_t subMeshes = std::min<uint32_t>(uint32_t(mesh->subMeshes.size()), uint32_t(inst.materials.size()));
 		for (uint32_t s = 0; s < subMeshes; ++s) {
 			if (mesh->subMeshes[s].indexCount == 0) {
@@ -857,15 +871,22 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 				opaque_.push_back(item);
 			}
 		}
+		bool traced = false;
 		if (inRays) {
 			// Not there for rays: what is not a surface (the cars' blob shadow boxes, helper geometry, materials Aether does
 			// not translate) and what light goes through (glass, anything blended): a bit per sub mesh. The others'
 			// materials go into the table a hit looks its colour up in.
 			uint32_t skip = 0, kept = 0, twoSided = 0;
 			const uint32_t materialOffset = uint32_t(rayMaterials_.size() / 2);
-			const uint32_t count = uint32_t(inst.materials.size());
+			// (an entry for every sub mesh the mesh's triangles may name, also beyond the renderer's materials: a ray that
+			// lands on such a triangle read past this instance's part of the table, and with a stray texture index the
+			// GPU faulted and the device was lost; those sub meshes are not there for rays)
+			const uint32_t count = std::min<uint32_t>(std::max<uint32_t>(uint32_t(inst.materials.size()), uint32_t(mesh->subMeshes.size())), 127u);
+			if (mesh->subMeshes.size() > inst.materials.size()) {
+				++rayMaterialPadded_;
+			}
 			for (uint32_t s = 0; s < count; ++s) {
-				const SceneMaterial* material = inst.materials[s] ? store.Material(inst.materials[s]) : nullptr;
+				const SceneMaterial* material = s < inst.materials.size() && inst.materials[s] ? store.Material(inst.materials[s]) : nullptr;
 				const uint32_t cls = material ? material->desc.materialClass : uint32_t(kAeMaterialUnsupported);
 				const bool solid = material && cls != kAeMaterialUnsupported && cls != kAeMaterialSkip && cls != kAeMaterialBlobShadow && !(material->desc.flags & kAeMaterialBlend);
 				if (solid) {
@@ -885,8 +906,11 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 				}
 			}
 			if (kept > 0) {
-				SceneBvh::Get().AddInstance(inst.desc.mesh, world, skip, materialOffset, twoSided, mirrored);
+				traced = SceneBvh::Get().AddInstance(inst.desc.mesh, world, skip, materialOffset | (count << 24), twoSided, mirrored);
 			}
+		}
+		if (!traced) {
+			untracedCasters_.insert(untracedCasters_.end(), casters_.begin() + castersBefore, casters_.end());
 		}
 	}
 	// equal keys next to each other, sub mesh by sub mesh: DrawItems turns such runs into one instanced draw
@@ -897,6 +921,7 @@ void SceneRenderer::BuildDrawLists(const SceneFrame& scene, uint64_t frame) {
 	auto byKey = [](const DrawItem& a, const DrawItem& b) { return a.sortKey != b.sortKey ? a.sortKey < b.sortKey : a.subMesh < b.subMesh; };
 	std::sort(opaque_.begin(), opaque_.end(), byKey);
 	std::sort(casters_.begin(), casters_.end(), byKey);
+	std::sort(untracedCasters_.begin(), untracedCasters_.end(), byKey);
 	std::sort(probeItems_.begin(), probeItems_.end(), byKey);
 	std::sort(transparent_.begin(), transparent_.end(), [](const DrawItem& a, const DrawItem& b) { return a.depth > b.depth; }); // back to front
 }
@@ -1392,7 +1417,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	}
 	// ---- probe grid GI: the volume follows the camera a whole cell at a time (the probes stay where they are in the
 	// world, and each keeps its place in the textures: its cell modulo the counts)
-	gi_ = bvhReady_ && settings.probeGi;
+	// (not while the ambient light comes per pixel from rays: rtGi_. What read the probes then reads the sky.)
+	gi_ = bvhReady_ && settings.probeGi && !rtGi_;
 	if (gi_ && !giRays_) {
 		GpuTextureDesc g;
 		g.width = uint32_t(kGiCounts[0] * kGiCounts[1]) * kGiTile;
@@ -1423,6 +1449,11 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		giHistory_ = false;
 	}
 	fc.giParams[3] = float(punctualCount_); // (also read by the particles: with or without the probes)
+	fc.rayParams[0] = bvhReady_ ? 1.0f : 0.0f;
+	fc.rayParams[1] = rtLighting_ ? 1.0f : 0.0f;
+	// (the sun's angular radius, 0.27 degrees, at the default softness; the setting widens or narrows the penumbra)
+	fc.rayParams[2] = 0.00465f * std::max(settings.shadowSoftness, 0.0f) / 1.5f;
+	fc.rayParams[3] = untracedShadow_ ? 1.0f : 0.0f;
 	indirect_ = settings.indirectLight && settings.ssao && taa_ && historyValid_;
 	fc.qualityParams[2] = indirect_ ? settings.indirectStrength : 0.0f;
 	memcpy(fc.prevViewProj, prevViewProj_.m, 64);
@@ -1455,7 +1486,7 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.aoParams[0] = settings.aoStrength;
 	fc.aoParams[1] = settings.aoRadius;
 	fc.aoParams[2] = f.aoDirectStrength;
-	fc.aoParams[3] = aoActive_ ? 1.0f : 0.0f;
+	fc.aoParams[3] = rtGi_ ? 2.0f : aoActive_ ? 1.0f : 0.0f; // (2: the texture holds all the ambient light, from long rays)
 	memcpy(fc.smh[0], f.smhShadows, sizeof(f.smhShadows));
 	memcpy(fc.smh[1], f.smhMidtones, sizeof(f.smhMidtones));
 	memcpy(fc.smh[2], f.smhHighlights, sizeof(f.smhHighlights));
@@ -1649,6 +1680,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		face.jitter[0] = face.jitter[1] = face.jitter[2] = 0;
 		face.clusterCounts[0] = 0;
 		face.aoParams[3] = 0;
+		face.rayParams[1] = 0; // (the denoised sun shadow is the screen's: a probe face takes a ray of its own)
+		face.rayParams[3] = 0;
 		face.qualityParams[1] = 0;
 		face.qualityParams[2] = 0;
 		face.misc[0] = 0;
@@ -1690,7 +1723,7 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	gridVa_ = upload(clusterGrid_.data(), clusterGrid_.size() * sizeof(uint32_t), 16);
 	indicesVa_ = upload(lightIndices_.data(), lightIndices_.size() * sizeof(uint32_t), 16);
 	// the instance map is written while the passes are recorded: room for every list once per pass that draws it
-	instanceMapCapacity_ = uint32_t(opaque_.size() * 2 + transparent_.size() + decals_.size() + casters_.size() * 4 + probeItems_.size() * 2 + 4);
+	instanceMapCapacity_ = uint32_t(opaque_.size() * 2 + transparent_.size() + decals_.size() + casters_.size() * 4 + untracedCasters_.size() * 4 + probeItems_.size() * 2 + 4);
 	const UploadAllocation map = gpu.Upload(size_t(instanceMapCapacity_) * sizeof(uint32_t), 16);
 	instanceMap_ = static_cast<uint32_t*>(map.cpu);
 	instanceMapVa_ = map.gpu;
@@ -1751,6 +1784,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	gpu.CopySrv(globalsTable_ + 10, reflection_ && reflectionDepth_ ? reflectionDepth_->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 11, gi_ ? giIrradiance_->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 12, gi_ ? giDepth_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 13, nullTextureSrv_); // (the opaque pass puts the ray traced sun shadow here)
+	gpu.CopySrv(globalsTable_ + 14, nullTextureSrv_); // (... and the untraced casters' shadow map)
 	// (the table the cube's own faces are drawn with: the same, without the cube and without screen space occlusion)
 	probeGlobalsTable_ = reflection_ ? gpu.AllocSrv(kGlobalsTableSize) : UINT32_MAX;
 	if (probeGlobalsTable_ != UINT32_MAX) {
@@ -1767,6 +1802,11 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		}
 		gpu.CopySrv(probeGlobalsTable_ + 11, gi_ ? giIrradiance_->srv : nullTextureSrv_);
 		gpu.CopySrv(probeGlobalsTable_ + 12, gi_ ? giDepth_->srv : nullTextureSrv_);
+		// (the ray traced sun shadow and the untraced casters' shadow map are the screen's, not a probe face's: empty here.
+		// Left uninitialised, these two slots held whatever an earlier view had been, a texture destroyed with a car
+		// among them, and drawing a probe face after a car was switched hung the GPU.)
+		gpu.CopySrv(probeGlobalsTable_ + 13, nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 14, nullTextureSrv_);
 	} else {
 		reflection_ = false;
 	}
@@ -2011,7 +2051,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	}
 	// ---- ray tracing: the trees that arrived; the tree over this frame's instances is filled while the draw lists are
 	// built (the same walk over the instances) and built after it
-	raysWanted_ = settings.rayTracedReflections || settings.probeGi || settings.debugView == "bvh";
+	raysWanted_ = settings.rayTracedReflections || settings.probeGi || settings.rayTracedLighting || settings.debugView == "bvh";
 	SceneBvh::Get().BeginFrame(device_, list, retireFence, frame);
 	SceneBvh::Get().BeginInstances();
 	raysWanted_ = raysWanted_ && SceneBvh::Get().HasGeometry() && raysSupported_;
@@ -2019,6 +2059,23 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	bvhReady_ = raysWanted_ && SceneBvh::Get().EndInstances(device_, list, retireFence);
 	rayReflections_ = bvhReady_ && settings.rayTracedReflections;
 	nrdFrame_ = rayReflections_ && settings.reflectionDenoiser == "nrd" && ReflectionDenoiser::Available();
+	rtLighting_ = bvhReady_ && settings.rayTracedLighting && LightingDenoiser::Available() && LightingDenoiser::Get().Prepare(device_, target.width, target.height, retireFence, frame);
+	rtGi_ = rtLighting_ && settings.rayTracedGi;
+	untracedShadow_ = rtLighting_ && !untracedCasters_.empty() && shadowAtlas_ && shadowCascadeSize_ > 0;
+	if (untracedShadow_ && (!untracedAtlas_ || untracedAtlas_->desc.width != shadowCascadeSize_)) {
+		if (untracedAtlas_) {
+			gpu.RetireTexture(std::move(untracedAtlas_), retireFence, frame);
+		}
+		GpuTextureDesc d;
+		d.width = d.height = shadowCascadeSize_; // (half the atlas: 2 x 2 cascades of half the size)
+		d.format = DXGI_FORMAT_R32_TYPELESS;
+		d.srvFormat = DXGI_FORMAT_R32_FLOAT;
+		d.targetFormat = DXGI_FORMAT_D32_FLOAT;
+		d.depthStencil = true;
+		d.clearDepth = 1.0f;
+		untracedAtlas_ = gpu.CreateTexture(d, "Scene.ShadowAtlasUntraced", ResourceCategory::ShadowMap, Lifetime::Persistent, frame);
+		untracedShadow_ = untracedAtlas_ != nullptr;
+	}
 	BuildCascades(scene, settings);
 	BuildClusters(scene);
 	if (!UploadFrameData(scene, target, settings)) {
@@ -2055,6 +2112,28 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	const D3D12_RECT scissor = {0, 0, LONG(target.width), LONG(target.height)};
 	const bool compare = settings.renderMode == "compare";
 
+	// (with ray traced shadows: the casters the rays cannot find, into a half size atlas of their own)
+	untracedShadow_ = untracedShadow_ && shadows;
+	const RenderGraph::ResourceId untracedShadow = untracedShadow_ ? graph_.Import(untracedAtlas_) : RenderGraph::kInvalid;
+	graph_.AddPass("ShadowCascadesUntraced", untracedShadow_, [&](RenderGraph::Builder& b) { b.Write(untracedShadow, D3D12_RESOURCE_STATE_DEPTH_WRITE); }, [&, untracedShadow](RenderGraph::PassContext& ctx) {
+		GpuTexture* atlas = ctx.Texture(untracedShadow);
+		D3D12_CPU_DESCRIPTOR_HANDLE dsv = gpu.DsvCpu(atlas->target);
+		ctx.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+		ctx.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+		BindCommon(ctx.list, false);
+		for (size_t i = 0; i < cascades_.size(); ++i) {
+			D3D12_VIEWPORT vp = cascades_[i].viewport;
+			vp.TopLeftX *= 0.5f;
+			vp.TopLeftY *= 0.5f;
+			vp.Width *= 0.5f;
+			vp.Height *= 0.5f;
+			const D3D12_RECT rect = {LONG(vp.TopLeftX), LONG(vp.TopLeftY), LONG(vp.TopLeftX + vp.Width), LONG(vp.TopLeftY + vp.Height)};
+			ctx.list->RSSetViewports(1, &vp);
+			ctx.list->RSSetScissorRects(1, &rect);
+			DrawItems(ctx, untracedCasters_, kShadow, kShadowAlpha, int(i));
+		}
+		ctx.note = Format("%zu casters not in the ray structures", untracedCasters_.size());
+	});
 	graph_.AddPass("ShadowCascades", shadows, [&](RenderGraph::Builder& b) { b.Write(shadow, D3D12_RESOURCE_STATE_DEPTH_WRITE); }, [&, shadow](RenderGraph::PassContext& ctx) {
 		GpuTexture* atlas = ctx.Texture(shadow);
 		D3D12_CPU_DESCRIPTOR_HANDLE dsv = gpu.DsvCpu(atlas->target);
@@ -2069,10 +2148,22 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 			DrawItems(ctx, casters_, kShadow, kShadowAlpha, int(i));
 		}
 	});
-	graph_.AddPass("DepthPrepass", true, [&](RenderGraph::Builder& b) { b.Write(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE); }, [&, depth](RenderGraph::PassContext& ctx) {
+	GpuTextureDesc guideDesc = colorDesc;
+	guideDesc.format = guideDesc.targetFormat = kGuideNormalFormat;
+	const RenderGraph::ResourceId guideNormal = graph_.CreateTransient("SceneGuideNormal", guideDesc, ResourceCategory::RenderTarget);
+	graph_.AddPass("DepthPrepass", true, [&](RenderGraph::Builder& b) {
+		b.Write(depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+		b.Write(guideNormal, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		b.Write(velocity, D3D12_RESOURCE_STATE_RENDER_TARGET);
+	}, [&, depth, guideNormal, velocity](RenderGraph::PassContext& ctx) {
 		D3D12_CPU_DESCRIPTOR_HANDLE dsv = gpu.DsvCpu(ctx.Texture(depth)->target);
-		ctx.list->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+		const D3D12_CPU_DESCRIPTOR_HANDLE targets[2] = {gpu.RtvCpu(ctx.Texture(guideNormal)->target), gpu.RtvCpu(ctx.Texture(velocity)->target)};
+		ctx.list->OMSetRenderTargets(2, targets, FALSE, &dsv);
 		ctx.list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
+		const float up[4] = {0.5f, 1.0f, 0, 0};
+		const float nothing[4] = {1000.0f, 1000.0f, 0, 0};
+		ctx.list->ClearRenderTargetView(targets[0], up, 0, nullptr);
+		ctx.list->ClearRenderTargetView(targets[1], nothing, 0, nullptr);
 		ctx.list->RSSetViewports(1, &viewport);
 		ctx.list->RSSetScissorRects(1, &scissor);
 		BindCommon(ctx.list, false);
@@ -2145,7 +2236,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	aoDesc.format = aoDesc.targetFormat = kOcclusionFormat;
 	aoDesc.renderTarget = true;
 	aoDesc.clearColor[0] = aoDesc.clearColor[1] = aoDesc.clearColor[2] = aoDesc.clearColor[3] = 1.0f;
-	const bool ao = aoActive_;
+	const bool ao = aoActive_ && !rtLighting_; // (screen space: when the rays do not give it)
 	const RenderGraph::ResourceId aoRaw = ao ? graph_.CreateTransient("SceneAO.Raw", aoDesc, ResourceCategory::RenderTarget) : RenderGraph::kInvalid;
 	const RenderGraph::ResourceId aoFinal = ao ? graph_.CreateTransient("SceneAO", aoDesc, ResourceCategory::RenderTarget) : RenderGraph::kInvalid;
 	auto fullscreenAo = [&, viewport, scissor](RenderGraph::PassContext& ctx, FullscreenKind kind, RenderGraph::ResourceId output, uint32_t table) {
@@ -2277,6 +2368,71 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 			Fullscreen(ctx, kFullscreenReflectionBlur, ctx.Texture(blurred), ctx.Texture(sharp), nullptr, nullptr, params);
 		});
 	}
+	// ---- ray traced lighting: after the depth prepass (its normal and motion are the denoiser's guides), for every
+	// 2 x 2 block one ray towards the sun and one short ray for the ambient occlusion, then NRD (LightingDenoiser); the opaque pass
+	// reads the sun's visibility and g_AO from what it leaves
+	RenderGraph::ResourceId rtAmbient = RenderGraph::kInvalid, rtShadow = RenderGraph::kInvalid;
+	if (rtLighting_) {
+		LightingDenoiser& lighting = LightingDenoiser::Get();
+		rtAmbient = graph_.Import(lighting.Ambient());
+		rtShadow = graph_.Import(lighting.Shadow());
+		GpuTextureDesc sunDesc = colorDesc;
+		sunDesc.width = std::max((target.width + 1) / 2, 1u); // (a ray per 2 x 2 block)
+		sunDesc.height = std::max((target.height + 1) / 2, 1u);
+		sunDesc.format = sunDesc.targetFormat = DXGI_FORMAT_R16_FLOAT;
+		const RenderGraph::ResourceId sunRays = graph_.CreateTransient("SceneSunRays", sunDesc, ResourceCategory::RenderTarget);
+		GpuTextureDesc aoRayDesc = sunDesc;
+		aoRayDesc.format = aoRayDesc.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		const RenderGraph::ResourceId aoRays = graph_.CreateTransient("SceneAoRays", aoRayDesc, ResourceCategory::RenderTarget);
+		const bool lightHistory = historyValid_ && history_[historyIndex_] && history_[historyIndex_]->desc.width == target.width && history_[historyIndex_]->desc.height == target.height;
+		const RenderGraph::ResourceId before = lightHistory ? graph_.Import(history_[historyIndex_]) : RenderGraph::kInvalid;
+		const float rayParams[4] = {0, 0, 0, float(frame % 65536)};
+		graph_.AddPass("SunShadowRays", true, [&, sunRays, guideNormal](RenderGraph::Builder& b) {
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(guideNormal, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(sunRays, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, sunRays, guideNormal, rayParams](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenSunRays, ctx.Texture(sunRays), nullptr, ctx.Texture(depth), ctx.Texture(guideNormal), rayParams);
+		});
+		graph_.AddPass("AmbientOcclusionRays", true, [&, aoRays, guideNormal, before](RenderGraph::Builder& b) {
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(guideNormal, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			if (before != RenderGraph::kInvalid) {
+				b.Read(before, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			b.Write(aoRays, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, aoRays, guideNormal, before, rayParams](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenAoRays, ctx.Texture(aoRays), before != RenderGraph::kInvalid ? ctx.Texture(before) : black_.get(), ctx.Texture(depth), ctx.Texture(guideNormal), rayParams);
+			ctx.note = Format("radius %.2f m", settings.aoRadius);
+		});
+		graph_.AddPass("LightingDenoise", true, [&, sunRays, aoRays, guideNormal](RenderGraph::Builder& b) {
+			b.Read(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			b.Read(guideNormal, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			b.Read(velocity, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			b.Read(sunRays, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			b.Read(aoRays, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			b.Write(rtAmbient, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			b.Write(rtShadow, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		}, [&, sunRays, aoRays, guideNormal](RenderGraph::PassContext& ctx) {
+			LightingDenoiser::Frame f;
+			f.worldToView = nrdView_.m;
+			f.viewToClip = nrdProj_.m;
+			f.worldToViewPrev = nrdViewPrev_.m;
+			f.viewToClipPrev = nrdProjPrev_.m;
+			f.invViewProj = invViewProj_.m;
+			f.sunDirection[0] = sunDirection_.x;
+			f.sunDirection[1] = sunDirection_.y;
+			f.sunDirection[2] = sunDirection_.z;
+			f.tanSunRadius = 0.00465f * std::max(settings.shadowSoftness, 0.0f) / 1.5f;
+			f.aoRadius = settings.aoRadius;
+			f.aoStrength = settings.aoStrength;
+			f.gi = rtGi_;
+			f.restart = !historyValid_;
+			f.retireFence = retireFence_;
+			LightingDenoiser::Get().Record(ctx.list, f, *ctx.Texture(depth), *ctx.Texture(guideNormal), *ctx.Texture(velocity), *ctx.Texture(sunRays), *ctx.Texture(aoRays), ctx.note);
+			ctx.dispatches = 1;
+		});
+	}
 	graph_.AddPass("Opaque", true, [&](RenderGraph::Builder& b) {
 		for (int i = 0; i < 3; ++i) {
 			if (reflectionId[i] != RenderGraph::kInvalid) {
@@ -2293,6 +2449,13 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		if (ao) {
 			b.Read(aoFinal, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		}
+		if (rtAmbient != RenderGraph::kInvalid) {
+			b.Read(rtAmbient, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(rtShadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+		if (untracedShadow != RenderGraph::kInvalid) {
+			b.Read(untracedShadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
 		if (shadow != RenderGraph::kInvalid) {
 			b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		}
@@ -2302,6 +2465,13 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	}, [&, color, depth, surface, velocity, ao, aoFinal](RenderGraph::PassContext& ctx) {
 		if (ao) {
 			gpu.CopySrv(globalsTable_ + 3, ctx.Texture(aoFinal)->srv);
+		}
+		if (rtAmbient != RenderGraph::kInvalid) {
+			gpu.CopySrv(globalsTable_ + 3, ctx.Texture(rtAmbient)->srv);
+			gpu.CopySrv(globalsTable_ + 13, ctx.Texture(rtShadow)->srv);
+		}
+		if (untracedShadow != RenderGraph::kInvalid) {
+			gpu.CopySrv(globalsTable_ + 14, ctx.Texture(untracedShadow)->srv);
 		}
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(ctx.Texture(color)->target), dsv = gpu.DsvCpu(ctx.Texture(depth)->target);
 		const D3D12_CPU_DESCRIPTOR_HANDLE targets[3] = {rtv, gpu.RtvCpu(ctx.Texture(surface)->target), gpu.RtvCpu(ctx.Texture(velocity)->target)};
@@ -2366,6 +2536,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 					f.width = target.width;
 					f.height = target.height;
 					f.restart = !historyValid_;
+					f.retireFence = retireFence_;
 					ReflectionDenoiser::Get().Record(ctx.list, f, *ctx.Texture(depth), *ctx.Texture(surface), *ctx.Texture(velocity), *ctx.Texture(noisy), *ctx.Texture(denoised), ctx.note);
 					ctx.dispatches = 1;
 				});
@@ -2839,6 +3010,13 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		if (timing) {
 			(begin ? passStampBegin_ : passStampEnd_)[index] = timer_.Stamp(list);
 		}
+		// (the pass's name as an event: DRED's breadcrumbs say which pass the GPU was in when a device is lost)
+		if (begin) {
+			const std::wstring name = Utf8ToWide("Aether." + graph_.PassName(index));
+			list->BeginEvent(0, name.c_str(), UINT((name.size() + 1) * sizeof(wchar_t)));
+		} else {
+			list->EndEvent();
+		}
 	});
 	if (timing) {
 		timer_.Resolve(list);
@@ -2878,6 +3056,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		{"opaqueDraws", opaque_.size()},
 		{"transparentDraws", transparent_.size()},
 		{"shadowCasterDraws", casters_.size()},
+		{"rayInstancesWithFewerMaterialsThanSubMeshes", rayMaterialPadded_},
 		{"unsupportedMaterialDraws", unsupportedDraws},
 		{"drawCalls", draws},
 		{"instancing", {{"instancesDrawn", itemsDrawn_}, {"inInstancedDraws", itemsInstanced_}, {"drawCallsSaved", itemsDrawn_ > draws ? itemsDrawn_ - draws : 0}}},
@@ -2930,7 +3109,7 @@ void SceneRenderer::Release(bool leak) {
 		for (auto& [k, pso] : fullscreenPipelines_) pso.Detach();
 		root_.Detach();
 		defaultsVb_.Detach();
-		for (auto* t : {&white_, &flatNormal_, &black_, &shadowAtlas_}) {
+		for (auto* t : {&white_, &flatNormal_, &black_, &shadowAtlas_, &untracedAtlas_}) {
 			if (*t) {
 				(*t)->resource.Detach();
 			}
@@ -2944,6 +3123,8 @@ void SceneRenderer::Release(bool leak) {
 	flatNormal_.reset();
 	black_.reset();
 	shadowAtlas_.reset();
+	untracedAtlas_.reset();
+	untracedShadow_ = false;
 	irradiance_.reset();
 	history_[0].reset();
 	history_[1].reset();
@@ -2966,7 +3147,9 @@ void SceneRenderer::Release(bool leak) {
 	SceneBvh::Get().Release(leak);
 	bvhReady_ = false;
 	nrdFrame_ = false;
+	rtLighting_ = false;
 	ReflectionDenoiser::Get().Release(retireFence_, leak);
+	LightingDenoiser::Get().Release(retireFence_, leak);
 	reflectionDepth_.reset();
 	probeGlobalsTable_ = UINT32_MAX;
 	atmosphereLutsValid_ = false;

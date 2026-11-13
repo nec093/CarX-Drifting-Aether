@@ -98,13 +98,14 @@ float4 PSTaa(FullscreenOutput input) : SV_Target {
 	int2 p = int2(input.position.xy);
 	int2 last = int2(g_ScreenSize.xy) - 1;
 	float4 center = g_SceneColor.Load(int3(p, 0));
+	center.rgb = SafeColor(center.rgb);
 	float3 m1 = 0.0, m2 = 0.0;
 	float closest = 0.0;
 	int2 closestAt = p;
 	for (int y = -1; y <= 1; ++y) {
 		for (int x = -1; x <= 1; ++x) {
 			int2 q = clamp(p + int2(x, y), int2(0, 0), last);
-			float3 c = g_SceneColor.Load(int3(q, 0)).rgb;
+			float3 c = SafeColor(g_SceneColor.Load(int3(q, 0)).rgb);
 			c *= 1.0 / (1.0 + Luma(c)); // (compressed: a single very bright pixel does not blow the statistics up)
 			m1 += c;
 			m2 += c * c;
@@ -130,7 +131,7 @@ float4 PSTaa(FullscreenOutput input) : SV_Target {
 	float2 previousUv = velocity.x < 100.0 ? input.uv - velocity : PreviousUv(input.uv, closest);
 	bool usable = g_Jitter.z > 0.5 && all(previousUv > 0.0) && all(previousUv < 1.0);
 	float4 before = g_PostAux.SampleLevel(s_LinearClamp, previousUv, 0.0);
-	float3 history = before.rgb;
+	float3 history = SafeColor(before.rgb); // (what the history holds stays in it: nothing bad may enter it)
 	history *= 1.0 / (1.0 + Luma(history));
 	history = clamp(history, mean - 1.25 * deviation, mean + 1.25 * deviation);
 	float keep = usable ? 0.9 : 0.0;
@@ -140,7 +141,7 @@ float4 PSTaa(FullscreenOutput input) : SV_Target {
 	keep *= 1.0 - smoothstep(0.2, 0.6, abs(before.a - movingNow));
 	float3 result = lerp(current, history, keep);
 	result *= 1.0 / max(1.0 - Luma(result), 1e-3);
-	return float4(result, movingNow);
+	return float4(SafeColor(result), movingNow);
 }
 
 // ---- motion blur: every still point of the world is smeared along the way it moved on screen since the frame before
@@ -279,6 +280,73 @@ float3 SampleLobe(float3 V, float3 N, float roughness, int2 pixel, uint frameInd
 	return dot(R, N) > 0.0 ? R : reflect(-V, N);
 }
 
+// ---- the ray traced lighting (LightingDenoiser), after the depth prepass: at half resolution (for the top left pixel
+// of every 2 x 2 block) one ray towards the sun and one short ray for the ambient occlusion. g_PostDepth: the scene depth, g_PostAux: the prepass's normal (octahedral),
+// g_SceneColor: the picture of the frame before (the light the short rays find), g_PassParams.w: the frame number.
+float3 LightRayStart(int2 p, float depth, out float3 N, out float viewDepth) {
+	float2 ndc = (float2(p) + 0.5) * g_ScreenSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
+	float4 h = mul(g_InvViewProj, float4(ndc, depth, 1.0));
+	viewDepth = abs(1.0 / h.w);
+	N = OctDecode(g_PostAux.Load(int3(p, 0)).xy);
+	return h.xyz / h.w + N * (0.002 * viewDepth + 0.01);
+}
+
+// The distance to what hides the sun along a direction inside its disc (the denoiser makes the penumbra from it);
+// 65504: nothing does; 0: the surface faces away from the sun.
+float4 PSSunRays(FullscreenOutput input) : SV_Target {
+	int2 p = min(int2(input.position.xy) * 2, int2(g_ScreenSize.xy) - 1);
+	float depth = g_PostDepth.Load(int3(p, 0)).r;
+	if (depth <= 0.0 || g_SunDirection.w < 0.5 || g_SunColor.w < 0.5) {
+		return 65504.0;
+	}
+	float3 N;
+	float viewDepth;
+	float3 origin = LightRayStart(p, depth, N, viewDepth);
+	float3 L = g_SunDirection.xyz;
+	if (dot(N, L) <= 0.0) {
+		return 0.0;
+	}
+	Rng::Hash::Initialize(uint2(p), uint(g_PassParams.w));
+	float2 rnd = Rng::Hash::GetFloat2();
+	float3x3 basis = Geometry::GetBasis(L);
+	float r = sqrt(rnd.x) * g_RayParams.z, angle = rnd.y * 6.2831853;
+	float3 d = normalize(L + (basis[0] * cos(angle) + basis[1] * sin(angle)) * r);
+	float t = BvhOccluderDistance(origin, d, 1000.0);
+	return t < 0.0 ? 65504.0 : t;
+}
+
+// A short ray from the cosine lobe round the normal, as long as the occlusion's radius (g_AOParams.y). rgb: the light
+// of what it met (where the picture of the frame before shows that place, from there; else lit as the reflections
+// light their hits); a: how far it got (its length: nothing met).
+float4 PSAoRays(FullscreenOutput input) : SV_Target {
+	int2 p = min(int2(input.position.xy) * 2, int2(g_ScreenSize.xy) - 1);
+	float radius = max(g_AOParams.y, 0.05);
+	float depth = g_PostDepth.Load(int3(p, 0)).r;
+	if (depth <= 0.0) {
+		return float4(0.0, 0.0, 0.0, radius);
+	}
+	float3 N;
+	float viewDepth;
+	float3 origin = LightRayStart(p, depth, N, viewDepth);
+	Rng::Hash::Initialize(uint2(p), uint(g_PassParams.w) + 7919u);
+	float3x3 basis = Geometry::GetBasis(N);
+	float3 d = normalize(Geometry::RotateVectorInverse(basis, ImportanceSampling::Cosine::GetRay(Rng::Hash::GetFloat2())));
+	// (rayTracedGi: the rays go 60 m and bring all the ambient light: the sky where they get out)
+	const bool gi = g_AOParams.w > 1.5;
+	BvhHit hit = BvhTraceEx(origin, d, gi ? 60.0 : radius, false, false);
+	if (hit.t < 0.0) {
+		return gi ? float4(min(SkyRadiance(d, 0.5) * g_Misc.w, 60000.0), 60.0) : float4(0.0, 0.0, 0.0, radius);
+	}
+	float3 light = 0.0;
+	s_NoSkyFallback = gi;
+	if (gi || g_QualityParams.z > 0.0) {
+		float3 P = origin + d * hit.t;
+		float4 screen = g_Jitter.z > 0.5 ? ScreenRadianceAt(P) : 0.0;
+		light = screen.a > 0.5 ? screen.rgb : BvhHitSurface(P, hit, hit.t, d).rgb;
+	}
+	return float4(min(light, gi ? 60000.0 : 64.0), hit.t);
+}
+
 // How smooth a surface must be to mirror here: the scene's own setting, and never rougher than about 0.4 (what is
 // mirrored here is sharp; a rough surface's blurred surroundings come from the probes).
 float MirrorAmount(float4 surface) {
@@ -322,11 +390,21 @@ float3 MirrorNormal(int2 p, float3 N, float viewDepth) {
 // picture (g_PassParams.xy says which this frame). rgb: what the mirrored ray brought back, a: how far the surface is
 // from the eye (the reflection pass lays the result over the picture by that; 0: no ray was traced).
 // g_SceneColor: the picture of the frame before (if there is one), g_PostDepth: the scene depth, g_PostAux: the surface target.
-// A mirror: a smooth surface that returns much of the light (chrome, polished metal; not lacquer, which returns a
-// tenth). Its mirrored picture is traced for every pixel, in the reflection pass itself: at half resolution a wheel's
-// spokes showed a blurred one.
-bool SharpMirror(float4 surface) {
-	return surface.a > 0.35 && surface.z < 0.12;
+// A mirror: a smooth surface that returns much of the light (chrome, polished metal; not lacquer). Measured against
+// what a lacquer's coat returns at this angle (`NoV`): a coat seen at a slant returns as much as chrome (Fresnel),
+// and with a fixed bar the slanting part of a car's side became a mirror, with the chrome's contrast: a hard edge
+// between paint and a white mirror on one panel. Mirrors get the chrome's contrast curve.
+bool SharpMirror(float4 surface, float NoV) {
+	float coat = 0.2 + 0.8 * pow(1.0 - saturate(NoV), 5.0); // (above any coat's Fresnel term: theirs start at 0.04 to 0.14)
+	return surface.z < 0.12 && surface.a > max(0.35, coat + 0.15);
+}
+
+// Which rays a surface's mirrored picture comes from. 0: a ray of its own for every pixel, along the mirror direction,
+// traced in the reflection pass itself (very smooth surfaces: mirrors and lacquer's coat; at half resolution, and
+// denoised by NRD in particular, their reflections lost their sharpness); 1: the half resolution rays (glossy
+// surfaces, denoised by NRD); in between both, mixed (no edge between two kinds of surface).
+float HalfResShare(float4 surface, bool mirror) {
+	return mirror ? 0.0 : smoothstep(0.05, 0.10, surface.z);
 }
 
 float4 PSRayTrace(FullscreenOutput input) : SV_Target {
@@ -342,7 +420,7 @@ float4 PSRayTrace(FullscreenOutput input) : SV_Target {
 	}
 	float4 surface = g_PostAux.Load(int3(p, 0));
 	float depth = g_PostDepth.Load(int3(p, 0)).r;
-	if (MirrorAmount(surface) <= 0.002 || depth <= 0.0 || SharpMirror(surface)) {
+	if (MirrorAmount(surface) <= 0.002 || depth <= 0.0) {
 		return none;
 	}
 	float2 ndc = (float2(p) + 0.5) * g_ScreenSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
@@ -351,6 +429,9 @@ float4 PSRayTrace(FullscreenOutput input) : SV_Target {
 	float viewDepth = abs(1.0 / h.w);
 	float3 N = OctDecode(surface.xy);
 	float3 V = normalize(g_CameraPos.xyz - P);
+	if (HalfResShare(surface, SharpMirror(surface, dot(N, V))) <= 0.0) {
+		return none; // (traced per pixel by the reflection pass)
+	}
 	float3 mirrorN = MirrorNormal(p, N, viewDepth);
 	float3 R = reflect(-V, mirrorN);
 	if (forNrd) {
@@ -380,19 +461,21 @@ float4 PSSsr(FullscreenOutput input) : SV_Target {
 	float3 shadedR = reflect(-V, N); // (what the surface was shaded with: along the direction its own normal gave)
 	float3 R = reflect(-V, MirrorNormal(p, N, viewDepth));
 	float3 origin = P + N * (0.004 * viewDepth + 0.01);
+	const bool mirror = SharpMirror(surface, dot(N, V));
+	const float halfShare = HalfResShare(surface, mirror);
 	// ---- 1. on screen. `share`: how much of the answer the screen gives (it fades towards the picture's edge).
 	float share = 0.0;
 	float3 mirrored = 0.0;
-	// The screen's march only where no ray answers: a mirror traces its own ray below, and the rays denoised by NRD
-	// (g_PassParams.z = 1) answer for every other surface (the screen's sharp answer would not match their blur). A
-	// ray's hit that the screen shows is coloured from the screen anyway.
-	const bool rayAnswers = rays && (g_PassParams.z > 0.5 || SharpMirror(surface));
+	// The screen's march only where no ray answers: very smooth surfaces trace their own ray below, and the rays
+	// denoised by NRD (g_PassParams.z = 1) answer for every other surface (the screen's sharp answer would not match
+	// their blur). A ray's hit that the screen shows is coloured from the screen anyway.
+	const bool rayAnswers = rays && (g_PassParams.z > 0.5 || halfShare < 1.0);
 	if (onScreen && !rayAnswers) {
 		// the ray: steps that grow with the distance, a different start per pixel so that the steps do not show as bands
 		const int kSteps = 48;
 		// (no different start per pixel on a mirror: there the screen's answer and the rays' alternated from pixel to
 		// pixel where the march only just found something, and the mirror showed a stipple)
-		float dither = SharpMirror(surface) ? 0.5 : frac(52.9829189 * frac(dot(input.position.xy, float2(0.06711056, 0.00583715))));
+		float dither = halfShare < 1.0 ? 0.5 : frac(52.9829189 * frac(dot(input.position.xy, float2(0.06711056, 0.00583715))));
 		float reach = clamp(viewDepth * 4.0, 4.0, 400.0);
 		float before = 0.0, found = -1.0;
 		for (int i = 0; i < kSteps; ++i) {
@@ -447,11 +530,16 @@ float4 PSSsr(FullscreenOutput input) : SV_Target {
 	float3 shaded = EnvironmentSpecular(P, shadedR, surface.z);
 	// ---- 2. and 3. the scene's triangles, where the screen did not answer (or only in part)
 	float3 result = shaded;
-	if (rays && share < 0.999 && SharpMirror(surface)) {
-		result = min(TracedRadiance(origin, R, true), 600.0);
-	} else if (rays && share < 0.999) {
+	if (rays && share < 0.999) {
+		// a ray of this pixel's own, along the mirror direction
+		float3 sharp = 0.0;
+		if (halfShare < 1.0) {
+			sharp = min(TracedRadiance(origin, R, true), 600.0);
+		}
 		// the traced rays (g_PostAux2, half resolution): the four around this pixel, each counted by how near it lies and
 		// by whether it was traced for the same surface (its distance from the eye agrees)
+		float3 soft = shaded;
+		if (halfShare > 0.0) {
 		float2 at = float2(p) * 0.5;
 		int2 base = int2(floor(at));
 		float2 f = at - float2(base);
@@ -466,11 +554,13 @@ float4 PSSsr(FullscreenOutput input) : SV_Target {
 			weight += w;
 		}
 		if (weight > 1e-4) {
-			result = sum / weight;
+			soft = sum / weight;
 		}
+		}
+		result = lerp(sharp, soft, halfShare);
 	}
 	result = lerp(result, mirrored, share);
-	if (!SharpMirror(surface)) {
+	if (!mirror) {
 		// Lacquer and other smooth surfaces: a milder version of the curve below. What is bright in the surroundings (the
 		// sky's light parts, clouds, the sun, lit walls) stands out in the paint, what is dark stays dark: the wet gloss
 		// of a polished car. (Not physics either.)
@@ -478,7 +568,7 @@ float4 PSSsr(FullscreenOutput input) : SV_Target {
 		float lum = max(dot(result, float3(0.2126, 0.7152, 0.0722)), 1e-5);
 		result *= clamp(pow(lum / mean, 0.5), 0.35, 2.4); // (0.6 and up to 3 at first: a little too strong)
 	}
-	if (SharpMirror(surface)) {
+	if (mirror) {
 		// Chrome's look is its contrast: what is darker than the sky's average goes darker, what is brighter goes
 		// brighter. (A curve on the mirrored picture, not physics: the user's choice. Around the sky's mean the picture
 		// is left as it is.)
@@ -486,7 +576,7 @@ float4 PSSsr(FullscreenOutput input) : SV_Target {
 		float lum = max(dot(result, float3(0.2126, 0.7152, 0.0722)), 1e-5);
 		result *= clamp(pow(lum / mean, 1.4), 0.04, 5.0); // (0.7 at first: the user asked for more)
 	}
-	return float4((result - shaded) * amount, 0.0);
+	return float4(SafeColor(result) - SafeColor(shaded), 0.0) * amount;
 }
 
 // ---- the physical sky's LUTs (aether_atmosphere.hlsli)
@@ -676,19 +766,19 @@ float4 PSVolumetricFogApply(FullscreenOutput input) : SV_Target {
 float4 PSBloomDown(FullscreenOutput input) : SV_Target {
 	float2 t = g_PassParams.zw * 0.5; // a texel of the source
 	float2 uv = input.uv;
-	float3 a = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-2, -2), 0).rgb;
-	float3 b = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(0, -2), 0).rgb;
-	float3 c = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(2, -2), 0).rgb;
-	float3 d = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-2, 0), 0).rgb;
-	float3 e = g_SceneColor.SampleLevel(s_LinearClamp, uv, 0).rgb;
-	float3 f = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(2, 0), 0).rgb;
-	float3 g = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-2, 2), 0).rgb;
-	float3 h = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(0, 2), 0).rgb;
-	float3 i = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(2, 2), 0).rgb;
-	float3 j = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-1, -1), 0).rgb;
-	float3 k = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(1, -1), 0).rgb;
-	float3 l = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-1, 1), 0).rgb;
-	float3 m = g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(1, 1), 0).rgb;
+	float3 a = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-2, -2), 0).rgb);
+	float3 b = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(0, -2), 0).rgb);
+	float3 c = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(2, -2), 0).rgb);
+	float3 d = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-2, 0), 0).rgb);
+	float3 e = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv, 0).rgb);
+	float3 f = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(2, 0), 0).rgb);
+	float3 g = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-2, 2), 0).rgb);
+	float3 h = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(0, 2), 0).rgb);
+	float3 i = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(2, 2), 0).rgb);
+	float3 j = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-1, -1), 0).rgb);
+	float3 k = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(1, -1), 0).rgb);
+	float3 l = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(-1, 1), 0).rgb);
+	float3 m = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv + t * float2(1, 1), 0).rgb);
 	float3 g0 = (j + k + l + m) * 0.25, g1 = (a + b + d + e) * 0.25, g2 = (b + c + e + f) * 0.25, g3 = (d + e + g + h) * 0.25, g4 = (e + f + h + i) * 0.25;
 	if (g_PassParams.x > 0.5) {
 		float w0 = 1.0 / (1.0 + Luma(g0)), w1 = 1.0 / (1.0 + Luma(g1)), w2 = 1.0 / (1.0 + Luma(g2)), w3 = 1.0 / (1.0 + Luma(g3)), w4 = 1.0 / (1.0 + Luma(g4));
@@ -902,7 +992,7 @@ float4 PSExposure(FullscreenOutput input) : SV_Target {
 		for (int x = 0; x < kGridX; ++x) {
 			// a pixel corner: the linear sampler returns the mean of the four pixels around it
 			float2 uv = floor((float2(x, y) + 0.5) / float2(kGridX, kGridY) * g_ScreenSize.xy) / g_ScreenSize.xy;
-			float3 c = g_SceneColor.SampleLevel(s_LinearClamp, uv, 0.0).rgb;
+			float3 c = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv, 0.0).rgb);
 			sum += log2(max(dot(c, float3(0.2126, 0.7152, 0.0722)), 1e-4));
 		}
 	}
@@ -915,7 +1005,7 @@ float4 PSExposure(FullscreenOutput input) : SV_Target {
 	ev = clamp(ev, g_ExposureParams.x, g_ExposureParams.y);
 	if (g_ExposureParams.w < 1.0) {
 		float previous = g_PostAux.Load(int3(0, 0, 0)).r;
-		if (previous > 0.0 && previous < 1e6) { // (a NaN fails both: this frame's value alone)
+		if (SafeValue(previous) > 0.0 && previous < 1e6) { // (not a number: this frame's value alone)
 			float previousEv = clamp(-log2(1.2 * previous), g_ExposureParams.x, g_ExposureParams.y);
 			ev = lerp(previousEv, ev, g_ExposureParams.w);
 		}
@@ -980,7 +1070,7 @@ float3 LinearToSRGB(float3 c) {
 // The final composite into the host's back buffer (a UNORM target: the encoding is done here).
 float4 PSComposite(FullscreenOutput input) : SV_Target {
 	// the scene target has the size of the back buffer: pixel for pixel
-	float3 color = g_SceneColor.Load(int3(input.position.xy, 0)).rgb;
+	float3 color = SafeColor(g_SceneColor.Load(int3(input.position.xy, 0)).rgb);
 	if ((int)g_Misc.x == VIEW_NONE || (int)g_Misc.x >= VIEW_SUN) {
 		float exposure = g_Exposure.x;
 		if (g_Exposure.y > 1.5) {
@@ -988,12 +1078,12 @@ float4 PSComposite(FullscreenOutput input) : SV_Target {
 		}
 		if (g_PostParams.x > 0.0) {
 			// bloom, the host's way: the picture mixed with its blurred pyramid
-			float3 bloom = g_PostAux2.SampleLevel(s_LinearClamp, input.uv, 0.0).rgb;
+			float3 bloom = SafeColor(g_PostAux2.SampleLevel(s_LinearClamp, input.uv, 0.0).rgb);
 			color = lerp(color, bloom, g_PostParams.x);
 		}
 		// the lens flare (PSLensFlare; nothing bound: black)
-		color += g_PostDepth.SampleLevel(s_LinearClamp, input.uv, 0.0).rgb;
-		color *= exposure * g_Exposure.z;
+		color += SafeColor(g_PostDepth.SampleLevel(s_LinearClamp, input.uv, 0.0).rgb);
+		color *= SafeValue(exposure) * g_Exposure.z;
 		// the host's shadows / midtones / highlights grading (before the tone curve, like the host)
 		if (g_SmhLimits.y > 0.0 || g_SmhLimits.w > 0.0) {
 			float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
@@ -1147,45 +1237,47 @@ float4 PSGiDepth(FullscreenOutput input) : SV_Target {
 	return float4(far, far * far, 0.0, GiFresh(cell) ? 1.0 : 0.1);
 }
 
-// ---- lens flare: what the glass of a camera's lens adds to a picture with something very bright in it. Light
-// reflected between the lens's surfaces lands again as "ghosts": dim, coloured copies on the line through the middle
-// of the picture, on the other side of it; as a halo; and as rays round the bright thing (the aperture's blades).
+// ---- lens flare: what the glass of a camera's lens adds to a picture with something very bright in it. Kept
+// faint, the way a good coated lens shows it: light reflected between the lens's surfaces lands again as "ghosts",
+// small soft copies of the aperture (a seven bladed iris) on the line through the middle of the picture, each a
+// little tinted by the coating; and the aperture's blades bend the light of the bright thing itself into short thin
+// rays (fourteen for seven blades). No rainbow ring: a real lens shows none of that size.
 // g_SceneColor: the picture at an eighth of its size (a bloom level), g_PostDepth: the scene's depth,
 // g_PostAux: the exposure. g_PassParams.x: strength. The result is added to the picture by the composite.
 float3 FlareBright(float2 uv, float exposure) {
 	if (any(uv < 0.0) || any(uv > 1.0)) {
 		return 0.0;
 	}
-	float3 c = g_SceneColor.SampleLevel(s_LinearClamp, uv, 0.0).rgb;
-	// (only what is far brighter than the picture's middle grey: lamps, the sun, glints)
+	float3 c = SafeColor(g_SceneColor.SampleLevel(s_LinearClamp, uv, 0.0).rgb);
+	// (only what is far brighter than the picture's middle grey: lamps, the sun, glints; and no more than 20 times
+	// it: the sun's own picture is far above that, and its ghost would be a white blob)
 	float l = Luma(c) * exposure;
 	float2 fromCentre = uv - 0.5;
-	// (and no more than 30 times it: the sun's own picture is far above that, and its ghost was a white blob)
-	return c * (saturate((l - 6.0) / max(l, 1e-4)) * min(1.0, 30.0 / max(l, 1e-4)) * (1.0 - smoothstep(0.3, 0.5, length(fromCentre))));
+	return c * (saturate((l - 12.0) / max(l, 1e-4)) * min(1.0, 20.0 / max(l, 1e-4)) * (1.0 - smoothstep(0.25, 0.5, length(fromCentre))));
 }
 
-float FlareDisc(float2 p, float2 centre, float radius) {
-	float d = length(p - centre) / radius;
-	// (a ghost is the aperture's picture: even, a little brighter at its rim, soft at the edge)
-	return smoothstep(1.0, 0.85, d) * (0.55 + 0.45 * d * d);
+// The aperture's shape: a heptagon of `radius` round `centre` (picture units, the width scaled by the aspect), its
+// edge soft, the inside even with a slightly brighter rim (what the coating's reflection looks like).
+float FlareAperture(float2 p, float2 centre, float radius) {
+	float2 v = p - centre;
+	float angle = atan2(v.y, v.x + 1e-6) + 0.2;
+	const float sector = 6.2831853 / 7.0;
+	float edge = cos(sector * 0.5) / cos(fmod(angle + 31.4159265, sector) - sector * 0.5); // (the polygon's radius in that direction)
+	float d = length(v) / (radius * edge);
+	return smoothstep(1.0, 0.8, d) * (0.7 + 0.3 * d * d);
 }
 
 float4 PSLensFlare(FullscreenOutput input) : SV_Target {
 	float2 uv = input.uv;
 	float aspect = g_ScreenSize.x * g_ScreenSize.w;
-	float exposure = (g_Exposure.y > 1.5 ? g_PostAux.Load(int3(0, 0, 0)).r : g_Exposure.x) * g_Exposure.z;
+	float exposure = SafeValue((g_Exposure.y > 1.5 ? g_PostAux.Load(int3(0, 0, 0)).r : g_Exposure.x) * g_Exposure.z);
 	float3 flare = 0.0;
-	// ghosts of whatever is bright in the picture: the picture turned about its middle, at a few sizes, each tinted
+	// ghosts of whatever is bright in the picture: the picture turned about its middle, at two sizes
 	float2 flipped = 1.0 - uv;
 	float2 toCentre = 0.5 - flipped;
-	flare += FlareBright(flipped + toCentre * 0.35, exposure) * float3(0.9, 0.7, 0.5);
-	flare += FlareBright(flipped + toCentre * 0.8, exposure) * float3(0.5, 0.8, 1.0) * 0.7;
-	flare += FlareBright(flipped + toCentre * 1.4, exposure) * float3(0.6, 1.0, 0.7) * 0.5;
-	flare += FlareBright(uv + (0.5 - uv) * 0.5, exposure) * float3(0.8, 0.6, 1.0) * 0.4;
-	// the halo: the picture pushed out from the middle by a fixed distance
-	float2 out2 = normalize(toCentre * float2(aspect, 1.0) + 1e-5) * float2(1.0 / aspect, 1.0) * 0.4;
-	flare += FlareBright(flipped + out2, exposure) * float3(1.0, 0.85, 0.7) * 0.5;
-	flare *= 0.015;
+	flare += FlareBright(flipped + toCentre * 0.45, exposure) * float3(0.8, 0.85, 1.0);
+	flare += FlareBright(flipped + toCentre * 1.3, exposure) * float3(1.0, 0.9, 0.75) * 0.6;
+	flare *= 0.006;
 
 	// the sun (or the moon): its place is known, so its flare is drawn and not gathered from the picture
 	if (g_SunDirection.w > 0.5) {
@@ -1201,28 +1293,34 @@ float4 PSLensFlare(FullscreenOutput input) : SV_Target {
 					seen += g_PostDepth.SampleLevel(s_PointClamp, q, 0.0).r <= 0.0 ? 1.0 : 0.0;
 				}
 			}
-			seen = seen / 12.0 * CloudShadow(g_CameraPos.xyz);
+			// (less towards the picture's edge: there the light falls on the lens at a slant and the hood shades it)
+			float2 fromMiddle = abs(sun - 0.5) * 2.0;
+			seen = seen / 12.0 * CloudShadow(g_CameraPos.xyz) * (1.0 - 0.6 * smoothstep(0.4, 1.0, max(fromMiddle.x, fromMiddle.y)));
 			if (seen > 0.0) {
 				float2 p = (uv - 0.5) * float2(aspect, 1.0), s = (sun - 0.5) * float2(aspect, 1.0);
 				float3 f = 0.0;
-				f += FlareDisc(p, s * -0.35, 0.035) * float3(0.6, 0.8, 1.0) * 0.5;
-				f += FlareDisc(p, s * -0.62, 0.09) * float3(1.0, 0.7, 0.4) * 0.22;
-				f += FlareDisc(p, s * 0.45, 0.02) * float3(0.5, 1.0, 0.6) * 0.4;
-				f += FlareDisc(p, s * -1.15, 0.15) * float3(0.7, 0.6, 1.0) * 0.14;
-				f += FlareDisc(p, s * -1.6, 0.055) * float3(1.0, 0.9, 0.6) * 0.16;
-				float d = length(p - s);
-				// the halo: a thin ring, red outside and blue inside
-				f += float3(exp(-pow((d - 0.43) / 0.02, 2.0)), exp(-pow((d - 0.42) / 0.02, 2.0)), exp(-pow((d - 0.41) / 0.02, 2.0))) * 0.1;
-				// rays round it
-				float angle = atan2(p.y - s.y, p.x - s.x);
-				float rays = pow(abs(sin(angle * 7.0)), 10.0) * 0.6 + pow(abs(sin(angle * 3.0 + 1.3)), 24.0);
-				f += float3(1.0, 0.95, 0.85) * ((0.4 + rays) * exp(-d * 9.0) * 1.2);
-				// (the sun's light in scene units; a ghost is some hundredths of what a sunlit white wall sends)
-				flare += g_SunColor.rgb * f * (0.03 * seen);
+				// ghosts on the line through the middle; red, green and blue a little apart (the coating's colour)
+				const float kGhostPlace[4] = {-0.3, -0.7, 0.35, -1.25};
+				const float kGhostSize[4] = {0.03, 0.06, 0.018, 0.1};
+				const float3 kGhostTint[4] = {float3(0.55, 0.75, 1.0), float3(1.0, 0.8, 0.55), float3(0.6, 1.0, 0.75), float3(0.75, 0.7, 1.0)};
+				const float kGhostStrength[4] = {0.22, 0.08, 0.18, 0.04};
+				[unroll] for (int g = 0; g < 4; ++g) {
+					float2 c = s * kGhostPlace[g];
+					float3 shape = float3(FlareAperture(p, c, kGhostSize[g] * 1.03), FlareAperture(p, c, kGhostSize[g]), FlareAperture(p, c, kGhostSize[g] * 0.97));
+					f += shape * kGhostTint[g] * kGhostStrength[g];
+				}
+				// the glow round the sun and the blades' rays: short, thin, fading fast
+				float2 v = p - s;
+				float d = length(v);
+				float angle = atan2(v.y, v.x + 1e-6);
+				float rays = pow(abs(cos(angle * 7.0 + 0.2)), 60.0);
+				f += float3(1.0, 0.97, 0.92) * (exp(-d * 40.0) * 0.6 + rays * exp(-d * 10.0) * 0.5);
+				// (the sun's light in scene units; a ghost is about a hundredth of what a sunlit white wall sends)
+				flare += g_SunColor.rgb * f * (0.025 * seen);
 			}
 		}
 	}
-	return float4(flare * g_PassParams.x, 1.0);
+	return float4(SafeColor(flare * g_PassParams.x), 1.0);
 }
 
 // The tyre smoke, drawn at half size into a target of its own (scene_particles.hlsl), over the picture.

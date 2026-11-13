@@ -59,6 +59,33 @@ void PSDepthAlphaTest(VSOutput input) {
 	clip(alpha - mat.params.z);
 }
 
+// The depth prepass also writes what the ray traced sun shadow and ambient occlusion need before the opaque pass
+// (their denoiser's guides): the surface's normal (the vertex normal, octahedral) and its motion on screen.
+struct PrepassOutput {
+	float2 normal : SV_Target0;
+	float4 velocity : SV_Target1; // as the opaque pass writes it (ForwardOutput)
+};
+
+PrepassOutput Prepass(VSOutput input, bool frontFace) {
+	PrepassOutput o;
+	const bool outside = frontFace != ((g_DrawFlags & 1u) != 0u);
+	o.normal = OctEncode(normalize(input.normal) * (outside ? 1.0 : -1.0));
+	float2 now = input.clipNow.xy / max(input.clipNow.w, 1e-5), before = input.clipBefore.xy / max(input.clipBefore.w, 1e-5);
+	o.velocity = float4(input.clipBefore.w > 1e-4 ? (now - before) * float2(0.5, -0.5) : float2(0.0, 0.0), g_Instances[input.instance].layers.y > 0.5 ? 1.0 : 0.0, 0.0);
+	return o;
+}
+
+PrepassOutput PSPrepass(VSOutput input, bool frontFace : SV_IsFrontFace) {
+	return Prepass(input, frontFace);
+}
+
+PrepassOutput PSPrepassAlphaTest(VSOutput input, bool frontFace : SV_IsFrontFace) {
+	MaterialData mat = g_Materials[g_MaterialIndex];
+	float alpha = g_BaseMap.Sample(s_Aniso, input.uv).a * mat.baseColor.a;
+	clip(alpha - mat.params.z);
+	return Prepass(input, frontFace);
+}
+
 void PSShadowAlphaTest(float4 position : SV_Position, float2 uv : TEXCOORD0) {
 	MaterialData mat = g_Materials[g_MaterialIndex];
 	float alpha = g_BaseMap.Sample(s_Aniso, uv).a * mat.baseColor.a;
@@ -524,7 +551,20 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 
 	// ---- lighting
 	uint cascade = 0, lightCount = 0;
-	float shadow = SunShadow(input.worldPos, normalize(input.normal) * (outside ? 1.0 : -1.0), input.viewDepth, cascade);
+	// the sun's shadow: ray traced and denoised for the opaque picture (LightingDenoiser), one ray for what is blended
+	// over it (glass), the shadow map where there are no rays
+	float shadow;
+	if (g_RayParams.y > 0.5 && (g_DrawFlags & 2u) == 0u) {
+		shadow = g_SunShadowMask.Load(int3(input.position.xy, 0)).r;
+		if (g_RayParams.w > 0.5) {
+			// (and what the rays cannot find: people and other skinned meshes, from their own shadow map)
+			shadow *= SunShadowIn(g_SunShadowUntraced, 2.0, input.worldPos, normalize(input.normal) * (outside ? 1.0 : -1.0), cascade);
+		}
+	} else if (g_RayParams.x > 0.5) {
+		shadow = RaySunShadow(input.worldPos, normalize(input.normal) * (outside ? 1.0 : -1.0));
+	} else {
+		shadow = SunShadow(input.worldPos, normalize(input.normal) * (outside ? 1.0 : -1.0), input.viewDepth, cascade);
+	}
 	shadow *= CloudShadow(input.worldPos); // (the physical sky's clouds drift over the ground)
 	float3 direct = 0.0;
 	float3 sunLight = 0.0;
@@ -535,7 +575,8 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 	}
 	direct += PunctualLights(s, input.worldPos, V, input.position.xy, input.viewDepth, layers, lightCount);
 
-	float3 ambientDiffuse = AmbientLight(input.worldPos, N) * s.albedo * (1.0 - s.metallic);
+	const bool rayGi = g_AOParams.w > 1.5 && (g_DrawFlags & 2u) == 0u; // (rayTracedGi: the AO texture brings all the ambient light)
+	float3 ambientDiffuse = rayGi ? 0.0 : AmbientLight(input.worldPos, N) * s.albedo * (1.0 - s.metallic);
 	float3 R = reflect(-V, N);
 	// a rough surface reflects mostly what lies around its normal, not around the mirror direction
 	// (the base layer's normal: on metallic paint each flake mirrors its own part of the surroundings)
@@ -551,7 +592,7 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		float4 occlusion = g_AO.Load(int3(input.position.xy, 0)); // rgb: light bounced off nearby surfaces, a: ambient occlusion
 		visibility *= occlusion.a;
 		// (the bounced light is diffuse light like the sky's, and is not occluded again: it was gathered around this very place)
-		bounced = occlusion.rgb * g_QualityParams.z * s.albedo * (1.0 - s.metallic) * s.occlusion;
+		bounced = occlusion.rgb * (rayGi ? 1.0 : g_QualityParams.z) * s.albedo * (1.0 - s.metallic) * s.occlusion;
 		float directAo = lerp(1.0, occlusion.a, g_AOParams.z);
 		direct *= directAo;
 		sunLight *= directAo;
@@ -676,6 +717,7 @@ struct ForwardOutput {
 ForwardOutput PSForward(VSOutput input, bool frontFace : SV_IsFrontFace) {
 	ForwardOutput o;
 	o.color = ShadeForward(input, frontFace, o.surface);
+	o.color.rgb = SafeColor(o.color.rgb); // (a sun glint on a very smooth coat could reach infinity)
 	float2 now = input.clipNow.xy / max(input.clipNow.w, 1e-5), before = input.clipBefore.xy / max(input.clipBefore.w, 1e-5);
 	o.velocity = float4(input.clipBefore.w > 1e-4 ? (now - before) * float2(0.5, -0.5) : float2(0.0, 0.0), g_Instances[input.instance].layers.y > 0.5 ? 1.0 : 0.0, 0.0);
 	return o;

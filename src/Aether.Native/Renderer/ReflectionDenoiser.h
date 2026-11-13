@@ -34,6 +34,7 @@ public:
 		uint32_t width = 0, height = 0;         // the full resolution (the rays have half of it)
 		bool restart = false;                   // the history does not apply (another camera, a cut)
 		float fps = 60.0f;                      // for an accumulation measured in seconds
+		UINT64 retireFence = 0;                 // this frame's: the descriptors it uses are reused after it
 	};
 
 	// The quarter resolution target the reflection pass reads; made by Prepare for this size. Null: not usable.

@@ -100,6 +100,8 @@
 - ゲームのタイヤスモークの発生：ドリフト中 1 台あたり毎秒 500 個強、1 フレーム分は同じ 1 点に出る。ゲーム側の不透明度は 0.04〜0.09、発生サイズは 0.08〜0.10 m（小さく薄い粒を大量に重ねる設計）。
 - コースの夜はゲームの DLC（`GameManager.NightModeInstalled`）。無いときに Aether から夜へ切り替えない。ガレージの昼夜切り替えは誰でも使える。
 - Unity の `Mathf.SmoothStep(a, b, t)` は a と b の補間で、GLSL / HLSL の smoothstep とは別物。
+- DXC は fast math でコンパイルする。`isnan` や NaN の比較に頼った防御は消えることがある。NaN / 無限大はビット列で判定する（`SafeColor`）。シーンの絵（`R11G11B10_FLOAT`）は 65024 を超えると無限大になる。
+- グローバルのテクスチャーテーブル（`kGlobalsTableSize`）にスロットを足すときは、画面用（`globalsTable_`）と反射プローブ用（`probeGlobalsTable_`）の両方で必ず初期化する。初期化しないスロットには古いビュー（破棄済みのテクスチャーのものも）が残り、読むと GPU がハングする（`DXGI_ERROR_DEVICE_HUNG`。調べ方は `docs/diagnostics/troubleshooting.md`）。
 - HLSL では `pass` は予約語。Windows のヘッダーを含む C++ では `near` / `far` がマクロ。
 - D3D12 のデバッグレイヤーのメッセージは Unity の `Player.log` には出ない。Aether がコールバックで自分のログに写す（`E_D3D12_VALIDATION` / `E_D3D12_CORRUPTION`）。ゲーム内の検証は `launch-game.ps1 -DebugLayer` で起動して `get_logs` を読む。
 - Unity のクラッシュダンプは `%LOCALAPPDATA%\Temp\CarX Technologies\Drift Racing Online\Crashes\`。例外コード `0x87D` はデバッグレイヤーが破損を検出して投げた例外。

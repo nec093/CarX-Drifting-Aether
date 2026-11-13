@@ -59,6 +59,7 @@ public:
 
 	struct PassResult { std::string name; bool executed = false; uint32_t drawCalls = 0, triangles = 0, dispatches = 0; double cpuMs = 0; std::string note; };
 	const std::vector<PassResult>& Results() const { return results_; }
+	const std::string& PassName(size_t index) const { return passes_[index].name; }
 	const std::vector<std::string>& Errors() const { return errors_; }
 	GpuTexture* Physical(ResourceId id) const;
 	size_t PassCount() const { return passes_.size(); }

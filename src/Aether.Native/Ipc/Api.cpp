@@ -3,6 +3,7 @@
 // the same validated entry points the overlay uses. Nothing here touches the device or a resource's lifetime.
 #include "../Renderer/Bvh.h"
 #include "../Renderer/ReflectionDenoiser.h"
+#include "../Renderer/LightingDenoiser.h"
 #include "PipeServer.h"
 #include "../Core/Config.h"
 #include "../Core/Log.h"
@@ -222,6 +223,7 @@ json HandleRequest(const json& request) {
 		out["aetherRenderer"] = SceneRenderer::Get().Stats();
 		out["rayTracing"] = SceneBvh::Get().Stats();
 		out["reflectionDenoiser"] = ReflectionDenoiser::Get().Stats();
+		out["lightingDenoiser"] = LightingDenoiser::Get().Stats();
 		return Ok(id, out);
 	}
 	if (method == "get_logs") {

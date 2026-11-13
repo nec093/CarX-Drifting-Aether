@@ -115,7 +115,11 @@ Transient はプールに戻ります。プールのテクスチャーは 120 �
 | パス | 条件 | 内容 |
 |---|---|---|
 | `ShadowCascades` | カスケードがあるとき | 太陽（夜は月）の影を、アトラスの各カスケードのタイルに描く |
-| `DepthPrepass` | 常に | 不透明の深度（`SceneDepth`） |
+| `ShadowCascadesUntraced` | レイトレースの影で、光線の構造に入っていない投影物があるとき | その投影物だけを、半分の大きさのアトラスに描く |
+| `DepthPrepass` | 常に | 不透明の深度（`SceneDepth`）。法線（`SceneGuideNormal`）と画面上の動き（`SceneVelocity`）も書く（レイトレースの影と AO のノイズ除去の手がかり） |
+| `SunShadowRays` | 機能 `rayTracedLighting`（光線が使えるとき） | 2 × 2 画素に 1 本、太陽の円盤の中への光線。遮る物までの距離を書く |
+| `AmbientOcclusionRays` | 同上 | 2 × 2 画素に 1 本、AO の短い光線（`rayTracedGi` では 60 m の間接光の光線：抜ければ空の光）。当たった先の色と距離を書く |
+| `LightingDenoise` | 同上 | コンピュート。NRD（SIGMA_SHADOW、REBLUR_DIFFUSE）の入力を作り、NRD を実行し、太陽の見え方と `g_AO` の形式の AO を全解像度で書く（`LightingDenoiser`） |
 | `SkyTransmittance` | 物理空で、LUT が未作成のとき（登録しない） | 大気の透過率 LUT |
 | `SkyMultipleScattering` | 同上 | 多重散乱 LUT |
 | `CloudNoise` | 同上 | 雲の形のもとになるタイリングノイズ |
@@ -123,7 +127,7 @@ Transient はプールに戻ります。プールのテクスチャーは 120 �
 | `SkyClouds` | 物理空で雲があるとき（登録しない） | 雲を含めた空。反射と空の拡散光が読む |
 | `SkyViewReady` | 物理空（登録しない） | 描画なし。空の LUT を以降のパスが読む状態にする |
 | `SkyIrradiance` | 空があるとき（シーンの空のテクスチャーか物理空） | 空の拡散光（32x32 の八面体マップ） |
-| `AmbientOcclusion` | 設定 `ssao` | 深度からの AO。間接光が有効なら前フレームの絵から近くの面の照り返しも集める |
+| `AmbientOcclusion` | 設定 `ssao`（レイトレースの AO でないとき） | 深度からの AO。間接光が有効なら前フレームの絵から近くの面の照り返しも集める |
 | `AmbientOcclusionBlur` | 同上 | 深度を見たぼかし |
 | `GiRays` | プローブグリッド GI（BVH が使えるとき、登録しない） | 各プローブから 64 本の光線 |
 | `GiIrradiance` | 同上 | 光線の結果をプローブの放射照度に集める |

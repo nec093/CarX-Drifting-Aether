@@ -107,8 +107,10 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 | `reflectionProbe` | 毎フレーム、カメラの周りにキューブを描いて、画面外も含めた周囲の映り込みにする |
 | `rayTracedReflections` | シーンの三角形にレイを飛ばした、滑らかな面の反射（画面外も映る） |
 | `followSceneNight` | ゲームの昼夜の切り替えが夜の間、物理的な空も夜（真夜中ごろ、月が出る）にする |
-| `probeGi` | カメラの周りのプローブの格子からの間接光（各プローブが毎フレーム、シーンの三角形にレイを飛ばす） |
+| `rayTracedGi` | 画素ごとのレイトレース間接光（最大 60 m、NRD REBLUR）。`rayTracedLighting` が必要。動いている間は `probeGi` の格子を止める |
+| `probeGi` | カメラの周りのプローブの格子からの間接光（各プローブが毎フレーム、シーンの三角形にレイを飛ばす）。`rayTracedGi` が動かないときに使う |
 | `lensFlare` | 太陽と明るいランプからのレンズフレア |
+| `rayTracedLighting` | レイトレースの太陽の影と AO（NVIDIA NRD の SIGMA、REBLUR でノイズ除去）。オフ：シャドウマップと SSAO。状態は `get_scene_info` の `lightingDenoiser` |
 
 ### set_graphics_option のオプション
 

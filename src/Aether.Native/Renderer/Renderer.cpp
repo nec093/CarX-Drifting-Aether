@@ -70,18 +70,57 @@ void Renderer::Fail(const char* code, const std::string& what, HRESULT hr) {
 			D3D12_DRED_PAGE_FAULT_OUTPUT1 fault = {};
 			if (SUCCEEDED(dred->GetPageFaultAllocationOutput1(&fault))) {
 				extra["dredPageFaultVA"] = Format("0x%llX", static_cast<unsigned long long>(fault.PageFaultVA));
+				// what lay at that address: still there, or freed shortly before
+				auto names = [](const D3D12_DRED_ALLOCATION_NODE1* n) {
+					json list = json::array();
+					for (int k = 0; n && k < 24; n = n->pNext, ++k) {
+						list.push_back({{"name", n->ObjectNameW ? WideToUtf8(n->ObjectNameW) : n->ObjectNameA ? std::string(n->ObjectNameA) : ""}, {"type", int(n->AllocationType)}});
+					}
+					return list;
+				};
+				extra["dredPageFaultExisting"] = names(fault.pHeadExistingAllocationNode);
+				extra["dredPageFaultRecentlyFreed"] = names(fault.pHeadRecentFreedAllocationNode);
 			}
 			D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 crumbs = {};
 			if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&crumbs))) {
+				// (D3D12_AUTO_BREADCRUMB_OP by value)
+				static const char* const kOps[] = {"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch",
+					"CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView", "ClearUnorderedAccessView",
+					"ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData", "BeginSubmission", "EndSubmission", "DecodeFrame",
+					"ProcessFrames", "AtomicCopyBufferUint", "AtomicCopyBufferUint64", "ResolveSubresourceRegion", "WriteBufferImmediate", "DecodeFrame1",
+					"SetProtectedResourceSession", "DecodeFrame2", "ProcessFrames1", "BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
+					"CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion", "ResolveMotionVectorHeap",
+					"SetPipelineState1", "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh", "EncodeFrame", "ResolveEncoderOutputMetadata", "Barrier",
+					"BeginCommandList", "DispatchGraph", "SetProgram", "ProcessFrames2"};
+				auto opName = [&](int op) { return op >= 0 && op < int(_countof(kOps)) ? std::string(kOps[op]) : Format("op %d", op); };
 				json nodes = json::array();
 				int count = 0;
-				for (const D3D12_AUTO_BREADCRUMB_NODE1* n = crumbs.pHeadAutoBreadcrumbNode; n && count < 16; n = n->pNext, ++count) {
+				for (const D3D12_AUTO_BREADCRUMB_NODE1* n = crumbs.pHeadAutoBreadcrumbNode; n && count < 64; n = n->pNext, ++count) {
 					UINT last = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
-					if (last == n->BreadcrumbCount) {
+					if (last == n->BreadcrumbCount || !n->pCommandHistory) {
 						continue; // this list ran to its end
 					}
-					nodes.push_back({{"commandList", n->pCommandListDebugNameW ? WideToUtf8(n->pCommandListDebugNameW) : ""}, {"completedOps", last}, {"totalOps", n->BreadcrumbCount},
-						{"nextOp", last < n->BreadcrumbCount && n->pCommandHistory ? int(n->pCommandHistory[last]) : -1}});
+					json node = {{"commandList", n->pCommandListDebugNameW ? WideToUtf8(n->pCommandListDebugNameW) : ""},
+						{"queue", n->pCommandQueueDebugNameW ? WideToUtf8(n->pCommandQueueDebugNameW) : ""}, {"completedOps", last}, {"totalOps", n->BreadcrumbCount}};
+					// the operations round the first one that did not complete
+					json ops = json::array();
+					for (UINT k = last >= 4 ? last - 4 : 0; k < std::min(n->BreadcrumbCount, last + 4); ++k) {
+						ops.push_back(Format("%u%s %s", k, k == last ? " (next)" : "", opName(int(n->pCommandHistory[k])).c_str()));
+					}
+					node["ops"] = ops;
+					// the events (Aether's pass names) up to there: the last is the pass the GPU was in
+					json events = json::array();
+					for (UINT c = 0; c < n->BreadcrumbContextsCount; ++c) {
+						const D3D12_DRED_BREADCRUMB_CONTEXT& ctx = n->pBreadcrumbContexts[c];
+						if (ctx.BreadcrumbIndex <= last + 1 && ctx.pContextString) {
+							events.push_back(Format("%u ", ctx.BreadcrumbIndex) + WideToUtf8(ctx.pContextString));
+						}
+					}
+					if (events.size() > 6) {
+						events.erase(events.begin(), events.end() - 6);
+					}
+					node["events"] = events;
+					nodes.push_back(node);
 				}
 				extra["dredIncompleteLists"] = nodes;
 			}

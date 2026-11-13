@@ -609,17 +609,17 @@ void SceneBvh::BeginInstances() {
 	frameInstanceTris_ = 0;
 }
 
-void SceneBvh::AddInstance(AeHandle mesh, const Mat4& world, uint32_t skipSubMeshes, uint32_t materialOffset, uint32_t doubleSided, bool mirrored) {
+bool SceneBvh::AddInstance(AeHandle mesh, const Mat4& world, uint32_t skipSubMeshes, uint32_t materialOffset, uint32_t doubleSided, bool mirrored) {
 	auto alias = aliases_.find(mesh);
 	auto it = meshes_.find(alias != aliases_.end() ? alias->second : mesh);
 	// (only meshes whose triangles the GPU already has)
 	if (it == meshes_.end() || uint64_t(it->second.triBase) + it->second.triCount > uploadedTris_) {
-		return;
+		return false;
 	}
 	for (int r = 0; r < 3; ++r) {
 		for (int c = 0; c < 4; ++c) {
 			if (!std::isfinite(world.at(r, c))) {
-				return;
+				return false;
 			}
 		}
 	}
@@ -632,12 +632,13 @@ void SceneBvh::AddInstance(AeHandle mesh, const Mat4& world, uint32_t skipSubMes
 	}
 	instance.triBase = it->second.triBase;
 	instance.skipSubMeshes = skipSubMeshes;
-	instance.materialOffset = (materialOffset & 0x7FFFFFFFu) | (mirrored ? 0x80000000u : 0u);
+	instance.materialOffset = (materialOffset & 0x7FFFFFFFu) | (mirrored ? 0x80000000u : 0u); // (the caller packs the entry count into bits 24..30)
 	instance.doubleSided = doubleSided;
 	instances_.push_back(instance);
 	instanceWorld_.push_back(world);
 	instanceMesh_.push_back(it->first);
 	frameInstanceTris_ += it->second.triCount;
+	return true;
 }
 
 bool SceneBvh::Supported(ID3D12Device* device) {

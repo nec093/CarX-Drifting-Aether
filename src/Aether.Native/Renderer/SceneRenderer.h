@@ -69,7 +69,7 @@ private:
 	void UploadDefaults(ID3D12GraphicsCommandList* list);
 	ID3D12PipelineState* Pipeline(uint32_t layoutId, PassKind kind, uint32_t cull);
 	// full screen passes: one pixel shader each (scene_post.hlsl), named in kFullscreenEntry (SceneRenderer.cpp)
-	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenGiRays, kFullscreenGiIrradiance, kFullscreenGiDepth, kFullscreenLensFlare, kFullscreenSmokeApply, kFullscreenKindCount };
+	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenGiRays, kFullscreenGiIrradiance, kFullscreenGiDepth, kFullscreenLensFlare, kFullscreenSmokeApply, kFullscreenSunRays, kFullscreenAoRays, kFullscreenKindCount };
 	// draws a full screen pass into `output` (its whole size) with up to three inputs; `params` reach the shader as g_PassParams
 	bool Fullscreen(RenderGraph::PassContext& ctx, FullscreenKind kind, GpuTexture* output, GpuTexture* in0, GpuTexture* in1 = nullptr, GpuTexture* in2 = nullptr, const float* params = nullptr, GpuTexture* in3 = nullptr);
 	uint32_t postNext_ = 0; // the next free table of this frame's post tables
@@ -82,6 +82,8 @@ private:
 	// the reflection denoiser (NRD): the camera without jitter, this frame and the one before, and what the passes
 	// reconstruct positions with
 	Mat4 nrdView_ = Mat4::Identity(), nrdProj_ = Mat4::Identity(), nrdViewPrev_ = Mat4::Identity(), nrdProjPrev_ = Mat4::Identity(), invViewProj_ = Mat4::Identity();
+	bool rtGi_ = false;      // this frame: the ambient light per pixel from long rays (setting rayTracedGi; the probe grid stops)
+	bool rtLighting_ = false; // this frame: the sun's shadow and the ambient occlusion from rays (setting rayTracedLighting, LightingDenoiser)
 	bool nrdFrame_ = false; // this frame: the reflection rays sample the surface's lobe and NRD denoises them (setting reflectionDenoiser = nrd)
 	bool taa_ = false;
 	float bloomMix_ = 0, bloomScatter_ = 0, motionBlur_ = 0;
@@ -170,7 +172,7 @@ private:
 	bool failedShaders_ = false;
 	uint64_t shaderGeneration_ = 0;
 	ComPtr<ID3D12RootSignature> root_;
-	ComPtr<ID3DBlob> vsMain_, vsShadow_, psForward_, psDepthAlpha_, psShadowAlpha_, vsFullscreen_, psDecal_, vsParticle_, psParticle_;
+	ComPtr<ID3DBlob> vsMain_, vsShadow_, psForward_, psPrepass_, psDepthAlpha_, psShadowAlpha_, vsFullscreen_, psDecal_, vsParticle_, psParticle_;
 	// particles: this frame's quads (sorted, uploaded as a buffer the vertex shader reads) and their batches
 	ComPtr<ID3D12PipelineState> particlePipeline_, smokePipeline_; // (smoke: into its own target at half size)
 	bool particlePipelineFailed_ = false;
@@ -188,6 +190,11 @@ private:
 	std::shared_ptr<GpuTexture> white_, flatNormal_, black_;
 	bool defaultsUploaded_ = false;
 	std::shared_ptr<GpuTexture> shadowAtlas_;
+	// with ray traced shadows: what the rays cannot find (meshes not in the ray structures: skinned people by default)
+	// casts its shadow from a shadow map of its own, half the atlas's size, the same cascades
+	std::shared_ptr<GpuTexture> untracedAtlas_;
+	bool untracedShadow_ = false;
+	uint32_t rayMaterialPadded_ = 0; // this frame: ray instances whose mesh has more sub meshes than the renderer has materials
 	uint32_t shadowCascadeSize_ = 0;
 	uint32_t nullCubeSrv_ = UINT32_MAX, nullTextureSrv_ = UINT32_MAX, fallbackTable_ = UINT32_MAX;
 
@@ -197,7 +204,7 @@ private:
 	std::vector<uint32_t> passStampBegin_, passStampEnd_;
 
 	// per frame
-	std::vector<DrawItem> opaque_, transparent_, casters_, decals_; // decals_: boxes that darken what lies inside them (blob shadows)
+	std::vector<DrawItem> opaque_, transparent_, casters_, untracedCasters_, decals_; // decals_: boxes that darken what lies inside them (blob shadows)
 	std::vector<uint8_t> instanceData_, materialData_;
 	uint32_t instanceCount_ = 0, materialCount_ = 0;
 	std::vector<Cascade> cascades_;

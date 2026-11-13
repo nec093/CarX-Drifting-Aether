@@ -43,7 +43,7 @@ struct TlasInstance {
 	float worldToObject[12]; // three rows (the hit's normal)
 	uint32_t triBase;        // the mesh's first triangle in the pool (also the instance's ID in the top level structure)
 	uint32_t skipSubMeshes;  // bit per sub mesh (the first 32): its triangles are not there for rays (glass, helper geometry)
-	uint32_t materialOffset; // where its sub meshes' materials start in the frame's ray material table; bit 31: mirrored (its triangles' front is the other side)
+	uint32_t materialOffset; // bits 0..23: where its sub meshes' materials start in the frame's ray material table, 24..30: how many entries it has there, 31: mirrored (its triangles' front is the other side)
 	uint32_t doubleSided;    // bit per sub mesh (the first 32): rays hit its triangles from behind too
 };
 
@@ -72,7 +72,8 @@ public:
 	// Takes in what the worker finished and, when the pool changed, uploads it (recorded into `list`).
 	void BeginFrame(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT64 fence, uint64_t frame);
 	void BeginInstances();
-	void AddInstance(AeHandle mesh, const Mat4& world, uint32_t skipSubMeshes, uint32_t materialOffset, uint32_t doubleSided, bool mirrored);
+	// False: the mesh is not there for rays (yet): its triangles never came (skinned meshes by default) or are not uploaded.
+	bool AddInstance(AeHandle mesh, const Mat4& world, uint32_t skipSubMeshes, uint32_t materialOffset, uint32_t doubleSided, bool mirrored);
 	bool HasGeometry() const { return uploadedTris_ > 0; }
 	// Uploads this frame's instances and builds the structures: the bottom level ones this frame needs and has not
 	// got (or whose triangles changed), the top level one over the instances. False: nothing to trace this frame (no

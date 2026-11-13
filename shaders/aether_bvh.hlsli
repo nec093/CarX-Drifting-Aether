@@ -20,7 +20,7 @@ struct TlasInstance {
 	float4 row0, row1, row2; // world -> the mesh's space (for the hit's normal)
 	uint triBase;            // the mesh's first triangle in g_BvhTris (also the instance's ID in the structure)
 	uint skipSubMeshes;      // bit per sub mesh (the first 32): not there for rays (glass, helper geometry)
-	uint materialOffset;     // where its sub meshes' materials start in g_RayMaterials; bit 31: mirrored
+	uint materialOffset;     // bits 0..23 where its sub meshes' materials start in g_RayMaterials, 24..30 how many it has there, 31 mirrored
 	uint doubleSided;        // bit per sub mesh (the first 32): hit from behind too
 };
 
@@ -105,6 +105,67 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 	return BvhTraceEx(o, d, tMax, anyHit, false);
 }
 
+// A hit's entry in g_RayMaterials: x its index in g_Materials, y its base texture (0xFFFFFFFF: none). A sub mesh past the
+// instance's entries, or a texture index past the heap, is taken as no texture (never read: a stray index made the GPU
+// fault and the device was lost).
+uint2 BvhHitMaterial(TlasInstance inst, BvhTri tri) {
+	uint count = (inst.materialOffset >> 24) & 0x7Fu;
+	if (tri.subMesh >= count) {
+		return uint2(0u, 0xFFFFFFFFu);
+	}
+	uint2 entry = g_RayMaterials[(inst.materialOffset & 0x00FFFFFFu) + tri.subMesh];
+	if (entry.y >= 16384u) {
+		entry.y = 0xFFFFFFFFu;
+	}
+	return entry;
+}
+
+// Whether a hit is solid there: an alpha tested material (leaves, fences) lets the ray through where its base
+// texture's alpha is cut away. `t`: how far the ray went (a coarser texture level further away).
+bool BvhHitSolid(BvhHit hit, float t) {
+	TlasInstance inst = g_TlasInstances[hit.instance];
+	BvhTri tri = g_BvhTris[hit.tri];
+	uint2 entry = BvhHitMaterial(inst, tri);
+	MaterialData mat = g_Materials[entry.x];
+	if (mat.params.z < 0.0 || entry.y == 0xFFFFFFFFu) {
+		return true;
+	}
+	float2 uv = (float2(tri.uvU, tri.uvV) + tri.duv1 * hit.bary.x + tri.duv2 * hit.bary.y) * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
+	float a = g_SceneTextures[NonUniformResourceIndex(entry.y)].SampleLevel(s_Aniso, uv, 1.0 + 0.7 * log2(max(t, 1.0))).a;
+	return a * mat.baseColor.a >= mat.params.z;
+}
+
+// How far along o + d t (d normalised) the first solid thing is, both faces counting (as in the shadow map, whose
+// casters are drawn without culling); < 0: nothing within tMax. Through up to three cut away hits.
+float BvhOccluderDistance(float3 o, float3 d, float tMax) {
+	float travelled = 0.0;
+	for (int attempt = 0; attempt < 3; ++attempt) {
+		BvhHit hit = BvhTraceEx(o, d, tMax - travelled, false, true);
+		if (hit.t < 0.0) {
+			return -1.0;
+		}
+		travelled += hit.t;
+		if (BvhHitSolid(hit, travelled)) {
+			return travelled;
+		}
+		o += d * (hit.t + 0.01);
+		travelled += 0.01;
+	}
+	return -1.0;
+}
+
+// The sun's visibility at P by one ray towards the middle of its disc (hard: for what has no denoised mask, glass
+// and the surfaces rays land on). `n`: the surface's normal (the ray starts a little off it).
+float RaySunShadow(float3 P, float3 n) {
+	if (g_SunDirection.w < 0.5 || g_SunColor.w < 0.5) {
+		return 1.0;
+	}
+	if (dot(n, g_SunDirection.xyz) <= 0.0) {
+		return 0.0;
+	}
+	return BvhOccluderDistance(P + n * 0.02, g_SunDirection.xyz, 1000.0) < 0.0 ? 1.0 : 0.0;
+}
+
 // What a ray hit, where the screen cannot tell (the caller looks there first, if it can): the surface's own colour
 // from its material and base texture, lit by the sun (through the shadow map where that reaches, and the clouds) and
 // the sky. rgb: the light it sends back, a: 0 = nothing there after all (the texture's alpha cuts it away: the caller
@@ -117,7 +178,7 @@ BvhHit BvhTrace(float3 o, float3 d, float tMax, bool anyHit) {
 float4 BvhHitSurfaceLit(float3 P, BvhHit hit, float t, float3 d, bool punctual) {
 	TlasInstance inst = g_TlasInstances[hit.instance];
 	BvhTri tri = g_BvhTris[hit.tri];
-	uint2 entry = g_RayMaterials[(inst.materialOffset & 0x7FFFFFFFu) + tri.subMesh];
+	uint2 entry = BvhHitMaterial(inst, tri);
 	MaterialData mat = g_Materials[entry.x];
 	uint cls = (uint)mat.params2.z;
 	float4 tex = 1.0;
@@ -144,7 +205,7 @@ float4 BvhHitSurfaceLit(float3 P, BvhHit hit, float t, float3 d, bool punctual) 
 	float sun = 0.0;
 	if (g_SunDirection.w > 0.5) {
 		uint cascade = 0;
-		sun = SunShadow(P, n, 0.0, cascade) * CloudShadow(P);
+		sun = (g_RayParams.x > 0.5 ? RaySunShadow(P, n) : SunShadow(P, n, 0.0, cascade)) * CloudShadow(P);
 		light += g_SunColor.rgb * (saturate(dot(n, g_SunDirection.xyz)) * sun / PI);
 	}
 	if (punctual) {

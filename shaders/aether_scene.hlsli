@@ -55,6 +55,7 @@ cbuffer FrameConstants : register(b0) {
 	float4 g_GiGrid;             // xyz the grid cell of the GI volume's lowest corner, w 1 = probe grid GI on
 	float4 g_GiPrev;             // xyz the same the frame before, w 1 = the probes hold something
 	float4 g_GiParams;           // x metres between probes on the ground, y in height, z a different number every frame, w number of punctual lights
+	float4 g_RayParams;          // x 1 = rays this frame (the structures are bound), y 1 = g_SunShadowMask holds the sun's visibility for the opaque pass, z tan of the sun's angular radius, w 1 = g_SunShadowUntraced holds the casters the rays cannot find
 };
 
 cbuffer DrawConstants : register(b1) {
@@ -132,7 +133,9 @@ Texture2D g_ProbeAtlasBlur : register(t5, space4);  // ... blurred, for rough su
 Texture2D g_GiIrradiance : register(t7, space4);    // probe grid GI: per probe a tile of 8 x 8 directions (octahedral), the light arriving round each
 Texture2D g_GiDepth : register(t8, space4);         // ... r how far the probe sees that way on average (capped), g the same squared
 Texture2D g_ProbeAtlasDepth : register(t6, space4); // ... and their depth (reversed Z per tile)
-Texture2D g_CloudNoise : register(t3, space4);    // tiling noise the clouds' shape comes from (PSCloudNoise)
+Texture2D g_CloudNoise : register(t3, space4);
+Texture2D g_SunShadowMask : register(t9, space4);  // the ray traced sun shadow, denoised (LightingDenoiser): per pixel of the opaque picture
+Texture2D g_SunShadowUntraced : register(t10, space4); // the shadow map of what the rays cannot find (half size, the same cascades)    // tiling noise the clouds' shape comes from (PSCloudNoise)
 
 SamplerState s_Aniso : register(s0);
 SamplerState s_LinearClamp : register(s1);
@@ -385,6 +388,20 @@ float2 OctEncode(float3 n) {
 	return e * 0.5 + 0.5;
 }
 
+// A colour the picture can hold: NaN and infinity become black, the rest is kept between 0 and 30000. (A single
+// pixel of either was spread by the temporal history and the bloom pyramid into black squares of every size, and by
+// the lens flare into black ghosts. The scene targets are R11G11B10_FLOAT: above 65024 is infinity.) Tested on the
+// bits: DXC compiles with fast math, which may take isnan and NaN comparisons away.
+float3 SafeColor(float3 c) {
+	uint3 bits = asuint(c) & 0x7FFFFFFFu;
+	c = bits >= 0x7F800000u ? 0.0 : c;
+	return clamp(c, 0.0, 30000.0);
+}
+
+float SafeValue(float v) {
+	return (asuint(v) & 0x7FFFFFFFu) >= 0x7F800000u ? 0.0 : v;
+}
+
 float3 OctDecode(float2 uv) {
 	float2 e = uv * 2.0 - 1.0;
 	float3 n = float3(e.x, 1.0 - abs(e.x) - abs(e.y), e.y);
@@ -410,6 +427,7 @@ float3 AmbientDiffuse(float3 n) {
 // PSGiRays / PSGiIrradiance / PSGiDepth (scene_post.hlsl) keep up to date.
 static const float3 kGiCounts = float3(24.0, 8.0, 24.0);
 static const float kGiTile = 8.0;
+static bool s_NoSkyFallback = false; // set by the pass whose rays bring the sky themselves: no unoccluded sky in AmbientLight
 static bool s_GiOff = false; // set by the pass that must not read the probes (they hold nothing yet)
 
 float3 GiStorage(float3 cell) {
@@ -429,7 +447,10 @@ float2 GiTileUv(float3 cell, float3 dir) {
 }
 
 // The indirect light on a surface at P facing n, from the eight probes round it (irradiance / PI, like
-// AmbientDiffuse). a: how far the answer holds (0 outside the volume, fading in over its outer cells).
+// AmbientDiffuse). a: how far the answer holds. Beyond the volume the probes at its edge answer (the place is taken
+// to the edge), and the answer gives way to the open sky over the next 8 cells (24 m) sideways and 3 above or below.
+// (Before, the sky took over within the volume's last two cells: indoors, where the sky is many times brighter than
+// what reaches the floor, that showed as a straight edge across a car park's floor some 36 m away.)
 // A probe counts by how near it is, less when it is behind the surface, and hardly when it does not see the place:
 // when the place is further from it than what the probe sees in that direction (walls between them).
 float4 GiDiffuse(float3 P, float3 n) {
@@ -440,11 +461,14 @@ float4 GiDiffuse(float3 P, float3 n) {
 	float3 biased = P + n * 0.3; // (off the surface: a place on a wall is not behind that wall for the probe)
 	float3 g = biased / spacing - 0.5;
 	float3 rel = g - g_GiGrid.xyz;
-	float3 edge = min(rel, (kGiCounts - 1.0) - rel);
-	float fade = saturate(min(edge.x, edge.z) * 0.5) * saturate(edge.y);
+	float3 inside = clamp(rel, 0.0, kGiCounts - 1.001);
+	float3 beyond = abs(rel - inside); // (in cells: 0 inside the volume)
+	float fade = (1.0 - smoothstep(0.0, 8.0, max(beyond.x, beyond.z))) * (1.0 - smoothstep(0.0, 3.0, beyond.y));
 	if (fade <= 0.0) {
 		return 0.0;
 	}
+	g = inside + g_GiGrid.xyz;
+	biased = (g + 0.5) * spacing;
 	float3 base = floor(g);
 	float3 f = g - base;
 	float3 sum = 0.0;
@@ -481,6 +505,9 @@ float4 GiDiffuse(float3 P, float3 n) {
 float3 AmbientLight(float3 P, float3 n) {
 	float3 sky = AmbientDiffuse(n) * g_Misc.w;
 	float4 gi = GiDiffuse(P, n);
+	if (s_NoSkyFallback) {
+		return gi.rgb * gi.a;
+	}
 	return lerp(sky, gi.rgb, gi.a);
 }
 
@@ -491,7 +518,9 @@ float3 AmbientLight(float3 P, float3 n) {
 // camera's own passes: a reflection probe's faces, drawn from where the probe stands, looked their points up in the
 // wrong cascade or in none, and the probes had no shadows in them: what they showed was too bright, and so was
 // every reflection that took its colour from them.) `viewDepth` is not used any more.
-float SunShadow(float3 worldPos, float3 normal, float viewDepth, out uint cascade) {
+// The sun's shadow from a shadow map: `atlas` holds the cascades 2 x 2 in its tiles (g_ShadowMatrix), `scale` its
+// texel's size against the main atlas's (g_SunShadowUntraced is half the size: 2).
+float SunShadowIn(Texture2D atlas, float scale, float3 worldPos, float3 normal, out uint cascade) {
 	cascade = 0;
 	uint count = (uint)g_ShadowParams.x;
 	if (count == 0 || g_SunColor.w < 0.5) {
@@ -501,7 +530,7 @@ float SunShadow(float3 worldPos, float3 normal, float viewDepth, out uint cascad
 	bool found = false;
 	for (uint i = 0; i < count && !found; ++i) {
 		// push the sample off the surface along the normal by about one shadow texel of this cascade
-		float3 p = worldPos + normal * (g_CascadeTexel[i] * 1.5);
+		float3 p = worldPos + normal * (g_CascadeTexel[i] * 1.5 * scale);
 		float4 c = mul(g_ShadowMatrix[i], float4(p, 1.0));
 		// (the cascades are tiles of the atlas, 2 x 2: inside this one's tile, a little off its edge so that the
 		// taps stay in it)
@@ -516,7 +545,7 @@ float SunShadow(float3 worldPos, float3 normal, float viewDepth, out uint cascad
 		return 1.0; // beyond the last cascade
 	}
 	float depth = sc.z - g_ShadowParams.z;
-	float texel = g_ShadowParams.y;
+	float texel = g_ShadowParams.y * scale;
 	// 3 x 3 taps (each already the mean of four comparisons) spread over the softness the user chose; 5 x 5 where
 	// that would leave gaps between the taps
 	float softness = max(g_QualityParams.x, 0.0);
@@ -525,9 +554,13 @@ float SunShadow(float3 worldPos, float3 normal, float viewDepth, out uint cascad
 	float sum = 0.0;
 	for (int y = -reach; y <= reach; ++y) {
 		for (int x = -reach; x <= reach; ++x) {
-			sum += g_ShadowAtlas.SampleCmpLevelZero(s_Shadow, sc.xy + float2(x, y) * spacing, depth);
+			sum += atlas.SampleCmpLevelZero(s_Shadow, sc.xy + float2(x, y) * spacing, depth);
 		}
 	}
 	sum *= 9.0 / float((2 * reach + 1) * (2 * reach + 1));
 	return sum / 9.0;
+}
+
+float SunShadow(float3 worldPos, float3 normal, float viewDepth, out uint cascade) {
+	return SunShadowIn(g_ShadowAtlas, 1.0, worldPos, normal, cascade);
 }
