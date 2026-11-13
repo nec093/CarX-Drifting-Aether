@@ -40,12 +40,14 @@ C# 側は、ローダーに依存しないコア（`AetherCore`、`IAetherHost`�
 | CMake 3.20 以降 | ネイティブ | |
 | .NET SDK 10 | C# Mod（net472 向け）、MCP サーバー（net10.0） | |
 | Unity 2023.2.20f1 エディター | Native Plugin API のヘッダー、HDRP の DX12 用バンドルのビルド | ヘッダーの既定は `C:\Program Files\Unity\Hub\Editor\2023.2.20f1\Editor\Data\PluginAPI`。別の場所なら `-UnityPluginApi` か環境変数 `AETHER_UNITY_PLUGIN_API` |
+| NRD v4.18.0、MathLib v11、ShaderMake（`build\deps\`） | 反射のノイズ除去（`reflectionDenoiser = nrd`） | `scripts\fetch-deps.ps1` で取得（NRD は NVIDIA RTX SDKs License。実行することがライセンスへの同意）。無くてもビルドはでき、ノイズ除去が無いだけ。NRD のシェーダーは Windows SDK 10.0.26100 の `dxc.exe` でコンパイルする（CMake の `AETHER_DXC_EXE`） |
 | ゲーム本体 | C# Mod の参照 | ゲームの `Drift Racing Online_Data\Managed` の DLL を参照する（BepInEx 用は `BepInEx\core\BepInEx.dll` も） |
 
 ## ビルド
 
 | 対象 | コマンド | 出力 |
 |---|---|---|
+| ネイティブの依存（初回だけ） | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1` | `build\deps\` |
 | ネイティブ（`AetherNative.dll`、`AetherHost.exe`） | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-native.ps1 [-Config RelWithDebInfo] [-Clean]` | `build\native\<Config>\` |
 | MCP サーバー | `dotnet build src\Aether.MCP\Aether.MCP.csproj -c Release` | `build\mcp\Release\Aether.MCP.exe` |
 | C# Mod（BepInEx 用） | `dotnet build src\Aether.Managed\Aether.Managed.csproj -c Release -p:Loader=BepInEx` | `build\managed\BepInEx\Release\Aether.dll` |
@@ -73,6 +75,7 @@ BepInEx（既定）のとき：
 |---|---|
 | `build\managed\BepInEx\Release\Aether.dll` | `BepInEx\plugins\Aether\` |
 | `build\native\<Config>\AetherNative.dll`（と `.pdb`） | `BepInEx\plugins\Aether\native\` |
+| `build\native\<Config>\dxcompiler.dll`、`dxil.dll`（Windows SDK の `Redist\D3D\x64` からビルド時にコピー） | `BepInEx\plugins\Aether\native\` |
 | `shaders\*` | `BepInEx\plugins\Aether\shaders\` |
 | `build\unity\aether_hdrp_dx12.bundle` | `BepInEx\plugins\Aether\hdrp\` |
 

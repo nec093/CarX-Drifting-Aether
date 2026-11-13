@@ -96,7 +96,7 @@
 - スキンメッシュの頂点を毎フレーム読み戻す（`AsyncGPUReadback`）と、Unity のフレームフェンスが遅れ、Aether のコマンドリストが再利用待ちで足りなくなってフレームが飛ぶ。既定で読み戻さない（`skinnedRayUpdates = 0`）。
 - ゲームの `HDRP.MasterVolumes` は Aether のパイプラインでも動き、`QualitySettings`（VSync、LOD バイアスなど）を毎フレーム書き戻す。Aether は描画の後で毎フレーム自分の値を適用する（`HostQualitySettings.Enforce`）。
 - VSync がオンのまま測った GPU 時間は当てにならない（GPU が周波数を落とす）。計測は `vsync = 0` で行う。
-- ピクセルシェーダーで BVH をたどるパスの時間は、レイの本数より最も遅いレイで決まる。距離とステップ数に上限を置く。
+- 光線は DXR 1.1 のインラインレイトレーシング（`RayQuery`）で飛ばす。シェーダーで BVH をたどる実装（以前のもの）は、最も遅いレイでパスの時間が決まり、GI の光線だけで 0.9 ms かかっていた（DXR で 0.07 ms）。シェーダーはすべて DXC（SM 6.5）でコンパイルする。
 - ゲームのタイヤスモークの発生：ドリフト中 1 台あたり毎秒 500 個強、1 フレーム分は同じ 1 点に出る。ゲーム側の不透明度は 0.04〜0.09、発生サイズは 0.08〜0.10 m（小さく薄い粒を大量に重ねる設計）。
 - コースの夜はゲームの DLC（`GameManager.NightModeInstalled`）。無いときに Aether から夜へ切り替えない。ガレージの昼夜切り替えは誰でも使える。
 - Unity の `Mathf.SmoothStep(a, b, t)` は a と b の補間で、GLSL / HLSL の smoothstep とは別物。

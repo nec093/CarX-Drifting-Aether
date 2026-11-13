@@ -7,7 +7,7 @@ namespace aether {
 
 class GpuTimer {
 public:
-	static const uint32_t kFrames = 16, kStamps = 24;
+	static const uint32_t kFrames = 16, kStamps = 128; // (two stamps a pass: the scene graph has about forty passes)
 
 	bool Init(ID3D12Device* device, ID3D12CommandQueue* queue, uint64_t frame);
 	void Release(bool leak);

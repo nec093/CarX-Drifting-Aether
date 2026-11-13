@@ -12,9 +12,10 @@ static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", 
 static const std::vector<std::string> kRenderModes = {"hdrp", "aether", "compare", "standalone"};
 static const std::vector<std::string> kSkyModes = {"physical", "scene"};
 static const std::vector<std::string> kTonemaps = {"host", "agx", "aces", "neutral", "none"};
+static const std::vector<std::string> kReflectionDenoisers = {"off", "nrd"};
 static const std::vector<std::string> kControlModes = {"deny", "ask", "allow"};
 static const std::vector<std::string> kLogLevels = {"debug", "info", "warning", "error"};
-static const std::vector<std::string> kDebugViews = {"none", "albedo", "normal", "roughness", "metallic", "depth", "lighting", "shadow", "materialClass", "sun", "ambient", "reflection", "bvh", "bvhCost"};
+static const std::vector<std::string> kDebugViews = {"none", "albedo", "normal", "roughness", "metallic", "depth", "lighting", "shadow", "materialClass", "sun", "ambient", "reflection", "bvh"};
 
 const std::vector<std::string>& RenderFeatureNames() { return kFeatures; }
 const std::vector<std::string>& QualityNames() { return kQualities; }
@@ -56,6 +57,7 @@ static json ToJsonData(const SettingsData& d) {
 		{"moonlight", d.moonlight},
 		{"skinnedRayUpdates", d.skinnedRayUpdates},
 		{"tonemap", d.tonemap},
+		{"reflectionDenoiser", d.reflectionDenoiser},
 		{"skyMode", d.skyMode},
 		{"timeOfDay", d.timeOfDay},
 		{"sunHeading", d.sunHeading},
@@ -111,6 +113,7 @@ json Settings::Schema() {
 		{"particles", {{"type", "boolean"}, {"description", "Particles (the game's particle systems and tyre smoke)"}}},
 		{"ssr", {{"type", "boolean"}, {"description", "Screen space reflections (on where the game's volumes have them on; needs temporal antialiasing)"}}},
 		{"tonemap", oneOf(kTonemaps, "Tone mapping curve")},
+		{"reflectionDenoiser", oneOf(kReflectionDenoisers, "off, or nrd: the reflection rays sample each surface's GGX lobe (glossy reflections blur by roughness) and NVIDIA NRD (REBLUR_SPECULAR) denoises them; on by default. Needs DXR 1.1")},
 		{"skyMode", oneOf(kSkyModes, "Sky and sun: physical (Aether's atmosphere at timeOfDay) or scene (the scene's own sky texture and sun)")},
 		{"timeOfDay", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 24.0}, {"description", "Time of day in hours for the physical sky"}}},
 		{"cloudCoverage", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}, {"description", "How much of the sky the clouds take (physical sky; 0 = no clouds)"}}},
@@ -233,6 +236,7 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 		return {};
 	}
 	if (key == "tonemap") return wantEnum(d.tonemap, kTonemaps);
+	if (key == "reflectionDenoiser") return wantEnum(d.reflectionDenoiser, kReflectionDenoisers);
 	if (key == "skyMode") return wantEnum(d.skyMode, kSkyModes);
 	if (key == "cloudCoverage" || key == "cloudSpeed") {
 		const double hi = key == "cloudCoverage" ? 1.0 : 4.0;
@@ -338,7 +342,12 @@ void Settings::Load(const std::wstring& file) {
 		AE_LOG_CODE(Error, "Config", "E_CONFIG_PARSE", "Settings file is not valid JSON, using defaults (%s)", WideToUtf8(file).c_str());
 		return;
 	}
+	// settings that existed once and were removed: dropped from the file at the next save, without a warning
+	static const char* const kRetired[] = {"rayTracingApi"};
 	for (auto it = j.begin(); it != j.end(); ++it) {
+		if (std::find(std::begin(kRetired), std::end(kRetired), it.key()) != std::end(kRetired)) {
+			continue;
+		}
 		std::string why = Apply(data_, it.key(), it.value());
 		if (!why.empty()) {
 			AE_LOG_CODE(Warning, "Config", "W_CONFIG_VALUE", "Ignored setting from file: %s", why.c_str());

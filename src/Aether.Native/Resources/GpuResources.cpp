@@ -180,7 +180,8 @@ std::shared_ptr<GpuTexture> GpuResources::CreateTexture(const GpuTextureDesc& de
 	rd.MipLevels = desc.mipLevels;
 	rd.Format = desc.format;
 	rd.SampleDesc.Count = 1;
-	rd.Flags = (desc.renderTarget ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE) | (desc.depthStencil ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_NONE);
+	rd.Flags = (desc.renderTarget ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE) | (desc.depthStencil ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_NONE) |
+		(desc.unorderedAccess ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
 	if (desc.depthStencil && !desc.shaderResource) {
 		rd.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
 	}
@@ -226,6 +227,17 @@ std::shared_ptr<GpuTexture> GpuResources::CreateTexture(const GpuTextureDesc& de
 				sd.Texture2D.MipLevels = desc.mipLevels;
 			}
 			WriteSrv(t->srv, t->resource.Get(), &sd);
+		}
+	}
+	if (desc.unorderedAccess) {
+		t->uav = AllocSrv(1);
+		if (t->uav != UINT32_MAX) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+			ud.Format = desc.srvFormat != DXGI_FORMAT_UNKNOWN ? desc.srvFormat : desc.format;
+			ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			// (in both heaps, as WriteSrv does: CopySrv copies from the CPU only one)
+			device_->CreateUnorderedAccessView(t->resource.Get(), nullptr, &ud, StagingCpu(t->uav));
+			device_->CreateUnorderedAccessView(t->resource.Get(), nullptr, &ud, SrvCpu(t->uav));
 		}
 	}
 	if (desc.renderTarget) {
@@ -312,10 +324,12 @@ void GpuResources::Collect(UINT64 completedFence, uint64_t frame) {
 				AE_LOG_CODE(Error, "Resources", "E_LIFETIME", "Texture %s is released with %lu COM references and %ld owners (expected 1 and 1)", t.name.c_str(), references, retiredTextures_.front().texture.use_count());
 			}
 		}
-		if (t.srv != UINT32_MAX) {
-			srvFree_.push_back({t.srv, 1});
-			std::lock_guard lock(statsMutex_);
-			stats_.srvUsed -= 1;
+		for (uint32_t index : {t.srv, t.uav}) {
+			if (index != UINT32_MAX) {
+				srvFree_.push_back({index, 1});
+				std::lock_guard lock(statsMutex_);
+				stats_.srvUsed -= 1;
+			}
 		}
 		if (t.target != UINT32_MAX) {
 			(t.desc.depthStencil ? dsvFree_ : rtvFree_).push_back(t.target);

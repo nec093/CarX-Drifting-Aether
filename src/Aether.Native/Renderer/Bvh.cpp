@@ -12,10 +12,6 @@ namespace aether {
 
 namespace {
 
-const uint32_t kLeafTriangles = 4;
-const uint32_t kBins = 12;
-const uint32_t kMaxDepth = 30; // (the shader's stack holds 32 entries)
-
 float HalfToFloat(uint16_t h) {
 	const uint32_t sign = (h >> 15) & 1u, exponent = (h >> 10) & 0x1Fu, mantissa = h & 0x3FFu;
 	float value;
@@ -27,29 +23,6 @@ float HalfToFloat(uint16_t h) {
 		value = std::ldexp(float(mantissa | 0x400u), int(exponent) - 25);
 	}
 	return sign ? -value : value;
-}
-
-struct Box {
-	Vec3 lo = {1e30f, 1e30f, 1e30f}, hi = {-1e30f, -1e30f, -1e30f};
-	void Add(Vec3 p) {
-		lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
-		hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
-	}
-	void Add(const Box& b) {
-		Add(b.lo);
-		Add(b.hi);
-	}
-	float Area() const {
-		const Vec3 d = hi - lo;
-		return d.x < 0 ? 0.0f : 2.0f * (d.x * d.y + d.y * d.z + d.z * d.x);
-	}
-};
-
-float Axis(Vec3 v, int axis) { return axis == 0 ? v.x : axis == 1 ? v.y : v.z; }
-
-void StoreBox(BvhNode& n, const Box& b) {
-	n.bmin[0] = b.lo.x; n.bmin[1] = b.lo.y; n.bmin[2] = b.lo.z;
-	n.bmax[0] = b.hi.x; n.bmax[1] = b.hi.y; n.bmax[2] = b.hi.z;
 }
 
 // uv: the three vertices' texture coordinates (u, v each), or null.
@@ -211,7 +184,7 @@ bool SceneBvh::SubmitVertices(AeHandle mesh, const void* data, uint32_t bytes, u
 		return false;
 	}
 	if (changingBuilt_.count(mesh)) {
-		// new vertices for a tree that exists: a refit. (Not piled up: a worker that is behind skips to the newest.)
+		// new vertices for a mesh that is there: an update. (Not piled up: a worker that is behind skips to the newest.)
 		Job job;
 		job.kind = JobKind::Refit;
 		job.generation = generation_.load();
@@ -346,7 +319,7 @@ void SceneBvh::WorkerMain() {
 		} else if (job.kind == JobKind::Refit) {
 			auto it = topologies_.find(job.mesh);
 			if (it != topologies_.end() && it->second.generation == job.generation && it->second.vertexCount == job.positions.size()) {
-				RefitMesh(job, it->second, built);
+				RereadMesh(job, it->second, built);
 				++refits_;
 			}
 		} else {
@@ -356,230 +329,118 @@ void SceneBvh::WorkerMain() {
 				*keep = Topology();
 				keep->generation = job.generation;
 			}
-			BuildMesh(job, built, keep);
-			if (keep && built.nodes.empty()) {
+			ReadMesh(job, built, keep);
+			if (keep && built.tris.empty()) {
 				topologies_.erase(job.mesh);
 			}
 		}
 		built.ms = NowMs() - start;
 		std::lock_guard lock(mutex_);
 		--pendingJobs_;
-		if (built.generation == generation_.load() && !built.nodes.empty()) {
+		if (built.generation == generation_.load() && !built.tris.empty()) {
 			built_.push_back(std::move(built));
 		}
 	}
 }
 
-// A tree over one mesh's triangles: split along the widest axis of the triangles' centres where the surface area
-// heuristic (binned) says the two halves are cheapest; a leaf holds up to four triangles.
-// `keep`: the tree's shape and each triangle's vertices are also kept (a mesh whose vertices will change).
-void SceneBvh::BuildMesh(const Job& job, Built& out, Topology* keep) {
-	struct Tri { Vec3 v0, v1, v2, centre; Box box; uint32_t subMesh; uint32_t index[3]; float uv[6]; };
+// The mesh's triangles in the order of its index buffer. `keep`: which vertices each triangle uses is kept too (a
+// mesh whose vertices will change: its triangles are read again from new vertices).
+void SceneBvh::ReadMesh(const Job& job, Built& out, Topology* keep) {
 	const bool hasUvs = !job.uvs.empty();
-	std::vector<Tri> tris;
-	tris.reserve(job.triSubMesh.size());
+	out.tris.reserve(job.triSubMesh.size());
 	for (size_t t = 0; t < job.triSubMesh.size(); ++t) {
-		Tri tri;
+		uint32_t index[3];
+		float uv[6];
 		for (int k = 0; k < 3; ++k) {
-			tri.index[k] = job.indices[t * 3 + size_t(k)];
+			index[k] = job.indices[t * 3 + size_t(k)];
+			uv[k * 2] = hasUvs ? job.uvs[size_t(index[k]) * 2] : 0.0f;
+			uv[k * 2 + 1] = hasUvs ? job.uvs[size_t(index[k]) * 2 + 1] : 0.0f;
 		}
-		tri.v0 = job.positions[tri.index[0]];
-		tri.v1 = job.positions[tri.index[1]];
-		tri.v2 = job.positions[tri.index[2]];
-		const Vec3 n = Cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
+		const Vec3 v0 = job.positions[index[0]], v1 = job.positions[index[1]], v2 = job.positions[index[2]];
+		const Vec3 n = Cross(v1 - v0, v2 - v0);
 		// no area (or not a number): nothing a ray could hit. (Kept in a mesh that changes: it may open up later.)
-		if (!(Dot(n, n) > 1e-18f) && !keep) {
+		if (!std::isfinite(Dot(n, n)) || (!(Dot(n, n) > 1e-18f) && !keep)) {
 			continue;
 		}
-		if (!std::isfinite(Dot(n, n))) {
-			continue;
+		out.tris.emplace_back();
+		StoreTri(out.tris.back(), v0, v1, v2, job.triSubMesh[t], uv);
+		if (keep) {
+			keep->triVertices.insert(keep->triVertices.end(), index, index + 3);
+			keep->triSubMesh.push_back(job.triSubMesh[t]);
+			keep->triUvs.insert(keep->triUvs.end(), uv, uv + 6);
 		}
-		tri.box.Add(tri.v0);
-		tri.box.Add(tri.v1);
-		tri.box.Add(tri.v2);
-		tri.centre = (tri.box.lo + tri.box.hi) * 0.5f;
-		tri.subMesh = job.triSubMesh[t];
-		for (int k = 0; k < 3; ++k) {
-			tri.uv[k * 2] = hasUvs ? job.uvs[size_t(tri.index[k]) * 2] : 0.0f;
-			tri.uv[k * 2 + 1] = hasUvs ? job.uvs[size_t(tri.index[k]) * 2 + 1] : 0.0f;
-		}
-		tris.push_back(tri);
-	}
-	if (tris.empty()) {
-		return;
-	}
-	std::vector<BvhNode>& nodes = out.nodes;
-	nodes.reserve(tris.size());
-	nodes.push_back({});
-	struct Work { uint32_t node, first, count, depth; };
-	std::vector<Work> stack;
-	stack.push_back({0, 0, uint32_t(tris.size()), 0});
-	uint32_t maxDepth = 0;
-	while (!stack.empty()) {
-		const Work w = stack.back();
-		stack.pop_back();
-		maxDepth = std::max(maxDepth, w.depth);
-		Box box, centres;
-		for (uint32_t i = w.first; i < w.first + w.count; ++i) {
-			box.Add(tris[i].box);
-			centres.Add(tris[i].centre);
-		}
-		StoreBox(nodes[w.node], box);
-		const Vec3 extent = centres.hi - centres.lo;
-		const int axis = extent.x >= extent.y && extent.x >= extent.z ? 0 : extent.y >= extent.z ? 1 : 2;
-		const float width = Axis(extent, axis);
-		if (w.count <= kLeafTriangles || w.depth >= kMaxDepth || !(width > 1e-9f)) {
-			if (w.count <= 64 || w.depth >= kMaxDepth) {
-				nodes[w.node].a = w.first;
-				nodes[w.node].b = w.count;
-				continue;
-			}
-		}
-		uint32_t mid = w.first + w.count / 2;
-		bool split = false;
-		if (width > 1e-9f && w.depth + 8 < kMaxDepth) {
-			// binned surface area heuristic along the widest axis
-			Box binBox[kBins];
-			uint32_t binCount[kBins] = {};
-			const float lo = Axis(centres.lo, axis), scale = float(kBins) / width;
-			for (uint32_t i = w.first; i < w.first + w.count; ++i) {
-				const uint32_t b = std::min(uint32_t((Axis(tris[i].centre, axis) - lo) * scale), kBins - 1);
-				binBox[b].Add(tris[i].box);
-				++binCount[b];
-			}
-			float rightArea[kBins] = {};
-			Box acc;
-			uint32_t rightCount[kBins] = {};
-			uint32_t n = 0;
-			for (int b = int(kBins) - 1; b > 0; --b) {
-				if (binCount[b]) {
-					acc.Add(binBox[b]);
-				}
-				n += binCount[b];
-				rightArea[b] = acc.Area();
-				rightCount[b] = n;
-			}
-			acc = Box();
-			n = 0;
-			float best = 1e30f;
-			uint32_t bestBin = 0;
-			for (uint32_t b = 0; b + 1 < kBins; ++b) {
-				if (binCount[b]) {
-					acc.Add(binBox[b]);
-				}
-				n += binCount[b];
-				if (n == 0 || rightCount[b + 1] == 0) {
-					continue;
-				}
-				const float cost = acc.Area() * float(n) + rightArea[b + 1] * float(rightCount[b + 1]);
-				if (cost < best) {
-					best = cost;
-					bestBin = b;
-				}
-			}
-			if (best < 1e30f) {
-				const auto middle = std::partition(tris.begin() + w.first, tris.begin() + w.first + w.count, [&](const Tri& t) {
-					return std::min(uint32_t((Axis(t.centre, axis) - lo) * scale), kBins - 1) <= bestBin;
-				});
-				mid = uint32_t(middle - tris.begin());
-				split = mid > w.first && mid < w.first + w.count;
-			}
-		}
-		if (!split) {
-			// (all centres in one place, or the tree is getting deep: halves by count keep it shallow)
-			mid = w.first + w.count / 2;
-			std::nth_element(tris.begin() + w.first, tris.begin() + mid, tris.begin() + w.first + w.count, [&](const Tri& a, const Tri& b) { return Axis(a.centre, axis) < Axis(b.centre, axis); });
-		}
-		const uint32_t left = uint32_t(nodes.size());
-		nodes.push_back({});
-		nodes.push_back({});
-		nodes[w.node].a = left;
-		nodes[w.node].b = 0;
-		stack.push_back({left, w.first, mid - w.first, w.depth + 1});
-		stack.push_back({left + 1, mid, w.first + w.count - mid, w.depth + 1});
-	}
-	out.depth = maxDepth;
-	out.tris.resize(tris.size());
-	for (size_t i = 0; i < tris.size(); ++i) {
-		StoreTri(out.tris[i], tris[i].v0, tris[i].v1, tris[i].v2, tris[i].subMesh, tris[i].uv);
 	}
 	if (keep) {
 		keep->vertexCount = uint32_t(job.positions.size());
-		keep->nodes = nodes;
-		keep->triVertices.resize(tris.size() * 3);
-		keep->triSubMesh.resize(tris.size());
-		keep->triUvs.resize(tris.size() * 6);
-		for (size_t i = 0; i < tris.size(); ++i) {
-			memcpy(&keep->triUvs[i * 6], tris[i].uv, sizeof(tris[i].uv));
-			memcpy(&keep->triVertices[i * 3], tris[i].index, sizeof(tris[i].index));
-			keep->triSubMesh[i] = tris[i].subMesh;
-		}
 	}
 }
 
-// The same tree around new vertices: every triangle taken from its three vertices again, every box fitted again
-// around what is under it (children come after their parent in the array, so one pass from the end does it).
-void SceneBvh::RefitMesh(const Job& job, const Topology& topology, Built& out) {
+// The same triangles from new vertices.
+void SceneBvh::RereadMesh(const Job& job, const Topology& topology, Built& out) {
 	const size_t triCount = topology.triSubMesh.size();
 	out.tris.resize(triCount);
-	std::vector<Box> triBox(triCount);
 	for (size_t i = 0; i < triCount; ++i) {
 		const Vec3 v0 = job.positions[topology.triVertices[i * 3]], v1 = job.positions[topology.triVertices[i * 3 + 1]], v2 = job.positions[topology.triVertices[i * 3 + 2]];
 		StoreTri(out.tris[i], v0, v1, v2, topology.triSubMesh[i], &topology.triUvs[i * 6]);
-		triBox[i].Add(v0);
-		triBox[i].Add(v1);
-		triBox[i].Add(v2);
-	}
-	out.nodes = topology.nodes;
-	std::vector<Box> boxes(out.nodes.size());
-	for (size_t k = out.nodes.size(); k-- > 0;) {
-		const BvhNode& n = out.nodes[k];
-		Box box;
-		if (n.b) {
-			for (uint32_t i = 0; i < n.b; ++i) {
-				box.Add(triBox[n.a + i]);
-			}
-		} else {
-			box.Add(boxes[n.a]);
-			box.Add(boxes[n.a + 1]);
-		}
-		boxes[k] = box;
-		StoreBox(out.nodes[k], box);
 	}
 }
 
 // ------------------------------------------------------------------------------------------------ render thread
 
-// Meshes that went away leave holes in the pools: when the holes outweigh what is left, the pools are written anew
-// without them.
+namespace {
+
+ComPtr<ID3D12Resource> MakeBuffer(ID3D12Device* device, uint64_t bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, bool uav) {
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = type;
+	D3D12_RESOURCE_DESC rd = {};
+	rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	rd.Width = std::max<uint64_t>(bytes, 256);
+	rd.Height = 1;
+	rd.DepthOrArraySize = 1;
+	rd.MipLevels = 1;
+	rd.SampleDesc.Count = 1;
+	rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	rd.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+	ComPtr<ID3D12Resource> buffer;
+	if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(&buffer)))) {
+		return nullptr;
+	}
+	return buffer;
+}
+
+void RetireResource(ComPtr<ID3D12Resource>& resource, UINT64 fence) {
+	if (resource) {
+		ComPtr<IUnknown> u;
+		resource.As(&u);
+		GpuResources::Get().Retire(u, fence);
+		resource.Reset();
+	}
+}
+
+const D3D12_RESOURCE_STATES kShaderRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+} // namespace
+
+// Meshes that went away leave holes in the pool: when the holes outweigh what is left, it is written anew without
+// them. (The structures do not depend on where a mesh's triangles lie: only the instances' IDs change.)
 void SceneBvh::Compact() {
-	std::vector<BvhNode> nodes;
 	std::vector<BvhTri> tris;
-	nodes.reserve(nodes_.size() - size_t(deadNodes_));
 	tris.reserve(tris_.size() - size_t(deadTris_));
 	for (auto& [handle, e] : meshes_) {
-		const uint32_t nodeBase = uint32_t(nodes.size()), triBase = uint32_t(tris.size());
-		for (uint32_t i = 0; i < e.nodeCount; ++i) {
-			BvhNode n = nodes_[e.root + i];
-			n.a = n.b ? n.a - e.triBase + triBase : n.a - e.root + nodeBase;
-			nodes.push_back(n);
-		}
+		const uint32_t triBase = uint32_t(tris.size());
 		tris.insert(tris.end(), tris_.begin() + e.triBase, tris_.begin() + e.triBase + e.triCount);
-		e.root = nodeBase;
 		e.triBase = triBase;
 	}
-	nodes_.swap(nodes);
 	tris_.swap(tris);
-	deadNodes_ = deadTris_ = 0;
+	deadTris_ = 0;
 	dirtyRanges_.clear();
 	// (nothing of the old layout may be traced any more: instances wait for the upload)
-	uploadedNodes_ = uploadedTris_ = 0;
+	uploadedTris_ = 0;
 	dirty_ = true;
 	++compactions_;
 }
 
 void SceneBvh::BeginFrame(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT64 fence, uint64_t frame) {
-	GpuResources& gpu = GpuResources::Get();
 	std::vector<Built> built;
 	std::vector<std::pair<AeHandle, AeHandle>> aliases;
 	std::vector<AeHandle> forget;
@@ -594,41 +455,29 @@ void SceneBvh::BeginFrame(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 			worker_ = std::thread([this] { WorkerMain(); });
 		}
 	}
-	auto retireBuffers = [&]() {
-		if (nodesBuffer_) {
-			ComPtr<IUnknown> a, b;
-			nodesBuffer_.As(&a);
-			trisBuffer_.As(&b);
-			gpu.Retire(a, fence);
-			gpu.Retire(b, fence);
-		}
-		nodesBuffer_.Reset();
-		trisBuffer_.Reset();
-	};
 	if (generation != poolGeneration_) {
-		// the scene was unloaded: every tree goes (the buffers once the GPU is done with them)
+		// the scene was unloaded: every mesh goes (the buffers once the GPU is done with them)
 		poolGeneration_ = generation;
-		nodes_.clear();
 		tris_.clear();
 		meshes_.clear();
 		aliases_.clear();
 		dirtyRanges_.clear();
-		retireBuffers();
-		nodesVa_ = trisVa_ = 0;
-		uploadedNodes_ = uploadedTris_ = 0;
-		deadNodes_ = deadTris_ = 0;
+		RetireResource(trisBuffer_, fence);
+		RetireAllStructures(fence);
+		trisVa_ = 0;
+		uploadedTris_ = 0;
+		deadTris_ = 0;
 		dirty_ = false;
 		buildMsTotal_ = 0;
-		maxDepth_ = 0;
 	}
 	for (const auto& [alias, mesh] : aliases) {
 		aliases_[alias] = mesh;
 	}
 	for (AeHandle h : forget) {
 		aliases_.erase(h);
+		RetireBlas(h, fence);
 		auto it = meshes_.find(h);
 		if (it != meshes_.end()) {
-			deadNodes_ += it->second.nodeCount;
 			deadTris_ += it->second.triCount;
 			meshes_.erase(it);
 			for (auto a = aliases_.begin(); a != aliases_.end();) {
@@ -642,74 +491,44 @@ void SceneBvh::BeginFrame(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 		}
 		auto existing = meshes_.find(b.mesh);
 		if (b.refit) {
-			// the same tree with new numbers: written over the old ones where they lie
-			if (existing == meshes_.end() || existing->second.nodeCount != b.nodes.size() || existing->second.triCount != b.tris.size()) {
+			// the same triangles from new vertices: written over the old ones where they lie
+			if (existing == meshes_.end() || existing->second.triCount != b.tris.size()) {
 				continue;
 			}
 			const MeshEntry& e = existing->second;
-			for (size_t i = 0; i < b.nodes.size(); ++i) {
-				BvhNode n = b.nodes[i];
-				n.a += n.b ? e.triBase : e.root;
-				nodes_[e.root + i] = n;
-			}
 			std::copy(b.tris.begin(), b.tris.end(), tris_.begin() + e.triBase);
-			dirtyRanges_.push_back({e.root, e.nodeCount, e.triBase, e.triCount});
+			dirtyRanges_.push_back({e.triBase, e.triCount});
+			stale_.insert(b.mesh);
 			refitMsLast_ = b.ms;
 			continue;
 		}
 		if (existing != meshes_.end()) {
 			continue;
 		}
-		const uint32_t nodeBase = uint32_t(nodes_.size()), triBase = uint32_t(tris_.size());
-		for (BvhNode n : b.nodes) {
-			n.a += n.b ? triBase : nodeBase;
-			nodes_.push_back(n);
-		}
-		tris_.insert(tris_.end(), b.tris.begin(), b.tris.end());
 		MeshEntry e;
-		e.root = nodeBase;
-		e.nodeCount = uint32_t(b.nodes.size());
-		e.triBase = triBase;
+		e.triBase = uint32_t(tris_.size());
 		e.triCount = uint32_t(b.tris.size());
 		e.changing = b.changing;
+		tris_.insert(tris_.end(), b.tris.begin(), b.tris.end());
 		meshes_[b.mesh] = e;
 		buildMsTotal_ += b.ms;
-		maxDepth_ = std::max(maxDepth_, b.depth);
 		dirty_ = true;
 	}
 	if (deadTris_ > 20000 && deadTris_ > tris_.size() / 2) {
 		Compact();
 	}
-	// The pools go to the GPU as a whole when they grew: not after every mesh (they arrive in bursts while a scene
+	// The pool goes to the GPU as a whole when it grew: not after every mesh (they arrive in bursts while a scene
 	// loads), but soon enough that what has arrived can be traced.
 	const bool quiet = pendingJobs_.load() == 0;
 	bool uploaded = false;
-	if (dirty_ && device && list && !nodes_.empty() && (frame - lastUploadFrame_ > (quiet ? 20u : 180u) || !nodesBuffer_)) {
-		auto make = [&](const void* data, uint64_t bytes, ComPtr<ID3D12Resource>& out) -> bool {
-			D3D12_HEAP_PROPERTIES heap = {};
-			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-			D3D12_RESOURCE_DESC rd = {};
-			rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-			rd.Width = bytes;
-			rd.Height = 1;
-			rd.DepthOrArraySize = 1;
-			rd.MipLevels = 1;
-			rd.SampleDesc.Count = 1;
-			rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-			ComPtr<ID3D12Resource> buffer, staging;
-			if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
-				return false;
-			}
-			heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-			if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging)))) {
-				return false;
-			}
-			void* mapped = nullptr;
-			const D3D12_RANGE none = {0, 0};
-			if (FAILED(staging->Map(0, &none, &mapped))) {
-				return false;
-			}
-			memcpy(mapped, data, size_t(bytes));
+	if (dirty_ && device && list && !tris_.empty() && (frame - lastUploadFrame_ > (quiet ? 20u : 180u) || !trisBuffer_)) {
+		const uint64_t bytes = uint64_t(tris_.size()) * sizeof(BvhTri);
+		ComPtr<ID3D12Resource> buffer = MakeBuffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);
+		ComPtr<ID3D12Resource> staging = MakeBuffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+		void* mapped = nullptr;
+		const D3D12_RANGE none = {0, 0};
+		if (buffer && staging && SUCCEEDED(staging->Map(0, &none, &mapped))) {
+			memcpy(mapped, tris_.data(), size_t(bytes));
 			staging->Unmap(0, nullptr);
 			list->CopyBufferRegion(buffer.Get(), 0, staging.Get(), 0, bytes);
 			D3D12_RESOURCE_BARRIER barrier = {};
@@ -717,23 +536,13 @@ void SceneBvh::BeginFrame(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 			barrier.Transition.pResource = buffer.Get();
 			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			barrier.Transition.StateAfter = kShaderRead;
 			list->ResourceBarrier(1, &barrier);
-			buffer->SetName(L"Aether.Bvh");
-			ComPtr<IUnknown> s;
-			staging.As(&s);
-			gpu.Retire(s, fence);
-			out = buffer;
-			return true;
-		};
-		ComPtr<ID3D12Resource> newNodes, newTris;
-		if (make(nodes_.data(), uint64_t(nodes_.size()) * sizeof(BvhNode), newNodes) && make(tris_.data(), uint64_t(tris_.size()) * sizeof(BvhTri), newTris)) {
-			retireBuffers();
-			nodesBuffer_ = newNodes;
-			trisBuffer_ = newTris;
-			nodesVa_ = nodesBuffer_->GetGPUVirtualAddress();
+			buffer->SetName(L"Aether.RayTriangles");
+			RetireResource(staging, fence);
+			RetireResource(trisBuffer_, fence);
+			trisBuffer_ = buffer;
 			trisVa_ = trisBuffer_->GetGPUVirtualAddress();
-			uploadedNodes_ = nodes_.size();
 			uploadedTris_ = tris_.size();
 			dirty_ = false;
 			dirtyRanges_.clear();
@@ -741,95 +550,78 @@ void SceneBvh::BeginFrame(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 			++uploads_;
 			uploaded = true;
 		} else {
-			AE_LOG_CODE(Error, "Bvh", "E_BVH_UPLOAD", "The ray tracing buffers could not be created: reflections fall back to probes");
+			AE_LOG_CODE(Error, "Bvh", "E_BVH_UPLOAD", "The ray tracing triangles could not be uploaded: reflections fall back to probes");
 			dirty_ = false;
 		}
 	}
-	// Refitted meshes: only their part of the buffers is written again, through a staging buffer of their own. (Not
+	// Updated meshes: only their part of the pool is written again, through a staging buffer of their own. (Not
 	// through the frame's upload memory: that is 8 MB for everything the frame draws with, and a few skinned people
 	// a frame filled it: the frame's own constants then had nowhere to go and the picture flickered.)
-	if (!uploaded && !dirtyRanges_.empty() && nodesBuffer_ && list && device) {
-		// (a mesh refitted twice since the last frame is written once; what is not on the GPU yet waits for the next whole upload)
+	if (!uploaded && !dirtyRanges_.empty() && trisBuffer_ && list && device) {
+		// (a mesh updated twice since the last frame is written once; what is not on the GPU yet waits for the next whole upload)
 		std::vector<Range> ranges;
 		uint64_t bytes = 0;
 		for (size_t i = dirtyRanges_.size(); i-- > 0;) {
 			const Range& r = dirtyRanges_[i];
 			bool seen = false;
 			for (const Range& k : ranges) {
-				seen = seen || k.node == r.node;
+				seen = seen || k.tri == r.tri;
 			}
-			if (seen || uint64_t(r.node) + r.nodeCount > uploadedNodes_ || uint64_t(r.tri) + r.triCount > uploadedTris_) {
+			if (seen || uint64_t(r.tri) + r.triCount > uploadedTris_) {
 				continue;
 			}
 			ranges.push_back(r);
-			bytes += uint64_t(r.nodeCount) * sizeof(BvhNode) + uint64_t(r.triCount) * sizeof(BvhTri);
+			bytes += uint64_t(r.triCount) * sizeof(BvhTri);
 		}
-		ComPtr<ID3D12Resource> staging;
+		ComPtr<ID3D12Resource> staging = bytes > 0 ? MakeBuffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false) : nullptr;
 		void* mapped = nullptr;
-		if (bytes > 0) {
-			D3D12_HEAP_PROPERTIES heap = {};
-			heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-			D3D12_RESOURCE_DESC rd = {};
-			rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-			rd.Width = bytes;
-			rd.Height = 1;
-			rd.DepthOrArraySize = 1;
-			rd.MipLevels = 1;
-			rd.SampleDesc.Count = 1;
-			rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-			const D3D12_RANGE none = {0, 0};
-			if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging))) || FAILED(staging->Map(0, &none, &mapped))) {
-				staging.Reset();
-			}
-		}
-		if (staging && mapped) {
-			const D3D12_RESOURCE_STATES shader = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			D3D12_RESOURCE_BARRIER barriers[2] = {};
-			for (int i = 0; i < 2; ++i) {
-				barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-				barriers[i].Transition.pResource = i == 0 ? nodesBuffer_.Get() : trisBuffer_.Get();
-				barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-				barriers[i].Transition.StateBefore = shader;
-				barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-			}
-			list->ResourceBarrier(2, barriers);
+		const D3D12_RANGE none = {0, 0};
+		if (staging && SUCCEEDED(staging->Map(0, &none, &mapped))) {
+			D3D12_RESOURCE_BARRIER barrier = {};
+			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barrier.Transition.pResource = trisBuffer_.Get();
+			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barrier.Transition.StateBefore = kShaderRead;
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+			list->ResourceBarrier(1, &barrier);
 			uint64_t at = 0;
 			for (const Range& r : ranges) {
-				const uint64_t nodeBytes = uint64_t(r.nodeCount) * sizeof(BvhNode), triBytes = uint64_t(r.triCount) * sizeof(BvhTri);
-				memcpy(static_cast<uint8_t*>(mapped) + at, &nodes_[r.node], size_t(nodeBytes));
-				list->CopyBufferRegion(nodesBuffer_.Get(), uint64_t(r.node) * sizeof(BvhNode), staging.Get(), at, nodeBytes);
-				at += nodeBytes;
+				const uint64_t triBytes = uint64_t(r.triCount) * sizeof(BvhTri);
 				memcpy(static_cast<uint8_t*>(mapped) + at, &tris_[r.tri], size_t(triBytes));
 				list->CopyBufferRegion(trisBuffer_.Get(), uint64_t(r.tri) * sizeof(BvhTri), staging.Get(), at, triBytes);
 				at += triBytes;
 				++partialUploads_;
 			}
 			staging->Unmap(0, nullptr);
-			for (int i = 0; i < 2; ++i) {
-				std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
-			}
-			list->ResourceBarrier(2, barriers);
-			ComPtr<IUnknown> s;
-			staging.As(&s);
-			gpu.Retire(s, fence);
+			std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+			list->ResourceBarrier(1, &barrier);
+			RetireResource(staging, fence);
 		}
 		dirtyRanges_.clear();
 	}
-	ready_ = false;
+	tlasVa_ = 0;
 }
 
 void SceneBvh::BeginInstances() {
 	instances_.clear();
-	instanceBoxes_.clear();
+	instanceWorld_.clear();
+	instanceMesh_.clear();
 	frameInstanceTris_ = 0;
 }
 
 void SceneBvh::AddInstance(AeHandle mesh, const Mat4& world, uint32_t skipSubMeshes, uint32_t materialOffset, uint32_t doubleSided, bool mirrored) {
 	auto alias = aliases_.find(mesh);
 	auto it = meshes_.find(alias != aliases_.end() ? alias->second : mesh);
-	// (only meshes whose tree the GPU already has)
-	if (it == meshes_.end() || uint64_t(it->second.root) + it->second.nodeCount > uploadedNodes_) {
+	// (only meshes whose triangles the GPU already has)
+	if (it == meshes_.end() || uint64_t(it->second.triBase) + it->second.triCount > uploadedTris_) {
 		return;
+	}
+	for (int r = 0; r < 3; ++r) {
+		for (int c = 0; c < 4; ++c) {
+			if (!std::isfinite(world.at(r, c))) {
+				return;
+			}
+		}
 	}
 	const Mat4 inv = Inverse(world);
 	TlasInstance instance = {};
@@ -838,96 +630,33 @@ void SceneBvh::AddInstance(AeHandle mesh, const Mat4& world, uint32_t skipSubMes
 			instance.worldToObject[r * 4 + c] = inv.at(r, c);
 		}
 	}
-	instance.root = it->second.root;
+	instance.triBase = it->second.triBase;
 	instance.skipSubMeshes = skipSubMeshes;
 	instance.materialOffset = (materialOffset & 0x7FFFFFFFu) | (mirrored ? 0x80000000u : 0u);
 	instance.doubleSided = doubleSided;
-	// the tree's own box (exact also for a skinned mesh, whose pose the mesh's stated bounds know nothing of) in the
-	// world: its centre moved, its half size through the absolute matrix
-	const BvhNode& root = nodes_[it->second.root];
-	const Vec3 localCentre = {(root.bmin[0] + root.bmax[0]) * 0.5f, (root.bmin[1] + root.bmax[1]) * 0.5f, (root.bmin[2] + root.bmax[2]) * 0.5f};
-	const float half[3] = {(root.bmax[0] - root.bmin[0]) * 0.5f, (root.bmax[1] - root.bmin[1]) * 0.5f, (root.bmax[2] - root.bmin[2]) * 0.5f};
-	InstanceBox box;
-	const Vec3 centre = TransformPoint(world, localCentre);
-	const float c[3] = {centre.x, centre.y, centre.z};
-	for (int r = 0; r < 3; ++r) {
-		const float h = std::abs(world.at(r, 0)) * half[0] + std::abs(world.at(r, 1)) * half[1] + std::abs(world.at(r, 2)) * half[2] + 1e-4f;
-		box.bmin[r] = c[r] - h;
-		box.bmax[r] = c[r] + h;
-		if (!std::isfinite(h) || !std::isfinite(c[r])) {
-			return;
-		}
-	}
 	instances_.push_back(instance);
-	instanceBoxes_.push_back(box);
+	instanceWorld_.push_back(world);
+	instanceMesh_.push_back(it->first);
 	frameInstanceTris_ += it->second.triCount;
 }
 
-bool SceneBvh::EndInstances() {
-	GpuResources& gpu = GpuResources::Get();
+bool SceneBvh::Supported(ID3D12Device* device) {
+	D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
+	ComPtr<ID3D12Device5> device5;
+	return device && SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5))) && o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 &&
+		SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5)));
+}
+
+bool SceneBvh::EndInstances(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT64 fence) {
 	const double start = NowMs();
-	ready_ = false;
-	tlasNodes_.clear();
-	const uint32_t count = uint32_t(instances_.size());
-	if (count > 0 && nodesVa_) {
-		tlasOrder_.resize(count);
-		for (uint32_t i = 0; i < count; ++i) {
-			tlasOrder_[i] = i;
-		}
-		// halves by count along the widest axis of the boxes' centres; one instance per leaf
-		struct Work { uint32_t node, first, count; };
-		std::vector<Work> stack;
-		tlasNodes_.push_back({});
-		stack.push_back({0, 0, count});
-		auto centre = [&](uint32_t i, int axis) { return (instanceBoxes_[i].bmin[axis] + instanceBoxes_[i].bmax[axis]) * 0.5f; };
-		while (!stack.empty()) {
-			const Work w = stack.back();
-			stack.pop_back();
-			float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}, clo[3] = {1e30f, 1e30f, 1e30f}, chi[3] = {-1e30f, -1e30f, -1e30f};
-			for (uint32_t k = w.first; k < w.first + w.count; ++k) {
-				const InstanceBox& b = instanceBoxes_[tlasOrder_[k]];
-				for (int a = 0; a < 3; ++a) {
-					lo[a] = std::min(lo[a], b.bmin[a]);
-					hi[a] = std::max(hi[a], b.bmax[a]);
-					const float c = (b.bmin[a] + b.bmax[a]) * 0.5f;
-					clo[a] = std::min(clo[a], c);
-					chi[a] = std::max(chi[a], c);
-				}
-			}
-			{
-				BvhNode& n = tlasNodes_[w.node];
-				memcpy(n.bmin, lo, sizeof(lo));
-				memcpy(n.bmax, hi, sizeof(hi));
-				if (w.count == 1) {
-					n.a = w.first;
-					n.b = 1;
-					continue;
-				}
-			}
-			const float ex = chi[0] - clo[0], ey = chi[1] - clo[1], ez = chi[2] - clo[2];
-			const int axis = ex >= ey && ex >= ez ? 0 : ey >= ez ? 1 : 2;
-			const uint32_t mid = w.first + w.count / 2;
-			std::nth_element(tlasOrder_.begin() + w.first, tlasOrder_.begin() + mid, tlasOrder_.begin() + w.first + w.count, [&](uint32_t x, uint32_t y) { return centre(x, axis) < centre(y, axis); });
-			const uint32_t left = uint32_t(tlasNodes_.size());
-			tlasNodes_.push_back({});
-			tlasNodes_.push_back({});
-			tlasNodes_[w.node].a = left;
-			tlasNodes_[w.node].b = 0;
-			stack.push_back({left, w.first, mid - w.first});
-			stack.push_back({left + 1, mid, w.first + w.count - mid});
-		}
-		// (the leaves name places in the sorted order: the instances are uploaded in that order)
-		const UploadAllocation nodes = gpu.Upload(tlasNodes_.size() * sizeof(BvhNode), 16);
-		const UploadAllocation instances = gpu.Upload(size_t(count) * sizeof(TlasInstance), 16);
-		if (nodes.cpu && instances.cpu) {
-			memcpy(nodes.cpu, tlasNodes_.data(), tlasNodes_.size() * sizeof(BvhNode));
-			TlasInstance* out = static_cast<TlasInstance*>(instances.cpu);
-			for (uint32_t k = 0; k < count; ++k) {
-				out[k] = instances_[tlasOrder_[k]];
-			}
-			tlasNodesVa_ = nodes.gpu;
-			tlasInstancesVa_ = instances.gpu;
-			ready_ = true;
+	tlasVa_ = instancesVa_ = 0;
+	bool ok = false;
+	if (!instances_.empty() && trisVa_ && device && list) {
+		const UploadAllocation a = GpuResources::Get().Upload(instances_.size() * sizeof(TlasInstance), 16);
+		if (a.cpu) {
+			memcpy(a.cpu, instances_.data(), instances_.size() * sizeof(TlasInstance));
+			instancesVa_ = a.gpu;
+			ok = BuildStructures(device, list, fence);
 		}
 	}
 	uint32_t changing = 0;
@@ -935,30 +664,229 @@ bool SceneBvh::EndInstances() {
 		changing += e.changing ? 1u : 0u;
 	}
 	std::lock_guard lock(statsMutex_);
-	stats_.meshes = uint32_t(meshes_.size());
-	stats_.changing = changing;
-	stats_.pending = pendingJobs_.load();
-	stats_.refused = refused_.load();
-	stats_.instances = count;
-	stats_.tlasNodes = uint32_t(tlasNodes_.size());
-	stats_.maxDepth = maxDepth_;
-	stats_.uploads = uploads_;
-	stats_.compactions = compactions_;
-	stats_.nodes = nodes_.size();
-	stats_.tris = tris_.size();
-	stats_.deadTris = deadTris_;
-	stats_.gpuBytes = uploadedNodes_ * sizeof(BvhNode) + uploadedTris_ * sizeof(BvhTri);
-	stats_.frameInstanceTris = frameInstanceTris_;
-	stats_.refits = refits_.load();
-	stats_.partialUploads = partialUploads_;
-	stats_.buildMsTotal = buildMsTotal_;
-	stats_.refitMsLast = refitMsLast_;
-	stats_.tlasMs = NowMs() - start;
-	return ready_;
+	stats_ = {
+		{"supported", support_ == 1}, {"meshes", meshes_.size()}, {"meshesChanging", changing}, {"meshesPending", pendingJobs_.load()}, {"meshesRefused", refused_.load()},
+		{"triangles", tris_.size()}, {"trianglesOfGoneMeshes", deadTris_}, {"triangleBytes", uploadedTris_ * sizeof(BvhTri)},
+		{"uploads", uploads_}, {"compactions", compactions_}, {"readMsTotal", buildMsTotal_},
+		{"updates", refits_.load()}, {"updateUploads", partialUploads_}, {"lastUpdateMs", refitMsLast_},
+		{"bottomLevel", blas_.size()}, {"bottomLevelBytes", blasBytes_}, {"bottomLevelBuilds", blasBuilds_}, {"bottomLevelUpdates", blasUpdates_},
+		{"topLevelBytes", tlas_ ? tlas_->GetDesc().Width : 0},
+		{"frame", {{"instances", instances_.size()}, {"instanceTriangles", frameInstanceTris_}, {"traced", ok}, {"cpuMs", NowMs() - start}}},
+	};
+	return ok;
+}
+
+void SceneBvh::RetireBlas(AeHandle mesh, UINT64 fence) {
+	auto it = blas_.find(mesh);
+	if (it != blas_.end()) {
+		blasBytes_ -= it->second.buffer ? it->second.buffer->GetDesc().Width : 0;
+		RetireResource(it->second.buffer, fence);
+		RetireResource(it->second.scratch, fence);
+		blas_.erase(it);
+	}
+	stale_.erase(mesh);
+}
+
+void SceneBvh::RetireAllStructures(UINT64 fence) {
+	for (auto& [mesh, b] : blas_) {
+		RetireResource(b.buffer, fence);
+		RetireResource(b.scratch, fence);
+	}
+	blas_.clear();
+	stale_.clear();
+	blasBytes_ = 0;
+	RetireResource(tlas_, fence);
+	RetireResource(tlasScratch_, fence);
+	tlasVa_ = 0;
+}
+
+bool SceneBvh::BuildStructures(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT64 fence) {
+	if (support_ < 0) {
+		support_ = Supported(device) ? 1 : 0;
+		if (support_ == 0) {
+			AE_LOG_CODE(Warning, "Bvh", "W_DXR_UNAVAILABLE", "The device has no DXR 1.1 (inline ray tracing): no ray traced reflections, GI probes or glass reflections");
+		}
+	}
+	ComPtr<ID3D12Device5> device5;
+	ComPtr<ID3D12GraphicsCommandList4> list4;
+	if (support_ != 1 || FAILED(device->QueryInterface(IID_PPV_ARGS(&device5))) || FAILED(list->QueryInterface(IID_PPV_ARGS(&list4)))) {
+		return false;
+	}
+	// ---- the bottom level: the meshes this frame uses that have no structure yet, or whose triangles changed (an
+	// update in place for a mesh built to be updated). New ones at most about two million triangles a frame: a scene's
+	// arrival is spread over a few frames, not one long one.
+	uint64_t budget = 2000000;
+	uint32_t built = 0;
+	for (AeHandle mesh : instanceMesh_) {
+		const auto e = meshes_.find(mesh);
+		if (e == meshes_.end() || e->second.triCount == 0) {
+			continue;
+		}
+		Blas& b = blas_[mesh];
+		const bool stale = stale_.count(mesh) != 0;
+		const bool update = stale && b.buffer && b.updatable && b.triCount == e->second.triCount;
+		if ((b.buffer && b.triCount == e->second.triCount && !stale) || (!update && budget < e->second.triCount && built > 0)) {
+			continue;
+		}
+		if (!update) {
+			budget -= std::min<uint64_t>(budget, e->second.triCount);
+		}
+		const uint32_t count = e->second.triCount;
+		// the vertices, three per triangle, as the pool has them (the corner and its two edges)
+		ComPtr<ID3D12Resource> vertices = MakeBuffer(device, uint64_t(count) * 36, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+		float* v = nullptr;
+		const D3D12_RANGE none = {0, 0};
+		if (!vertices || FAILED(vertices->Map(0, &none, reinterpret_cast<void**>(&v)))) {
+			break;
+		}
+		for (uint32_t i = 0; i < count; ++i) {
+			const BvhTri& t = tris_[e->second.triBase + i];
+			for (int k = 0; k < 3; ++k) {
+				v[i * 9 + k] = t.v0[k];
+				v[i * 9 + 3 + k] = t.v0[k] + t.e1[k];
+				v[i * 9 + 6 + k] = t.v0[k] + t.e2[k];
+			}
+		}
+		vertices->Unmap(0, nullptr);
+		D3D12_RAYTRACING_GEOMETRY_DESC geometry = {};
+		geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+		geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE; // (opaque or not is the instance's: FORCE_OPAQUE / FORCE_NON_OPAQUE)
+		geometry.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+		geometry.Triangles.VertexCount = count * 3;
+		geometry.Triangles.VertexBuffer = {vertices->GetGPUVirtualAddress(), 12};
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+		inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+		// (a changing mesh: built fast and to be updated; the rest: built once, for the fastest rays)
+		inputs.Flags = e->second.changing ? (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
+										  : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+		if (update) {
+			inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+		}
+		inputs.NumDescs = 1;
+		inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+		inputs.pGeometryDescs = &geometry;
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+		desc.Inputs = inputs;
+		if (update) {
+			desc.SourceAccelerationStructureData = desc.DestAccelerationStructureData = b.buffer->GetGPUVirtualAddress();
+			desc.ScratchAccelerationStructureData = b.scratch->GetGPUVirtualAddress();
+			list4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+			++blasUpdates_;
+		} else {
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+			device5->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			ComPtr<ID3D12Resource> result = MakeBuffer(device, info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+			// (a structure to be updated keeps its scratch: an update needs one every time)
+			ComPtr<ID3D12Resource> scratch = MakeBuffer(device, std::max(info.ScratchDataSizeInBytes, info.UpdateScratchDataSizeInBytes), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true);
+			if (!result || !scratch) {
+				RetireResource(vertices, fence);
+				AE_LOG_CODE(Error, "Bvh", "E_DXR_MEMORY", "A bottom level acceleration structure could not be created");
+				break;
+			}
+			desc.DestAccelerationStructureData = result->GetGPUVirtualAddress();
+			desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+			list4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+			result->SetName(L"Aether.Dxr.Blas");
+			if (b.buffer) {
+				blasBytes_ -= b.buffer->GetDesc().Width;
+				RetireResource(b.buffer, fence);
+			}
+			RetireResource(b.scratch, fence);
+			b.buffer = result;
+			b.updatable = e->second.changing;
+			if (b.updatable) {
+				b.scratch = scratch;
+			} else {
+				RetireResource(scratch, fence);
+			}
+			b.triCount = count;
+			blasBytes_ += result->GetDesc().Width;
+			++blasBuilds_;
+		}
+		stale_.erase(mesh);
+		RetireResource(vertices, fence);
+		++built;
+	}
+	if (built > 0) {
+		D3D12_RESOURCE_BARRIER barrier = {};
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; // (every structure written above: the top level build reads them)
+		list->ResourceBarrier(1, &barrier);
+	}
+	// ---- the top level: the frame's instances in the order g_TlasInstances has them. An instance whose mesh has no
+	// structure yet keeps its place (mask 0: never hit).
+	const uint32_t count = uint32_t(instances_.size());
+	D3D12_GPU_VIRTUAL_ADDRESS anyBlas = 0;
+	for (const auto& [mesh, b] : blas_) {
+		if (b.buffer) {
+			anyBlas = b.buffer->GetGPUVirtualAddress();
+			break;
+		}
+	}
+	if (!anyBlas) {
+		return false;
+	}
+	const UploadAllocation descs = GpuResources::Get().Upload(size_t(count) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), D3D12_RAYTRACING_INSTANCE_DESCS_BYTE_ALIGNMENT);
+	if (!descs.cpu) {
+		return false;
+	}
+	auto* out = static_cast<D3D12_RAYTRACING_INSTANCE_DESC*>(descs.cpu);
+	for (uint32_t i = 0; i < count; ++i) {
+		D3D12_RAYTRACING_INSTANCE_DESC d = {};
+		for (int r = 0; r < 3; ++r) {
+			for (int c = 0; c < 4; ++c) {
+				d.Transform[r][c] = instanceWorld_[i].at(r, c);
+			}
+		}
+		const auto b = blas_.find(instanceMesh_[i]);
+		const TlasInstance& t = instances_[i];
+		const bool has = b != blas_.end() && b->second.buffer && t.triBase < (1u << 24);
+		d.InstanceID = has ? t.triBase : 0;
+		d.InstanceMask = has ? 0xFF : 0;
+		d.AccelerationStructure = has ? b->second.buffer->GetGPUVirtualAddress() : anyBlas;
+		// Opaque unless some of its sub meshes are not there for rays or are double sided: those are decided per
+		// triangle in the shader (and their back faces are not culled by the ray's flag).
+		d.Flags = t.skipSubMeshes == 0 && t.doubleSided == 0 ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE : (D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE | D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE);
+		out[i] = d;
+	}
+	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+	inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+	inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+	inputs.NumDescs = count;
+	inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+	inputs.InstanceDescs = descs.gpu;
+	D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info = {};
+	device5->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+	// (one structure rebuilt in place every frame: the queue runs the frames one after another; it grows with room to spare)
+	if (!tlas_ || tlas_->GetDesc().Width < info.ResultDataMaxSizeInBytes) {
+		RetireResource(tlas_, fence);
+		tlas_ = MakeBuffer(device, info.ResultDataMaxSizeInBytes * 3 / 2, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+		if (tlas_) {
+			tlas_->SetName(L"Aether.Dxr.Tlas");
+		}
+	}
+	if (!tlasScratch_ || tlasScratch_->GetDesc().Width < info.ScratchDataSizeInBytes) {
+		RetireResource(tlasScratch_, fence);
+		tlasScratch_ = MakeBuffer(device, info.ScratchDataSizeInBytes * 3 / 2, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true);
+	}
+	if (!tlas_ || !tlasScratch_) {
+		AE_LOG_CODE(Error, "Bvh", "E_DXR_MEMORY", "The top level acceleration structure could not be created");
+		return false;
+	}
+	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+	desc.Inputs = inputs;
+	desc.DestAccelerationStructureData = tlas_->GetGPUVirtualAddress();
+	desc.ScratchAccelerationStructureData = tlasScratch_->GetGPUVirtualAddress();
+	list4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+	barrier.UAV.pResource = tlas_.Get();
+	list->ResourceBarrier(1, &barrier);
+	tlasVa_ = tlas_->GetGPUVirtualAddress();
+	return true;
 }
 
 void SceneBvh::Release(bool leak) {
-	// The device's objects go; what was built stays (the pools are uploaded again when there is a device again).
+	// The device's objects go; what was read stays (the pool is uploaded again when there is a device again).
 	{
 		std::lock_guard lock(mutex_);
 		stop_ = true;
@@ -972,27 +900,31 @@ void SceneBvh::Release(bool leak) {
 		stop_ = false;
 	}
 	if (leak) {
-		nodesBuffer_.Detach();
 		trisBuffer_.Detach();
+		tlas_.Detach();
+		tlasScratch_.Detach();
+		for (auto& [mesh, b] : blas_) {
+			b.buffer.Detach();
+			b.scratch.Detach();
+		}
 	}
-	nodesBuffer_.Reset();
 	trisBuffer_.Reset();
-	nodesVa_ = trisVa_ = tlasNodesVa_ = tlasInstancesVa_ = 0;
-	uploadedNodes_ = uploadedTris_ = 0;
+	tlas_.Reset();
+	tlasScratch_.Reset();
+	blas_.clear();
+	stale_.clear();
+	blasBytes_ = 0;
+	trisVa_ = instancesVa_ = tlasVa_ = 0;
+	uploadedTris_ = 0;
 	dirtyRanges_.clear();
-	dirty_ = !nodes_.empty();
-	ready_ = false;
+	dirty_ = !tris_.empty();
+	support_ = -1;
 }
 
 json SceneBvh::Stats() {
 	std::lock_guard lock(statsMutex_);
-	return {
-		{"meshes", stats_.meshes}, {"meshesChanging", stats_.changing}, {"meshesPending", stats_.pending}, {"meshesRefused", stats_.refused},
-		{"triangles", stats_.tris}, {"trianglesOfGoneMeshes", stats_.deadTris}, {"nodes", stats_.nodes}, {"gpuBytes", stats_.gpuBytes},
-		{"uploads", stats_.uploads}, {"compactions", stats_.compactions}, {"deepestTree", stats_.maxDepth}, {"buildMsTotal", stats_.buildMsTotal},
-		{"refits", stats_.refits}, {"refitUploads", stats_.partialUploads}, {"lastRefitMs", stats_.refitMsLast},
-		{"frame", {{"instances", stats_.instances}, {"instanceTriangles", stats_.frameInstanceTris}, {"topLevelNodes", stats_.tlasNodes}, {"topLevelBuildMs", stats_.tlasMs}}},
-	};
+	return stats_.is_null() ? json{{"meshes", 0}} : stats_;
 }
 
 } // namespace aether
+

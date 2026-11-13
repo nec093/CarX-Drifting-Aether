@@ -79,6 +79,10 @@ private:
 	uint32_t historyIndex_ = 0, historyCamera_ = 0;
 	bool historyValid_ = false;
 	Mat4 prevViewProj_ = Mat4::Identity();
+	// the reflection denoiser (NRD): the camera without jitter, this frame and the one before, and what the passes
+	// reconstruct positions with
+	Mat4 nrdView_ = Mat4::Identity(), nrdProj_ = Mat4::Identity(), nrdViewPrev_ = Mat4::Identity(), nrdProjPrev_ = Mat4::Identity(), invViewProj_ = Mat4::Identity();
+	bool nrdFrame_ = false; // this frame: the reflection rays sample the surface's lobe and NRD denoises them (setting reflectionDenoiser = nrd)
 	bool taa_ = false;
 	float bloomMix_ = 0, bloomScatter_ = 0, motionBlur_ = 0;
 	bool ownExposure_ = false;
@@ -135,6 +139,7 @@ private:
 	bool bvhReady_ = false;      // this frame: rays can be traced through the scene's triangles (Bvh.h)
 	bool raysWanted_ = false;    // this frame: something traces rays (reflections, a debug view)
 	bool rayReflections_ = false; // this frame: smooth surfaces mirror what rays find
+	bool raysSupported_ = false;  // the device has DXR 1.1 (inline ray tracing): the shaders were built with rays
 	std::vector<uint32_t> rayMaterials_; // per ray instance and sub mesh, two numbers: its index in this frame's material buffer, its base texture's place in the SRV heap (UINT32_MAX: none)
 	D3D12_GPU_VIRTUAL_ADDRESS rayMaterialsVa_ = 0;
 	bool indirect_ = false;      // this frame: the occlusion pass also gathers light bounced off what it finds

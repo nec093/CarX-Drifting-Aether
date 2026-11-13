@@ -226,8 +226,8 @@ bool Renderer::BuildPipelines() {
 		triVbId_ = ResourceRegistry::Get().Register(device_, triVb_.Get(), "TestTriangle.VertexBuffer", ResourceCategory::Buffer, D3D12_HEAP_TYPE_UPLOAD, frame_);
 	}
 
-	ComPtr<ID3DBlob> vs = ShaderManager::Get().Compile("test_triangle.hlsl", "VSMain", "vs_5_1");
-	ComPtr<ID3DBlob> ps = ShaderManager::Get().Compile("test_triangle.hlsl", "PSMain", "ps_5_1");
+	ComPtr<ID3DBlob> vs = ShaderManager::Get().Compile("test_triangle.hlsl", "VSMain", "vs_6_5");
+	ComPtr<ID3DBlob> ps = ShaderManager::Get().Compile("test_triangle.hlsl", "PSMain", "ps_6_5");
 	if (!vs || !ps) {
 		triNote_ = "shader compile failed (see the Shaders tab / get_shader_errors)";
 		return true; // a shader error is not a device failure

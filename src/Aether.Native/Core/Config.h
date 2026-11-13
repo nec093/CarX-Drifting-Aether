@@ -58,6 +58,7 @@ struct SettingsData {
 	int anisotropicLevel = 9; // Anisotropic texture filtering level
 	int vsync = 1; // Vertical sync: 0 off, 1 every refresh, 2 every second refresh
 	std::string tonemap = "host";    // host (the curve of the game renderer) | agx | aces | neutral | none
+	std::string reflectionDenoiser = "nrd"; // nrd | off: the reflection rays sample each surface's GGX lobe and NVIDIA NRD (REBLUR) denoises them (off: mirror rays, not denoised)
 	float exposureEV = 0.0f;         // exposure bias in stops on top of the scene's exposure
 	int vramBudgetMB = 2048;         // budget for Aether-owned GPU memory (0 = none): crossing it is reported, nothing is freed
 	int vramWarnPercent = 80;        // warning threshold in percent of the budget

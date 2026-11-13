@@ -2,6 +2,7 @@
 // Authorize (the MCP server's --allow-control switch, the mcpControl setting, the in-game approval) and then through
 // the same validated entry points the overlay uses. Nothing here touches the device or a resource's lifetime.
 #include "../Renderer/Bvh.h"
+#include "../Renderer/ReflectionDenoiser.h"
 #include "PipeServer.h"
 #include "../Core/Config.h"
 #include "../Core/Log.h"
@@ -220,6 +221,7 @@ json HandleRequest(const json& request) {
 		out["aetherScene"] = SceneStore::Get().Summary();
 		out["aetherRenderer"] = SceneRenderer::Get().Stats();
 		out["rayTracing"] = SceneBvh::Get().Stats();
+		out["reflectionDenoiser"] = ReflectionDenoiser::Get().Stats();
 		return Ok(id, out);
 	}
 	if (method == "get_logs") {
@@ -307,7 +309,7 @@ json HandleRequest(const json& request) {
 	}
 	if (method == "set_graphics_option") {
 		// one of Aether's own graphics options (the same ones the overlay's Settings tab shows)
-		static const char* const kOptions[] = {"skyMode", "timeOfDay", "sunHeading", "cloudCoverage", "cloudSpeed", "shadowSoftness", "indirectStrength", "fogStrength", "moonlight", "skinnedRayUpdates", "motionBlurStrength", "bloomStrength", "aoStrength", "aoRadius", "lensFlareStrength", "smokeOpacity", "lodBias", "anisotropicLevel", "vsync", "exposureEV", "tonemap"};
+		static const char* const kOptions[] = {"skyMode", "timeOfDay", "sunHeading", "cloudCoverage", "cloudSpeed", "shadowSoftness", "indirectStrength", "fogStrength", "moonlight", "skinnedRayUpdates", "motionBlurStrength", "bloomStrength", "aoStrength", "aoRadius", "lensFlareStrength", "smokeOpacity", "lodBias", "anisotropicLevel", "vsync", "exposureEV", "tonemap", "reflectionDenoiser"};
 		std::string option;
 		if (!GetString(params, "option", "", option, error)) {
 			return Fail(id, error);
@@ -341,7 +343,7 @@ json HandleRequest(const json& request) {
 			return Fail(id, {"E_INVALID_PARAMS", "mode must be one of: hdrp, aether, compare"});
 		}
 		if (!debugView.empty() && std::find(views.begin(), views.end(), debugView) == views.end()) {
-			return Fail(id, {"E_INVALID_PARAMS", "debugView must be one of: none, albedo, normal, roughness, metallic, depth, lighting, shadow, materialClass, sun, ambient, reflection, bvh, bvhCost"});
+			return Fail(id, {"E_INVALID_PARAMS", "debugView must be one of: none, albedo, normal, roughness, metallic, depth, lighting, shadow, materialClass, sun, ambient, reflection, bvh"});
 		}
 		if (mode.empty() && debugView.empty()) {
 			return Fail(id, {"E_INVALID_PARAMS", "give mode, debugView or both"});

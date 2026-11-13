@@ -224,14 +224,17 @@ float4 ScreenRadianceAt(float3 worldPos) {
 
 // What a ray from `o` along `d` (normalised) brings back.
 // `sunDisc`: a ray that reaches the sky shows the sun where it looks at it (for mirrors: the glint of the sun in chrome).
-float3 TracedRadiance(float3 o, float3 d, bool sunDisc) {
+// `hitT`: how far the ray went to what it brought back (the sky: 10 km).
+float3 TracedRadianceT(float3 o, float3 d, bool sunDisc, out float hitT) {
 	// (a hit the texture's alpha cuts away is passed: a few times, then the sky)
+	hitT = 0.0;
 	for (int attempt = 0; attempt < 3; ++attempt) {
 		BvhHit hit = BvhTrace(o, d, 500.0, false);
 		if (hit.t < 0.0) {
 			break;
 		}
 		float3 P = o + d * hit.t;
+		hitT += hit.t;
 		float4 screen = ScreenRadianceAt(P);
 		if (screen.a > 0.5) {
 			return screen.rgb;
@@ -241,7 +244,9 @@ float3 TracedRadiance(float3 o, float3 d, bool sunDisc) {
 			return surface.rgb;
 		}
 		o = P + d * 0.02;
+		hitT += 0.02;
 	}
+	hitT = 10000.0;
 	float3 sky = SkyRadiance(d, 0.0);
 	if (sunDisc && g_SunDirection.w > 0.5) {
 		// (wider than the real disc, two degrees across its soft edge: a wheel's curves shrink it to a point anyway, and a
@@ -251,6 +256,27 @@ float3 TracedRadiance(float3 o, float3 d, bool sunDisc) {
 		sky += g_SunColor.rgb * ((smoothstep(0.99863, 0.99985, c) * 200.0 + smoothstep(0.985, 0.9995, c) * 6.0) * CloudShadow(o));
 	}
 	return sky;
+}
+
+float3 TracedRadiance(float3 o, float3 d, bool sunDisc) {
+	float hitT;
+	return TracedRadianceT(o, d, sunDisc, hitT);
+}
+
+// MathLib (NVIDIA, MIT): the GGX lobe's visible normals, sampled for the rays NRD denoises
+#include "ml.hlsli"
+
+// A reflection direction from the surface's GGX lobe (rays NRD denoises: in its lobe, never into the surface).
+// `roughness`: linear (perceptual) roughness. A different sequence every frame and pixel.
+float3 SampleLobe(float3 V, float3 N, float roughness, int2 pixel, uint frameIndex) {
+	Rng::Hash::Initialize(uint2(pixel), frameIndex);
+	float2 rnd = Rng::Hash::GetFloat2();
+	float3x3 basis = Geometry::GetBasis(N);
+	float3 Vlocal = Geometry::RotateVector(basis, V);
+	float3 Hlocal = ImportanceSampling::VNDF::GetRay(rnd, float2(roughness, roughness), Vlocal, 0.95);
+	float3 H = Geometry::RotateVectorInverse(basis, Hlocal);
+	float3 R = reflect(-V, H);
+	return dot(R, N) > 0.0 ? R : reflect(-V, N);
 }
 
 // How smooth a surface must be to mirror here: the scene's own setting, and never rougher than about 0.4 (what is
@@ -306,23 +332,34 @@ bool SharpMirror(float4 surface) {
 float4 PSRayTrace(FullscreenOutput input) : SV_Target {
 	// (always the same pixel of each 2 x 2 block: a different one every frame, for the temporal antialiasing to gather,
 	// made sharp mirrored edges shimmer whenever the camera moved)
+	// g_PassParams.z = 1: the rays are for NRD (ReflectionDenoiser): along directions sampled from the surface's
+	// lobe, a their hit distance, -1 where no ray is traced. Else along the mirror direction, a the view depth.
+	const bool forNrd = g_PassParams.z > 0.5;
+	const float4 none = forNrd ? float4(0.0, 0.0, 0.0, -1.0) : 0.0;
 	int2 p = int2(input.position.xy) * 2;
 	if (any(p >= int2(g_ScreenSize.xy))) {
-		return 0.0;
+		return none;
 	}
 	float4 surface = g_PostAux.Load(int3(p, 0));
 	float depth = g_PostDepth.Load(int3(p, 0)).r;
 	if (MirrorAmount(surface) <= 0.002 || depth <= 0.0 || SharpMirror(surface)) {
-		return 0.0;
+		return none;
 	}
 	float2 ndc = (float2(p) + 0.5) * g_ScreenSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
 	float4 h = mul(g_InvViewProj, float4(ndc, depth, 1.0));
 	float3 P = h.xyz / h.w;
 	float viewDepth = abs(1.0 / h.w);
 	float3 N = OctDecode(surface.xy);
-	float3 R = reflect(-normalize(g_CameraPos.xyz - P), MirrorNormal(p, N, viewDepth));
+	float3 V = normalize(g_CameraPos.xyz - P);
+	float3 mirrorN = MirrorNormal(p, N, viewDepth);
+	float3 R = reflect(-V, mirrorN);
+	if (forNrd) {
+		R = SampleLobe(V, mirrorN, surface.z, p, uint(g_PassParams.w));
+	}
 	// (with the sun where the ray reaches it: the sun's image in the lacquer)
-	return float4(min(TracedRadiance(P + N * (0.004 * viewDepth + 0.01), R, true), 300.0), viewDepth);
+	float hitT;
+	float3 radiance = min(TracedRadianceT(P + N * (0.004 * viewDepth + 0.01), R, true, hitT), 300.0);
+	return float4(radiance, forNrd ? hitT : viewDepth);
 }
 
 float4 PSSsr(FullscreenOutput input) : SV_Target {
@@ -346,7 +383,11 @@ float4 PSSsr(FullscreenOutput input) : SV_Target {
 	// ---- 1. on screen. `share`: how much of the answer the screen gives (it fades towards the picture's edge).
 	float share = 0.0;
 	float3 mirrored = 0.0;
-	if (onScreen) {
+	// The screen's march only where no ray answers: a mirror traces its own ray below, and the rays denoised by NRD
+	// (g_PassParams.z = 1) answer for every other surface (the screen's sharp answer would not match their blur). A
+	// ray's hit that the screen shows is coloured from the screen anyway.
+	const bool rayAnswers = rays && (g_PassParams.z > 0.5 || SharpMirror(surface));
+	if (onScreen && !rayAnswers) {
 		// the ray: steps that grow with the distance, a different start per pixel so that the steps do not show as bands
 		const int kSteps = 48;
 		// (no different start per pixel on a mirror: there the screen's answer and the rays' alternated from pixel to
@@ -998,18 +1039,12 @@ float4 PSReflectionBlur(FullscreenOutput input) : SV_Target {
 }
 
 // Debug view: one ray per pixel from the camera through the ray tracing structure. What it shows must be what the
-// rasterised picture shows (the same shapes in the same places); the cost view is what a ray had to test on its way.
-// g_PassParams.x: 1 = the cost view.
+// rasterised picture shows (the same shapes in the same places).
 float4 PSBvhDebug(FullscreenOutput input) : SV_Target {
 	float2 ndc = input.uv * float2(2.0, -2.0) + float2(-1.0, 1.0);
 	float4 h = mul(g_InvViewProj, float4(ndc, 0.5, 1.0));
 	float3 d = normalize(h.xyz / h.w - g_CameraPos.xyz);
 	BvhHit hit = BvhTrace(g_CameraPos.xyz, d, 2000.0, false);
-	if (g_PassParams.x > 0.5) {
-		// blue (few tests) through green and yellow to red (300 and more)
-		float c = saturate(float(hit.steps) / 300.0);
-		return float4(saturate(float3(c * 3.0 - 1.0, 1.0 - abs(c * 3.0 - 1.5) * 0.9, 1.0 - c * 3.0)), 1.0);
-	}
 	if (hit.t < 0.0) {
 		return float4(0.02, 0.03, 0.06, 1.0);
 	}
@@ -1061,7 +1096,7 @@ float4 PSGiRays(FullscreenOutput input) : SV_Target {
 	for (int attempt = 0; attempt < 2; ++attempt) {
 		// (60 m: what shuts out the sky or lights a place is nearer than that; the few rays that went 300 m through
 		// everything took most of the pass's time)
-		BvhHit hit = BvhTraceEx(o, d, 60.0 - travelled, false, true, 300u);
+		BvhHit hit = BvhTraceEx(o, d, 60.0 - travelled, false, true);
 		if (hit.t < 0.0) {
 			break;
 		}

@@ -786,6 +786,10 @@ void SettingsTab() {
 			settings.Set(t.key, t.value, "overlay");
 		}
 	}
+	bool nrd = s.reflectionDenoiser == "nrd";
+	if (ImGui::Checkbox("Glossy reflections, denoised (NVIDIA NRD)", &nrd)) {
+		settings.Set("reflectionDenoiser", nrd ? "nrd" : "off", "overlay");
+	}
 	struct Slider { const char* key; const char* label; float value, lo, hi; const char* format; };
 	Slider sliders[] = {
 		{"shadowSoftness", "Shadow softness (texels)", s.shadowSoftness, 0.0f, 4.0f, "%.1f"},

@@ -14,7 +14,7 @@ Aether のレンダラーの構造（コマンドリストの単位、レンダ�
 | `GpuTimer` | `Renderer/GpuTimer.{h,cpp}` | シーンのパスごとの GPU 時間 |
 | `SceneBvh` | `Renderer/Bvh.{h,cpp}` | シェーダーで光線を飛ばすための三角形の BVH（DXR は使わない） |
 | スモーク | `Renderer/Smoke.cpp` | タイヤスモークのパフの移動（`Aether_SmokeStep`）と、パーティクルパス用の四角形 |
-| `ShaderManager` | `Shaders/ShaderManager.{h,cpp}` | `shaders/*.hlsl` を実行時に `D3DCompile`（シェーダーモデル 5.1）でコンパイルする |
+| `ShaderManager` | `Shaders/ShaderManager.{h,cpp}` | `shaders/*.hlsl` を実行時に DXC（シェーダーモデル 6.5）でコンパイルする。DXR 1.1 の無い GPU では `AE_NO_RAYS` を付け、光線は何にも当たらない |
 
 シーンのシェーダーは `shaders/aether_scene.hlsli`（共通の定義、レジスター）、`scene_forward.hlsl`（メッシュのパス）、`scene_post.hlsl`（全画面パス）、`scene_particles.hlsl`（パーティクル）、`aether_bvh.hlsli`（BVH の走査）です。
 コンパイルエラーはデータとして残ります（オーバーレイの Shaders、MCP の `get_shader_errors`）。シーンの必須シェーダーが 1 つでも失敗すると、直るまでシーンは描かれません（`E_SCENE_SHADERS`）。パーティクルのシェーダーだけが失敗した場合はパーティクルが出ないだけです。`reload_shader` で再起動せずに読み直せます。
@@ -80,7 +80,7 @@ Transient はプールに戻ります。プールのテクスチャーは 120 �
 2. `SceneStore::Apply`：メインスレッドから届いた追加・削除、このフレームのトランスフォーム、ライト、プローブ、パーティクル（何も描かないフレームでも適用する）。
 3. フレームのアップロードアリーナを取る（取れなければ描かない）。既定テクスチャーのアップロード、マテリアルのディスクリプターテーブルの更新。
 4. シャドウアトラスと反射プローブのテクスチャーの用意、このフレームに描く反射プローブの面を決める。
-5. 描画リスト（CPU）。BVH のインスタンスの木もここで一緒に作る。
+5. 描画リスト（CPU）。光線用のインスタンスもここで一緒に集め、DXR の構造（BLAS、TLAS）を作る。
 6. カスケード（`BuildCascades`）、ライトのクラスター（`BuildClusters`）、フレーム定数と各バッファーのアップロード（`UploadFrameData`）。
 7. パスをグラフに登録し、コンパイルして実行する。
 8. 提出後に `EndFrame`：タイムスタンプの提出、グラフの終わり、このフレームのディスクリプター範囲を完了番号に対して返す。
@@ -133,6 +133,7 @@ Transient はプールに戻ります。プールのテクスチャーは 120 �
 | `ReflectionProbeBlur` | 同上 | 粗い面用のぼかしたアトラス |
 | `Opaque` | 常に | 不透明の陰影。`SceneColor`、`SceneSurface`（法線、反射の粗さと重み）、`SceneVelocity`（画面上の動き）を同時に書く |
 | `ReflectionRays` | 光線の反射が有効なとき（登録しない） | 2x2 画素に 1 本（毎フレーム位置を変える）、半分の解像度で光線を飛ばす |
+| `ReflectionDenoise` | `reflectionDenoiser = nrd` で、DXR の光線のとき（登録しない） | コンピュート。NRD の入力を作り、NRD（REBLUR_SPECULAR）を実行し、結果を光線と同じ形式に戻す（`ReflectionDenoiser`） |
 | `Reflections` | 画面空間反射か光線の反射が有効なとき（登録しない） | 映り込みを `SceneColor` に足す |
 | `Clouds` | 物理空で雲があるとき（登録しない） | カメラから見た雲を半分の解像度でマーチする |
 | `Sky` | 常に | 遠方面の全画面三角形で空を描く（物理空なら雲の層を重ねる） |
@@ -143,7 +144,7 @@ Transient はプールに戻ります。プールのテクスチャーは 120 �
 | `Smoke` | タイヤスモークがあるとき（登録しない） | スモークを半分の解像度の専用ターゲットに描く |
 | `SmokeApply` | 同上 | スモークを絵に重ねる |
 | `Particles` | パーティクルがあるとき | ゲームのパーティクル（スモークを半分の解像度で描いたときはそれを除く） |
-| `BvhDebug` | `debugView` が `bvh` / `bvhCost` で BVH があるとき | BVH のデバッグ表示 |
+| `BvhDebug` | `debugView` が `bvh` で光線が使えるとき | 画素ごとにカメラから光線を飛ばし、当たった形を表示する |
 | `TemporalAA` | 設定 `antialiasing`（登録しない） | サブピクセルずらした今のフレームを履歴に混ぜる |
 | `MotionBlur` | モーションブラーが有効なとき（登録しない） | 画面上の動きに沿ったぼかし |
 | `BloomDown0`〜`BloomDown4` | ブルームかレンズフレアが有効で、64x64 以上のとき（登録しない） | 段階的な縮小 |
@@ -183,9 +184,9 @@ Transient はプールに戻ります。プールのテクスチャーは 120 �
 | 9 | テーブル | `space2 t4`〜`t7` | 全画面パスの入力：主入力、深度、補助 2 つ |
 | 10 | テーブル | `space3 t0`〜`t3` | ゲームの反射プローブのキューブ（近い 4 つ） |
 | 11 | ルート SRV（頂点） | `t5` | インスタンスマップ（描画ごとのインスタンスの番号） |
-| 12〜15 | ルート SRV | `t6`〜`t9` | BVH：メッシュのノード、三角形、フレームのインスタンスの木、そのインスタンス |
-| 16 | ルート SRV | `t10` | 光線が当たったインスタンスとサブメッシュのマテリアルと base テクスチャー |
-| 17 | テーブル | `space5 t0`〜 | SRV ヒープ全体（16,384）。光線が当たった面の base テクスチャーを番号で読む |
+| 12〜14 | ルート SRV | `t7`〜`t9` | 光線：三角形のプール、フレームの TLAS、そのインスタンス |
+| 15 | ルート SRV | `t10` | 光線が当たったインスタンスとサブメッシュのマテリアルと base テクスチャー |
+| 16 | テーブル | `space5 t0`〜 | SRV ヒープ全体（16,384）。光線が当たった面の base テクスチャーを番号で読む |
 
 静的サンプラー：`s0` 異方性 8 ・ラップ、`s1` リニア・クランプ、`s2` 比較（`LESS_EQUAL`、境界は白 = 影なし）、`s3` ポイント・クランプ。
 
@@ -220,7 +221,7 @@ G-buffer は持ちません。不透明のパスが、ピクセルごとにラ�
 | `get_render_graph` | `passes` / `resources`：フレーム末尾のリスト（テスト三角形、オーバーレイ、キャプチャ）。`sceneGraph`：直前にコンパイルしたシーンのグラフ（パス、読み書きと状態、リソースの種類・サイズ・形式・寿命・共有、プールの枚数とバイト数、各パスの直近の時間）。`sceneStats` |
 | `get_status` の `sceneRenderer` | 可視インスタンス、パスごとの描画数、インスタンス描画で減った描画数、三角形、フレーム内のマテリアル数、未対応マテリアルの描画数、パイプラインステート数、ライトとクラスターの占有、カスケード、反射プローブ、空、パーティクル |
 | `renderer.commandLists`（`get_status`） | リストの数と、空いていない理由（GPU、ホストのフェンス、再利用の間隔）、空きが無くて飛ばしたフレーム数 |
-| `debugView` | `albedo`、`normal`、`roughness`、`metallic`、`depth`、`lighting`、`shadow`、`materialClass`、`sun`、`ambient`、`reflection`、`bvh`、`bvhCost` |
+| `debugView` | `albedo`、`normal`、`roughness`、`metallic`、`depth`、`lighting`、`shadow`、`materialClass`、`sun`、`ambient`、`reflection`、`bvh` |
 
 ## 制限
 

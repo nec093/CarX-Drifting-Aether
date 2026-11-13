@@ -84,7 +84,7 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 | `hdrp` | ゲーム純正のレンダラーだけ。比べるための参照用 |
 | `compare` | 左半分が純正、右半分が Aether |
 
-`debugView`：`none`、`albedo`、`normal`、`roughness`、`metallic`、`depth`、`lighting`、`shadow`、`materialClass`、`sun`、`ambient`、`reflection`、`bvh`、`bvhCost`。描画モードが `aether` か `compare` のときに使われます。
+`debugView`：`none`、`albedo`、`normal`、`roughness`、`metallic`、`depth`、`lighting`、`shadow`、`materialClass`、`sun`、`ambient`、`reflection`、`bvh`。描画モードが `aether` か `compare` のときに使われます。
 
 ### set_render_feature の機能
 
@@ -137,6 +137,7 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 | `vsync` | 0〜2（整数） | 垂直同期：0 オフ、1 毎リフレッシュ、2 1 回おき |
 | `exposureEV` | −10〜10 | シーンの露出に足す補正（段） |
 | `tonemap` | `host` / `agx` / `aces` / `neutral` / `none` | トーンマッピングの曲線 |
+| `reflectionDenoiser` | `nrd` / `off` | 既定 `nrd`：反射の光線を表面のローブからサンプリングし、NVIDIA NRD（REBLUR）でノイズ除去する。`off`：鏡面方向の光線、ノイズ除去なし。状態は `get_scene_info` の `reflectionDenoiser` |
 
 MCP から変えられない設定：`overlayHotkey`、`overlayVisibleAtStart`、`overlayScale`、`vramBudgetMB`、`vramWarnPercent`、`mcpControl`、`mcpApprovalTimeoutSec`、`logLevel`。`quality` は `set_render_quality`、`renderMode` と `debugView` は `set_render_mode` で変えます。
 

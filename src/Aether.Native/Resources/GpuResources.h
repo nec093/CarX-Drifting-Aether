@@ -27,11 +27,12 @@ struct GpuTextureDesc {
 	DXGI_FORMAT srvFormat = DXGI_FORMAT_UNKNOWN;    // of the views (depth textures: typeless resource, typed views)
 	DXGI_FORMAT targetFormat = DXGI_FORMAT_UNKNOWN; // RTV or DSV format
 	bool renderTarget = false, depthStencil = false, shaderResource = true;
+	bool unorderedAccess = false; // written by compute shaders (a UAV in the SRV heap: GpuTexture::uav)
 	float clearColor[4] = {0, 0, 0, 0};
 	float clearDepth = 0; // reversed Z: far
 	bool operator==(const GpuTextureDesc& o) const {
 		return width == o.width && height == o.height && arraySize == o.arraySize && mipLevels == o.mipLevels && format == o.format && srvFormat == o.srvFormat &&
-			targetFormat == o.targetFormat && renderTarget == o.renderTarget && depthStencil == o.depthStencil && shaderResource == o.shaderResource;
+			targetFormat == o.targetFormat && renderTarget == o.renderTarget && depthStencil == o.depthStencil && shaderResource == o.shaderResource && unorderedAccess == o.unorderedAccess;
 	}
 };
 
@@ -41,6 +42,7 @@ struct GpuTexture {
 	D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON; // as the next recorded command will find it
 	uint32_t srv = UINT32_MAX;    // index in the SRV heap
 	uint32_t target = UINT32_MAX; // index in the RTV or DSV heap
+	uint32_t uav = UINT32_MAX;    // index in the SRV heap (desc.unorderedAccess)
 	uint64_t registryId = 0;
 	uint64_t bytes = 0;
 	std::string name;

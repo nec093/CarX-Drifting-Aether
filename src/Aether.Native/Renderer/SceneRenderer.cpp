@@ -1,4 +1,5 @@
 #include "Bvh.h"
+#include "ReflectionDenoiser.h"
 #include "SceneRenderer.h"
 #include "../Core/Log.h"
 #include "../Resources/GpuResources.h"
@@ -259,16 +260,19 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	fullscreenPipelines_.clear();
 	shaderGeneration_ = generation;
 	ShaderManager& sm = ShaderManager::Get();
-	vsMain_ = sm.Compile("scene_forward.hlsl", "VSMain", "vs_5_1");
-	vsShadow_ = sm.Compile("scene_forward.hlsl", "VSShadow", "vs_5_1");
-	psForward_ = sm.Compile("scene_forward.hlsl", "PSForward", "ps_5_1");
-	psDepthAlpha_ = sm.Compile("scene_forward.hlsl", "PSDepthAlphaTest", "ps_5_1");
-	psShadowAlpha_ = sm.Compile("scene_forward.hlsl", "PSShadowAlphaTest", "ps_5_1");
-	vsFullscreen_ = sm.Compile("scene_post.hlsl", "VSFullscreen", "vs_5_1");
-	psDecal_ = sm.Compile("scene_forward.hlsl", "PSBlobDecal", "ps_5_1");
+	// (shader model 6.5 through DXC: inline ray tracing. A device without DXR 1.1 gets shaders whose rays hit nothing.)
+	raysSupported_ = SceneBvh::Supported(device_);
+	const char* rays = raysSupported_ ? nullptr : "AE_NO_RAYS";
+	vsMain_ = sm.Compile("scene_forward.hlsl", "VSMain", "vs_6_5", rays);
+	vsShadow_ = sm.Compile("scene_forward.hlsl", "VSShadow", "vs_6_5", rays);
+	psForward_ = sm.Compile("scene_forward.hlsl", "PSForward", "ps_6_5", rays);
+	psDepthAlpha_ = sm.Compile("scene_forward.hlsl", "PSDepthAlphaTest", "ps_6_5", rays);
+	psShadowAlpha_ = sm.Compile("scene_forward.hlsl", "PSShadowAlphaTest", "ps_6_5", rays);
+	vsFullscreen_ = sm.Compile("scene_post.hlsl", "VSFullscreen", "vs_6_5", rays);
+	psDecal_ = sm.Compile("scene_forward.hlsl", "PSBlobDecal", "ps_6_5", rays);
 	// (the particle shaders are not a reason to stop the scene: without them there are no particles)
-	vsParticle_ = sm.Compile("scene_particles.hlsl", "VSParticle", "vs_5_1");
-	psParticle_ = sm.Compile("scene_particles.hlsl", "PSParticle", "ps_5_1");
+	vsParticle_ = sm.Compile("scene_particles.hlsl", "VSParticle", "vs_6_5", rays);
+	psParticle_ = sm.Compile("scene_particles.hlsl", "PSParticle", "ps_6_5", rays);
 	particlePipeline_.Reset();
 	smokePipeline_.Reset();
 	particlePipelineFailed_ = false;
@@ -276,7 +280,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	failedShaders_ = !vsMain_ || !vsShadow_ || !psForward_ || !psDepthAlpha_ || !psShadowAlpha_ || !vsFullscreen_ || !psDecal_;
 	static_assert(_countof(kFullscreenEntry) == kFullscreenKindCount, "one entry point per full screen pass");
 	for (int k = 0; k < kFullscreenKindCount; ++k) {
-		psFullscreen_[k] = sm.Compile("scene_post.hlsl", kFullscreenEntry[k], "ps_5_1");
+		psFullscreen_[k] = sm.Compile("scene_post.hlsl", kFullscreenEntry[k], "ps_6_5", rays);
 		failedShaders_ |= !psFullscreen_[k];
 	}
 	if (failedShaders_) {
@@ -290,20 +294,20 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 		D3D12_DESCRIPTOR_RANGE globalsRange[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 2, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 9, 0, 4, 4}}; // (space4 t4..t6: the reflection probes)
 		D3D12_DESCRIPTOR_RANGE postRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kPostTableSize, 4, 2, 0};
 		D3D12_DESCRIPTOR_RANGE probesRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kMaxProbes, 0, 3, 0}; // space3: reflection probe cubes
-		D3D12_ROOT_PARAMETER params[18] = {};
+		D3D12_ROOT_PARAMETER params[17] = {};
 		// space5: every texture in the SRV heap, by its index there (a ray's hit reads the base texture of whatever
 		// material it landed on: there is no telling which beforehand)
 		static const D3D12_DESCRIPTOR_RANGE allTexturesRange = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GpuResources::kSrvHeapSize, 0, 5, 0};
-		params[17].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[17].DescriptorTable = {1, &allTexturesRange};
-		params[17].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		params[16].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t10: the ray instances' materials
-		params[16].Descriptor = {10, 0};
+		params[16].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[16].DescriptorTable = {1, &allTexturesRange};
 		params[16].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-		// t6..t9: the ray tracing buffers (pooled nodes, pooled triangles, this frame's instance tree, its instances)
-		for (UINT i = 0; i < 4; ++i) {
+		params[15].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t10: the ray instances' materials
+		params[15].Descriptor = {10, 0};
+		params[15].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		// t7..t9: the rays' triangles, the frame's top level acceleration structure, its instances
+		for (UINT i = 0; i < 3; ++i) {
 			params[12 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-			params[12 + i].Descriptor = {6 + i, 0};
+			params[12 + i].Descriptor = {7 + i, 0};
 			params[12 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		}
 		params[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t5: the instance map
@@ -612,7 +616,6 @@ ID3D12PipelineState* SceneRenderer::ParticlePipeline(bool smokeTarget) {
 }
 
 ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI_FORMAT format) {
-	const bool composite = kind == kFullscreenComposite;
 	const bool sky = kind == kFullscreenSky;
 	const uint32_t key = (uint32_t(kind) << 16) | uint32_t(format);
 	auto it = fullscreenPipelines_.find(key);
@@ -1309,6 +1312,10 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	const Mat4 view = Mat4::From(f.view);
 	Mat4 proj = Mat4::From(f.proj);
 	const Mat4 cleanViewProj = proj * view;
+	nrdViewPrev_ = nrdView_;
+	nrdProjPrev_ = nrdProj_;
+	nrdView_ = view;
+	nrdProj_ = proj; // (before the jitter below)
 	// ---- post-processing as the host has it (frame), where Aether's own switches allow it
 	// (Aether's own switch: which antialiasing the game's graphics menu is set to is not looked at)
 	taa_ = settings.antialiasing;
@@ -1426,6 +1433,7 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.postParams[3] = taa_ ? 1.0f : 0.0f;
 	const Mat4 viewProj = proj * view;
 	const Mat4 invViewProj = Inverse(viewProj);
+	invViewProj_ = invViewProj;
 	memcpy(fc.view, view.m, 64);
 	memcpy(fc.proj, proj.m, 64);
 	memcpy(fc.viewProj, viewProj.m, 64);
@@ -1788,12 +1796,11 @@ void SceneRenderer::BindCommon(ID3D12GraphicsCommandList* list, bool globals) {
 	list->SetGraphicsRootShaderResourceView(11, instanceMapVa_);
 	// (always something valid in the slots: only passes that run when bvhReady_ read them)
 	SceneBvh& bvh = SceneBvh::Get();
-	list->SetGraphicsRootShaderResourceView(12, bvhReady_ ? bvh.NodesVa() : instancesVa_);
-	list->SetGraphicsRootShaderResourceView(13, bvhReady_ ? bvh.TrisVa() : instancesVa_);
-	list->SetGraphicsRootShaderResourceView(14, bvhReady_ ? bvh.TlasNodesVa() : instancesVa_);
-	list->SetGraphicsRootShaderResourceView(15, bvhReady_ ? bvh.TlasInstancesVa() : instancesVa_);
-	list->SetGraphicsRootShaderResourceView(16, bvhReady_ && rayMaterialsVa_ ? rayMaterialsVa_ : instancesVa_);
-	list->SetGraphicsRootDescriptorTable(17, gpu.SrvGpu(0));
+	list->SetGraphicsRootShaderResourceView(12, bvhReady_ ? bvh.TrisVa() : instancesVa_);
+	list->SetGraphicsRootShaderResourceView(13, bvhReady_ ? bvh.TlasVa() : instancesVa_);
+	list->SetGraphicsRootShaderResourceView(14, bvhReady_ ? bvh.InstancesVa() : instancesVa_);
+	list->SetGraphicsRootShaderResourceView(15, bvhReady_ && rayMaterialsVa_ ? rayMaterialsVa_ : instancesVa_);
+	list->SetGraphicsRootDescriptorTable(16, gpu.SrvGpu(0));
 	if (globals) {
 		list->SetGraphicsRootDescriptorTable(8, gpu.SrvGpu(globalsTable_));
 		list->SetGraphicsRootDescriptorTable(10, gpu.SrvGpu(probesTable_));
@@ -2004,13 +2011,14 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	}
 	// ---- ray tracing: the trees that arrived; the tree over this frame's instances is filled while the draw lists are
 	// built (the same walk over the instances) and built after it
-	raysWanted_ = settings.rayTracedReflections || settings.probeGi || settings.debugView == "bvh" || settings.debugView == "bvhCost";
+	raysWanted_ = settings.rayTracedReflections || settings.probeGi || settings.debugView == "bvh";
 	SceneBvh::Get().BeginFrame(device_, list, retireFence, frame);
 	SceneBvh::Get().BeginInstances();
-	raysWanted_ = raysWanted_ && SceneBvh::Get().HasTrees();
+	raysWanted_ = raysWanted_ && SceneBvh::Get().HasGeometry() && raysSupported_;
 	BuildDrawLists(scene, frame);
-	bvhReady_ = raysWanted_ && SceneBvh::Get().EndInstances();
+	bvhReady_ = raysWanted_ && SceneBvh::Get().EndInstances(device_, list, retireFence);
 	rayReflections_ = bvhReady_ && settings.rayTracedReflections;
+	nrdFrame_ = rayReflections_ && settings.reflectionDenoiser == "nrd" && ReflectionDenoiser::Available();
 	BuildCascades(scene, settings);
 	BuildClusters(scene);
 	if (!UploadFrameData(scene, target, settings)) {
@@ -2317,7 +2325,10 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		const RenderGraph::ResourceId before = screenReflections ? graph_.Import(history_[historyIndex_]) : RenderGraph::kInvalid;
 		// The rays are traced for one pixel of every 2 x 2 (a different one each frame, so that the temporal antialiasing
 		// gathers all four): a quarter of the rays. The reflection pass lays them over the full picture by depth.
-		const float rayOffset[4] = {float(frame & 1), float((frame >> 1) & 1), 0, 0};
+		// NRD's target for this size first: without it the rays are traced the way the reflection pass reads them directly
+		const std::shared_ptr<GpuTexture> denoisedTexture = rayReflections_ && nrdFrame_ ? ReflectionDenoiser::Get().Prepare(device_, target.width, target.height, retireFence, frame) : nullptr;
+		// z: 1 = the rays sample the surface's lobe and return their hit distance in a (for NRD), w: a number that changes every frame (their random sequence)
+		const float rayOffset[4] = {float(frame & 1), float((frame >> 1) & 1), denoisedTexture ? 1.0f : 0.0f, float(frame % 65536)};
 		RenderGraph::ResourceId rays = RenderGraph::kInvalid;
 		if (rayReflections_) {
 			GpuTextureDesc rayDesc = colorDesc;
@@ -2335,6 +2346,31 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 			}, [&, depth, surface, before, rays, rayOffset](RenderGraph::PassContext& ctx) {
 				Fullscreen(ctx, kFullscreenRayTrace, ctx.Texture(rays), before != RenderGraph::kInvalid ? ctx.Texture(before) : nullptr, ctx.Texture(depth), ctx.Texture(surface), rayOffset);
 			});
+			// ---- NRD: the noisy rays denoised (at the rays' resolution), in the same layout for the reflection pass
+			if (denoisedTexture) {
+				const RenderGraph::ResourceId denoised = graph_.Import(denoisedTexture);
+				const RenderGraph::ResourceId noisy = rays;
+				graph_.AddPass("ReflectionDenoise", true, [&, depth, surface, velocity, noisy, denoised](RenderGraph::Builder& b) {
+					b.Read(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+					b.Read(surface, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+					b.Read(velocity, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+					b.Read(noisy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+					b.Write(denoised, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+				}, [&, depth, surface, velocity, noisy, denoised](RenderGraph::PassContext& ctx) {
+					ReflectionDenoiser::Frame f;
+					f.worldToView = nrdView_.m;
+					f.viewToClip = nrdProj_.m;
+					f.worldToViewPrev = nrdViewPrev_.m;
+					f.viewToClipPrev = nrdProjPrev_.m;
+					f.invViewProj = invViewProj_.m;
+					f.width = target.width;
+					f.height = target.height;
+					f.restart = !historyValid_;
+					ReflectionDenoiser::Get().Record(ctx.list, f, *ctx.Texture(depth), *ctx.Texture(surface), *ctx.Texture(velocity), *ctx.Texture(noisy), *ctx.Texture(denoised), ctx.note);
+					ctx.dispatches = 1;
+				});
+				rays = denoised;
+			}
 		}
 		graph_.AddPass("Reflections", true, [&, color, depth, surface, before, rays](RenderGraph::Builder& b) {
 			if (before != RenderGraph::kInvalid) {
@@ -2349,7 +2385,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		}, [&, color, depth, surface, before, rays, rayOffset](RenderGraph::PassContext& ctx) {
 			Fullscreen(ctx, kFullscreenSsr, ctx.Texture(color), before != RenderGraph::kInvalid ? ctx.Texture(before) : nullptr, ctx.Texture(depth), ctx.Texture(surface), rayOffset,
 				rays != RenderGraph::kInvalid ? ctx.Texture(rays) : nullptr);
-			ctx.note = rayReflections_ ? (screenReflections ? "screen, then rays" : "rays") : "screen";
+			ctx.note = !rayReflections_ ? "screen" : nrdFrame_ ? "rays, denoised by NRD (mirrors: a ray per pixel)" : screenReflections ? "screen, then rays (mirrors: a ray per pixel)" : "rays";
 		});
 	}
 	// ---- the clouds as the camera sees them: marched at half resolution, laid over the sky by the sky pass
@@ -2583,9 +2619,9 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		ctx.note = Format("%u particles in %u batches", particlesDrawn_, uint32_t(particleBatches_.size()));
 	});
 	// ---- debug views of the ray tracing structure: the scene as rays from the camera find it (its geometry, or what each ray cost)
-	const bool bvhView = settings.debugView == "bvh" || settings.debugView == "bvhCost";
+	const bool bvhView = settings.debugView == "bvh";
 	graph_.AddPass("BvhDebug", bvhView && bvhReady_, [&, color](RenderGraph::Builder& b) { b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET); }, [&, color](RenderGraph::PassContext& ctx) {
-		const float params[4] = {settings.debugView == "bvhCost" ? 1.0f : 0.0f, 0, 0, 0};
+		const float params[4] = {0, 0, 0, 0};
 		Fullscreen(ctx, kFullscreenBvhDebug, ctx.Texture(color), nullptr, nullptr, nullptr, params);
 	});
 	// ---- post-processing. `post` is the picture as it stands; every step that runs replaces it.
@@ -2929,6 +2965,8 @@ void SceneRenderer::Release(bool leak) {
 	probeCameraValid_ = false;
 	SceneBvh::Get().Release(leak);
 	bvhReady_ = false;
+	nrdFrame_ = false;
+	ReflectionDenoiser::Get().Release(retireFence_, leak);
 	reflectionDepth_.reset();
 	probeGlobalsTable_ = UINT32_MAX;
 	atmosphereLutsValid_ = false;

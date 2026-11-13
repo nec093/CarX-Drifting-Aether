@@ -5,6 +5,7 @@
 # -Loader BepInEx (default): BepInEx 5 must be installed in the game folder (docs/development/build.md).
 #   BepInEx\plugins\Aether\Aether.dll               the plugin (no signing)
 #   BepInEx\plugins\Aether\native\AetherNative.dll  the native runtime (the plugin copies it to <Game>_Data\Plugins\x86_64 on start)
+#   BepInEx\plugins\Aether\native\dxcompiler.dll, dxil.dll  DXC for the DXR shaders (the Windows SDK's redistributables)
 #   BepInEx\plugins\Aether\shaders\*.hlsl, hdrp\aether_hdrp_dx12.bundle
 #   Settings: BepInEx\config\Aether. A copy of Aether left in kino\mods (KSL) is removed so that it cannot start twice.
 # -Loader Ksl: kino\mods\Aether.ksm (signed by tools\maykr.exe with the build key, else the raw Aether.dll) and
@@ -58,6 +59,11 @@ New-Item -ItemType Directory -Force (Join-Path $modData 'shaders'), $nativeDir |
 Copy-Item -Force $native $nativeDir
 $pdb = [System.IO.Path]::ChangeExtension($native, '.pdb')
 if (Test-Path $pdb) { Copy-Item -Force $pdb $nativeDir }
+# DXC (copied beside the build by CMake): without it the DXR option traces with the shader walk
+foreach ($dxc in 'dxcompiler.dll', 'dxil.dll') {
+	$from = Join-Path (Split-Path $native) $dxc
+	if (Test-Path $from) { Copy-Item -Force $from $nativeDir } else { Write-Host "note: $dxc not in the build folder: DXR shaders will not compile" }
+}
 Copy-Item -Force (Join-Path $repo 'shaders\*') (Join-Path $modData 'shaders')
 # HDRP's compute shaders for DX12 (scripts\build-hdrp-bundle.ps1): without them the game's own renderer shows nothing on DX12
 $bundle = Join-Path $repo 'build\unity\aether_hdrp_dx12.bundle'

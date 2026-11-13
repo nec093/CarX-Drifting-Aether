@@ -59,7 +59,7 @@ Aether.MCP.exe（C#、src/Aether.MCP）──┘   stdio の MCP ⇔ パイプ�
 | `Renderer/` | `Renderer`（イベントごとのコマンドリスト、完了の判定、タイムスタンプ、キャプチャ）、`SceneRenderer`、`RenderGraph`、`GpuTimer`、`Bvh`、`Smoke`、`Png`（[renderer.md](renderer.md)） |
 | `Resources/` | `GpuResources`（ディスクリプター、テクスチャー、アップロードアリーナ、退役）、`ResourceRegistry`（Aether が作った全リソースの台帳）（[gpu-resources.md](gpu-resources.md)） |
 | `Scene/SceneStore.cpp` | C# から届いたシーンの記述を保持し、描画スレッドで適用する（[scene-data-contract.md](scene-data-contract.md)） |
-| `Shaders/ShaderManager.cpp` | `shaders/*.hlsl` を `D3DCompile`（シェーダーモデル 5.1）でコンパイル。エラーはデータとして残し、再読み込みできる |
+| `Shaders/ShaderManager.cpp` | `shaders/*.hlsl` を DXC（シェーダーモデル 6.5、HLSL 2018）でコンパイル。エラーはデータとして残し、再読み込みできる |
 | `ImGui/Overlay.cpp` | Dear ImGui のオーバーレイ（設定、統計、VRAM、シェーダー、ログ、承認ダイアログ） |
 | `Profiler/` | フレームの CPU / GPU 時間、パスごとの時間、Unity の統計、ベンチマーク |
 | `Core/` | 構造化ログ、設定（値、スキーマ、検証を `Config.cpp` の 1 か所に持つ）、`DevOptions`（実験用スイッチ） |

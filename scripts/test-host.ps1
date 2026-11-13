@@ -4,7 +4,7 @@
 #      captures checked pixel by pixel (where things are, what is in front, which side of a face is drawn, a mirrored
 #      instance, shadows, blending, the diagnostic material, a scene unload and reload).
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-host.ps1 [-Config RelWithDebInfo] [-Seconds 25] [-Warp] [-Show] [-Keep] [-SceneOnly]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-host.ps1 [-Config RelWithDebInfo] [-Seconds 25] [-Warp] [-Show] [-Keep] [-SceneOnly] [-ReflectionDenoiser nrd|off]
 #
 # Passes when both runs print HOST OK (no D3D12 errors, no Aether errors, no leaked device objects) and every pixel
 # check holds. -Show: visible, focused windows. -Keep: keep the data folders (logs, captures) and print where they are.
@@ -14,7 +14,8 @@ param(
 	[switch]$Warp,
 	[switch]$Show,
 	[switch]$Keep,
-	[switch]$SceneOnly
+	[switch]$SceneOnly,
+	[ValidateSet('', 'off', 'nrd')][string]$ReflectionDenoiser = ''
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -60,6 +61,12 @@ if (-not $SceneOnly) {
 # ---------------------------------------------------------------- 2. scene path
 Write-Host 'scene path (validation scene through the scene data contract)'
 $data = New-Data 'scene'
+$hostSettings = @{}
+if ($ReflectionDenoiser) { $hostSettings.reflectionDenoiser = $ReflectionDenoiser } # (off: the reflection rays without NRD; the same checks must hold)
+if ($hostSettings.Count -gt 0) {
+	New-Item -ItemType Directory -Force (Join-Path $data 'config') | Out-Null
+	$hostSettings | ConvertTo-Json | Set-Content -Encoding ascii (Join-Path $data 'config\aether.json')
+}
 $hostArgs = @('--data', $data, '--seconds', $Seconds, '--scene')
 if (-not $Show) { $hostArgs += '--hidden' }
 if ($Warp) { $hostArgs += '--warp' }
@@ -103,7 +110,9 @@ if ($code -eq 0) {
 	Check 'scene store: 8 instances, 1 mesh, 8 materials, no contract errors' ($stats.instances.registered -eq 8 -and $stats.meshes.count -eq 1 -and $stats.materials.count -eq 8 -and $stats.contractErrors -eq 0) ($stats | ConvertTo-Json -Compress -Depth 4)
 	Check 'scene store: destroys and the scene clear were applied' ($stats.commands.destroys -ge 1 -and $stats.commands.sceneClears -eq 1)
 	$gpu = ($out | Where-Object { $_ -match '^gpu resources: ' }) -replace '^gpu resources: ', '' | ConvertFrom-Json
-	Check "GPU resource manager: retirements done ($($gpu.objectsRetired) objects, $($gpu.pendingRetirements) pending), descriptors $($gpu.descriptors.srvUsed) / peak $($gpu.descriptors.srvPeak)" ($gpu.objectsRetired -gt 0 -and $gpu.pendingRetirements -lt 20 -and $gpu.descriptors.srvUsed -lt 400)
+	# (NRD, on by default, keeps 4096 descriptors for its dispatches' tables and two views on each of its about twenty textures)
+	$descriptorLimit = if ($ReflectionDenoiser -ne 'off') { 400 + 4096 + 64 } else { 400 }
+	Check "GPU resource manager: retirements done ($($gpu.objectsRetired) objects, $($gpu.pendingRetirements) pending), descriptors $($gpu.descriptors.srvUsed) / peak $($gpu.descriptors.srvPeak)" ($gpu.objectsRetired -gt 0 -and $gpu.pendingRetirements -lt 20 -and $gpu.descriptors.srvUsed -lt $descriptorLimit)
 }
 if ($Keep) { Write-Host "  data: $data" } else { Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue }
 

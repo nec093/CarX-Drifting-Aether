@@ -122,7 +122,7 @@ try {
 	Set-Content -Encoding ascii $shader ($good -replace 'return float4\(input.color, 1.0\);', 'return float4(input.colour, 1.0);')
 	$r = Call $mcp 'reload_shader'
 	# both entry points live in the broken file: two failed shaders
-	Check 'reload_shader reports the compile error' (-not $r.isError -and $r.structuredContent.errorCount -eq 2 -and $r.structuredContent.errors[0].compilerOutput -match "error X3018: invalid subscript 'colour'") ($r.content[0].text)
+	Check 'reload_shader reports the compile error' (-not $r.isError -and $r.structuredContent.errorCount -eq 2 -and $r.structuredContent.errors[0].compilerOutput -match "error: no member named 'colour'") ($r.content[0].text)
 	$st = Call $mcp 'get_status'
 	Check 'a shader error does not stop the renderer' ($st.structuredContent.renderer.state -eq 'ready')
 	Set-Content -Encoding ascii $shader $good

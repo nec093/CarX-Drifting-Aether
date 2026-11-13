@@ -104,14 +104,14 @@ public static class ToolCatalog {
 			Control: true, TimeoutSeconds: ControlTimeout),
 
 		new("set_graphics_option",
-			"[control] Sets one of Aether's own graphics options (the ones in the overlay's Settings tab): skyMode (physical | scene), timeOfDay (hours), sunHeading (degrees), shadowSoftness, motionBlurStrength, bloomStrength, smokeOpacity, lodBias, anisotropicLevel, vsync, exposureEV, tonemap. get_settings shows the values and their ranges. Needs --allow-control and the game's permission.",
+			"[control] Sets one of Aether's own graphics options (the ones in the overlay's Settings tab): skyMode (physical | scene), timeOfDay (hours), sunHeading (degrees), shadowSoftness, motionBlurStrength, bloomStrength, smokeOpacity, lodBias, anisotropicLevel, vsync, exposureEV, tonemap, reflectionDenoiser (nrd | off). get_settings shows the values and their ranges. Needs --allow-control and the game's permission.",
 			"""{"type":"object","properties":{"option":{"type":"string","description":"The option's name, e.g. timeOfDay."},"value":{"type":["number","string"],"description":"The new value."}},"required":["option","value"],"additionalProperties":false}""",
 			"""{"type":"object","properties":{"option":{"type":"string"},"value":{"type":["number","string"]}},"required":["option","value"]}""",
 			Control: true, TimeoutSeconds: ControlTimeout),
 
 		new("set_render_mode",
 			"[control] Chooses who draws the scene: aether (Aether is the game's render pipeline: the game's own pipeline is not created; the UI stays on top), hdrp (the game's own renderer, for reference pictures and measurements), compare (left half HDRP, right half Aether). Optionally a debug view of Aether's renderer. Needs --allow-control and the game's permission.",
-			"""{"type":"object","properties":{"mode":{"type":"string","enum":["hdrp","aether","compare","standalone"]},"debugView":{"type":"string","enum":["none","albedo","normal","roughness","metallic","depth","lighting","shadow","materialClass","sun","ambient","reflection","bvh","bvhCost"]}},"additionalProperties":false}""",
+			"""{"type":"object","properties":{"mode":{"type":"string","enum":["hdrp","aether","compare","standalone"]},"debugView":{"type":"string","enum":["none","albedo","normal","roughness","metallic","depth","lighting","shadow","materialClass","sun","ambient","reflection","bvh"]}},"additionalProperties":false}""",
 			"""{"type":"object","properties":{"mode":{"type":"string"},"debugView":{"type":"string"},"note":{"type":"string"}},"required":["mode","debugView"]}""",
 			Control: true, TimeoutSeconds: ControlTimeout),
 
