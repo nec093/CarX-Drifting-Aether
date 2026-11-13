@@ -10,7 +10,7 @@
 #define AETHER_API extern "C" __declspec(dllimport)
 #endif
 
-#define AETHER_API_VERSION 6
+#define AETHER_API_VERSION 7
 
 // Render events for GL.IssuePluginEvent(Aether_GetRenderEventFunc(), id)
 #define AETHER_EVENT_FRAME_BEGIN 1 // first thing in the frame (GPU timestamp)
@@ -91,6 +91,9 @@ AETHER_API void Aether_SceneMeshForget(AeHandle mesh);
 AETHER_API void Aether_SceneBvhReset(void);
 // The game's own day / night switch as the managed side finds it: 1 night, 0 day or unknown.
 AETHER_API void Aether_SetSceneNight(int night);
+// The tyre smoke's motion (Renderer/Smoke.cpp): one step for `count` puffs in place, the puffs left as quads in `out`.
+struct AeParticle;
+AETHER_API int Aether_SmokeStep(void* puffs, int count, const void* wheels, int wheelCount, const void* bodies, int bodyCount, float dt, float time, const float* wind, float opacity, struct AeParticle* out);
 AETHER_API int Aether_GetRenderMode(void);
 // Experiment switches for the scene capture (Core/DevOptions.h); 0 in normal operation.
 AETHER_API int Aether_DevCaptureFlags();

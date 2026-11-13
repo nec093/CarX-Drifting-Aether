@@ -41,6 +41,8 @@ public:
 	// ---- any thread
 	json Stats();
 	void SetSceneNight(bool night) { sceneNight_.store(night); }
+	// (towards the sun or the moon, as the last frame had it; read without a lock: a torn read is three old or new floats)
+	Vec3 SunDirection() const { return sunDirection_; }
 	json GraphDescription() { return graph_.Describe(); }
 
 private:
@@ -67,7 +69,7 @@ private:
 	void UploadDefaults(ID3D12GraphicsCommandList* list);
 	ID3D12PipelineState* Pipeline(uint32_t layoutId, PassKind kind, uint32_t cull);
 	// full screen passes: one pixel shader each (scene_post.hlsl), named in kFullscreenEntry (SceneRenderer.cpp)
-	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenGiRays, kFullscreenGiIrradiance, kFullscreenGiDepth, kFullscreenKindCount };
+	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenGiRays, kFullscreenGiIrradiance, kFullscreenGiDepth, kFullscreenLensFlare, kFullscreenSmokeApply, kFullscreenKindCount };
 	// draws a full screen pass into `output` (its whole size) with up to three inputs; `params` reach the shader as g_PassParams
 	bool Fullscreen(RenderGraph::PassContext& ctx, FullscreenKind kind, GpuTexture* output, GpuTexture* in0, GpuTexture* in1 = nullptr, GpuTexture* in2 = nullptr, const float* params = nullptr, GpuTexture* in3 = nullptr);
 	uint32_t postNext_ = 0; // the next free table of this frame's post tables
@@ -127,6 +129,8 @@ private:
 	// probe grid GI: this frame's rays, the probes' irradiance and their distances (each probe a tile of 8 x 8)
 	std::shared_ptr<GpuTexture> giRays_, giIrradiance_, giDepth_;
 	bool gi_ = false, giHistory_ = false;
+	bool lensFlare_ = false;
+	float lensFlareStrength_ = 0.0f;
 	int giMin_[3] = {0, 0, 0}; // the grid cell of the volume's lowest corner
 	bool bvhReady_ = false;      // this frame: rays can be traced through the scene's triangles (Bvh.h)
 	bool raysWanted_ = false;    // this frame: something traces rays (reflections, a debug view)
@@ -163,13 +167,13 @@ private:
 	ComPtr<ID3D12RootSignature> root_;
 	ComPtr<ID3DBlob> vsMain_, vsShadow_, psForward_, psDepthAlpha_, psShadowAlpha_, vsFullscreen_, psDecal_, vsParticle_, psParticle_;
 	// particles: this frame's quads (sorted, uploaded as a buffer the vertex shader reads) and their batches
-	ComPtr<ID3D12PipelineState> particlePipeline_;
+	ComPtr<ID3D12PipelineState> particlePipeline_, smokePipeline_; // (smoke: into its own target at half size)
 	bool particlePipelineFailed_ = false;
 	std::vector<AeParticle> particleData_;
 	std::vector<AeParticleBatch> particleBatches_;
 	D3D12_GPU_VIRTUAL_ADDRESS particlesVa_ = 0;
 	uint32_t particlesDrawn_ = 0;
-	ID3D12PipelineState* ParticlePipeline();
+	ID3D12PipelineState* ParticlePipeline(bool smokeTarget = false);
 	ComPtr<ID3DBlob> psFullscreen_[kFullscreenKindCount];
 	std::map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines_;
 	std::map<uint32_t, ComPtr<ID3D12PipelineState>> fullscreenPipelines_;

@@ -744,7 +744,8 @@ float4 PSAmbientOcclusion(FullscreenOutput input) : SV_Target {
 	P *= 0.99999;
 
 	// the radius in world units and on screen; on screen it is capped (cost, and cache misses on the depth buffer)
-	const float kMaxPixels = 64.0;
+	// (64 at 1080 lines, up to 90 on larger pictures: the full 122 at 2160 lines took the pass from 1.6 to 2.25 ms)
+	const float kMaxPixels = 64.0 * clamp(g_ScreenSize.y / 1080.0, 1.0, 1.4);
 	float pixelSize = viewDepth * 2.0 / (g_Proj[1][1] * g_ScreenSize.y); // one pixel at this depth, in metres
 	float effectRadius = min(g_AOParams.y, kMaxPixels * pixelSize);
 	float screenRadius = effectRadius / pixelSize;
@@ -823,7 +824,8 @@ float4 PSAmbientOcclusion(FullscreenOutput input) : SV_Target {
 	visibility = max(visibility, 0.03);
 	// the scene's own strength setting decides how much of the occlusion shows
 	// (bounced: the horizons' rises add up to at most 2 per slice; as light per unit of the sky's light, like the irradiance map)
-	return float4(bounced / float(kSlices), lerp(1.0, visibility, saturate(g_AOParams.x)));
+	// Aether's strength setting: up to 1 how much of the occlusion shows, above 1 darker than measured
+	return float4(bounced / float(kSlices), g_AOParams.x <= 1.0 ? lerp(1.0, visibility, saturate(g_AOParams.x)) : pow(visibility, g_AOParams.x));
 }
 
 // 4 x 4 box over the noise pattern, weighted by how close each sample's depth is to the centre's.
@@ -948,6 +950,8 @@ float4 PSComposite(FullscreenOutput input) : SV_Target {
 			float3 bloom = g_PostAux2.SampleLevel(s_LinearClamp, input.uv, 0.0).rgb;
 			color = lerp(color, bloom, g_PostParams.x);
 		}
+		// the lens flare (PSLensFlare; nothing bound: black)
+		color += g_PostDepth.SampleLevel(s_LinearClamp, input.uv, 0.0).rgb;
 		color *= exposure * g_Exposure.z;
 		// the host's shadows / midtones / highlights grading (before the tone curve, like the host)
 		if (g_SmhLimits.y > 0.0 || g_SmhLimits.w > 0.0) {
@@ -1106,4 +1110,87 @@ float4 PSGiDepth(FullscreenOutput input) : SV_Target {
 	}
 	float far = min(g_SceneColor.Load(int3(p, 0)).a, 1.5 * length(g_GiParams.xyx));
 	return float4(far, far * far, 0.0, GiFresh(cell) ? 1.0 : 0.1);
+}
+
+// ---- lens flare: what the glass of a camera's lens adds to a picture with something very bright in it. Light
+// reflected between the lens's surfaces lands again as "ghosts": dim, coloured copies on the line through the middle
+// of the picture, on the other side of it; as a halo; and as rays round the bright thing (the aperture's blades).
+// g_SceneColor: the picture at an eighth of its size (a bloom level), g_PostDepth: the scene's depth,
+// g_PostAux: the exposure. g_PassParams.x: strength. The result is added to the picture by the composite.
+float3 FlareBright(float2 uv, float exposure) {
+	if (any(uv < 0.0) || any(uv > 1.0)) {
+		return 0.0;
+	}
+	float3 c = g_SceneColor.SampleLevel(s_LinearClamp, uv, 0.0).rgb;
+	// (only what is far brighter than the picture's middle grey: lamps, the sun, glints)
+	float l = Luma(c) * exposure;
+	float2 fromCentre = uv - 0.5;
+	// (and no more than 30 times it: the sun's own picture is far above that, and its ghost was a white blob)
+	return c * (saturate((l - 6.0) / max(l, 1e-4)) * min(1.0, 30.0 / max(l, 1e-4)) * (1.0 - smoothstep(0.3, 0.5, length(fromCentre))));
+}
+
+float FlareDisc(float2 p, float2 centre, float radius) {
+	float d = length(p - centre) / radius;
+	// (a ghost is the aperture's picture: even, a little brighter at its rim, soft at the edge)
+	return smoothstep(1.0, 0.85, d) * (0.55 + 0.45 * d * d);
+}
+
+float4 PSLensFlare(FullscreenOutput input) : SV_Target {
+	float2 uv = input.uv;
+	float aspect = g_ScreenSize.x * g_ScreenSize.w;
+	float exposure = (g_Exposure.y > 1.5 ? g_PostAux.Load(int3(0, 0, 0)).r : g_Exposure.x) * g_Exposure.z;
+	float3 flare = 0.0;
+	// ghosts of whatever is bright in the picture: the picture turned about its middle, at a few sizes, each tinted
+	float2 flipped = 1.0 - uv;
+	float2 toCentre = 0.5 - flipped;
+	flare += FlareBright(flipped + toCentre * 0.35, exposure) * float3(0.9, 0.7, 0.5);
+	flare += FlareBright(flipped + toCentre * 0.8, exposure) * float3(0.5, 0.8, 1.0) * 0.7;
+	flare += FlareBright(flipped + toCentre * 1.4, exposure) * float3(0.6, 1.0, 0.7) * 0.5;
+	flare += FlareBright(uv + (0.5 - uv) * 0.5, exposure) * float3(0.8, 0.6, 1.0) * 0.4;
+	// the halo: the picture pushed out from the middle by a fixed distance
+	float2 out2 = normalize(toCentre * float2(aspect, 1.0) + 1e-5) * float2(1.0 / aspect, 1.0) * 0.4;
+	flare += FlareBright(flipped + out2, exposure) * float3(1.0, 0.85, 0.7) * 0.5;
+	flare *= 0.015;
+
+	// the sun (or the moon): its place is known, so its flare is drawn and not gathered from the picture
+	if (g_SunDirection.w > 0.5) {
+		float4 clip = mul(g_ViewProj, float4(g_CameraPos.xyz + g_SunDirection.xyz * 500.0, 1.0));
+		if (clip.w > 0.0) {
+			float2 sun = clip.xy / clip.w * float2(0.5, -0.5) + 0.5;
+			// how much of it shows: the sky at a few places on its disc (nothing in front), and the clouds
+			float seen = 0.0;
+			for (int i = 0; i < 12; ++i) {
+				float a = float(i) * 2.39996, r = sqrt((float(i) + 0.5) / 12.0) * 0.008;
+				float2 q = sun + float2(cos(a) / aspect, sin(a)) * r;
+				if (all(q > 0.0) && all(q < 1.0)) {
+					seen += g_PostDepth.SampleLevel(s_PointClamp, q, 0.0).r <= 0.0 ? 1.0 : 0.0;
+				}
+			}
+			seen = seen / 12.0 * CloudShadow(g_CameraPos.xyz);
+			if (seen > 0.0) {
+				float2 p = (uv - 0.5) * float2(aspect, 1.0), s = (sun - 0.5) * float2(aspect, 1.0);
+				float3 f = 0.0;
+				f += FlareDisc(p, s * -0.35, 0.035) * float3(0.6, 0.8, 1.0) * 0.5;
+				f += FlareDisc(p, s * -0.62, 0.09) * float3(1.0, 0.7, 0.4) * 0.22;
+				f += FlareDisc(p, s * 0.45, 0.02) * float3(0.5, 1.0, 0.6) * 0.4;
+				f += FlareDisc(p, s * -1.15, 0.15) * float3(0.7, 0.6, 1.0) * 0.14;
+				f += FlareDisc(p, s * -1.6, 0.055) * float3(1.0, 0.9, 0.6) * 0.16;
+				float d = length(p - s);
+				// the halo: a thin ring, red outside and blue inside
+				f += float3(exp(-pow((d - 0.43) / 0.02, 2.0)), exp(-pow((d - 0.42) / 0.02, 2.0)), exp(-pow((d - 0.41) / 0.02, 2.0))) * 0.1;
+				// rays round it
+				float angle = atan2(p.y - s.y, p.x - s.x);
+				float rays = pow(abs(sin(angle * 7.0)), 10.0) * 0.6 + pow(abs(sin(angle * 3.0 + 1.3)), 24.0);
+				f += float3(1.0, 0.95, 0.85) * ((0.4 + rays) * exp(-d * 9.0) * 1.2);
+				// (the sun's light in scene units; a ghost is some hundredths of what a sunlit white wall sends)
+				flare += g_SunColor.rgb * f * (0.03 * seen);
+			}
+		}
+	}
+	return float4(flare * g_PassParams.x, 1.0);
+}
+
+// The tyre smoke, drawn at half size into a target of its own (scene_particles.hlsl), over the picture.
+float4 PSSmokeApply(FullscreenOutput input) : SV_Target {
+	return g_SceneColor.SampleLevel(s_LinearClamp, input.uv, 0.0);
 }

@@ -70,6 +70,7 @@ namespace Aether {
 			GameDx12Workarounds.Init(configDir);
 			GameDx12Workarounds.InitVideos(configDir);
 			DevCamera.Init(configDir);
+			ParticleCapture.ConfigDir = configDir;
 			ApplyWorkarounds();
 			string problem = Native.Prepare(dataDir, configDir, Host.GameRoot);
 			if (problem != null) {

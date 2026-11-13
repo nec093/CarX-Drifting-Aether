@@ -58,7 +58,7 @@ target_compile_options(aether_core PUBLIC /W4 /EHa /permissive- /utf-8 /wd4100 /
 target_link_libraries(aether_core PUBLIC aether_imgui d3d12 dxgi dxguid d3dcompiler windowscodecs ole32 user32 gdi32 dwmapi advapi32)
 
 # the game DLL
-add_library(AetherNative SHARED Device/UnityBridge.cpp)
+add_library(AetherNative SHARED Device/UnityBridge.cpp Renderer/Smoke.cpp)
 target_compile_definitions(AetherNative PRIVATE AETHER_NATIVE_EXPORTS)
 target_include_directories(AetherNative PRIVATE "${UNITY_PLUGIN_API_DIR}")
 target_link_libraries(AetherNative PRIVATE aether_core)

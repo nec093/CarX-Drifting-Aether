@@ -6,7 +6,7 @@ using System.Text;
 namespace Aether {
 	/// <summary>The C interface of AetherNative.dll (src/Aether.Native/include/AetherApi.h).</summary>
 	internal static class Native {
-		public const int ApiVersion = 6;
+		public const int ApiVersion = 7;
 		public const string Dll = "AetherNative";
 
 		public const int EventFrameBegin = 1;
@@ -58,6 +58,7 @@ namespace Aether {
 		[DllImport(Dll)] public static extern unsafe int Aether_SceneMeshIndices(uint mesh, void* data, uint bytes, uint indexStride, AeSubMesh* subMeshes, uint subMeshCount);
 		[DllImport(Dll)] public static extern void Aether_SceneBvhReset();
 		[DllImport(Dll)] public static extern void Aether_SetSceneNight(int night);
+		[DllImport(Dll)] public static extern unsafe int Aether_SmokeStep(void* puffs, int count, void* wheels, int wheelCount, void* bodies, int bodyCount, float dt, float time, UnityEngine.Vector3* wind, float opacity, AeParticle* quads);
 		[DllImport(Dll)] public static extern void Aether_SceneMeshChanging(uint mesh);
 		[DllImport(Dll)] public static extern void Aether_SceneMeshAlias(uint alias, uint mesh);
 		[DllImport(Dll)] public static extern void Aether_SceneMeshForget(uint mesh);

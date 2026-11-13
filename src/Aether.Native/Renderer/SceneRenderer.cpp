@@ -23,7 +23,7 @@ const uint32_t kPostTableSize = 4;    // per full screen pass: colour / main inp
 const float kExposureAdaptationRate = 2.0f; // per second: the automatic exposure covers 63 % of a change in half a second
 const uint32_t kPostTables = 64;     // 0..3: ambient occlusion, its blur, composite, exposure metering; the rest handed out per pass (Fullscreen)
 const uint32_t kIrradianceSize = 32;  // octahedral map of the sky's diffuse light
-const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace", "PSGiRays", "PSGiIrradiance", "PSGiDepth"};
+const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace", "PSGiRays", "PSGiIrradiance", "PSGiDepth", "PSLensFlare", "PSSmokeApply"};
 // reflection probes: each is six square tiles (3 x 2: +X -X +Y | -Y +Z -Z); the atlas holds them 4 x 2
 const uint32_t kProbeFace = 128, kProbeBlurFace = 32;
 const float kProbeCell = 12.0f;      // the grid's spacing on the ground (m)
@@ -270,6 +270,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 	vsParticle_ = sm.Compile("scene_particles.hlsl", "VSParticle", "vs_5_1");
 	psParticle_ = sm.Compile("scene_particles.hlsl", "PSParticle", "ps_5_1");
 	particlePipeline_.Reset();
+	smokePipeline_.Reset();
 	particlePipelineFailed_ = false;
 	atmosphereLutsValid_ = false; // (the LUT shaders may have changed)
 	failedShaders_ = !vsMain_ || !vsShadow_ || !psForward_ || !psDepthAlpha_ || !psShadowAlpha_ || !vsFullscreen_ || !psDecal_;
@@ -324,7 +325,7 @@ bool SceneRenderer::EnsureObjects(const HostGfx& host, uint64_t frame) {
 		params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 		params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 		params[8].DescriptorTable = {2, globalsRange};
-		params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL; // (the particles' vertex shader lights them: shadow atlas, GI probes)
 		params[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 		params[9].DescriptorTable = {1, &postRange};
 		params[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -570,9 +571,10 @@ ID3D12PipelineState* SceneRenderer::Pipeline(uint32_t layoutId, PassKind kind, u
 // Particles: quads made in the vertex shader from the particle buffer, blended over the picture with premultiplied
 // alpha (an additive particle returns alpha 0). No depth buffer bound: the pixel shader tests against the scene depth
 // itself, which also lets a quad fade out where it cuts into a surface.
-ID3D12PipelineState* SceneRenderer::ParticlePipeline() {
-	if (particlePipeline_ || particlePipelineFailed_ || !vsParticle_ || !psParticle_) {
-		return particlePipeline_.Get();
+ID3D12PipelineState* SceneRenderer::ParticlePipeline(bool smokeTarget) {
+	ComPtr<ID3D12PipelineState>& pipeline = smokeTarget ? smokePipeline_ : particlePipeline_;
+	if (pipeline || particlePipelineFailed_ || !vsParticle_ || !psParticle_) {
+		return pipeline.Get();
 	}
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
 	d.pRootSignature = root_.Get();
@@ -591,17 +593,22 @@ ID3D12PipelineState* SceneRenderer::ParticlePipeline() {
 	blend.SrcBlendAlpha = D3D12_BLEND_ZERO; // (the colour target's alpha is the temporal passes' mask: left as it is)
 	blend.DestBlendAlpha = D3D12_BLEND_ONE;
 	blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	if (smokeTarget) {
+		// (the smoke's own target: its alpha gathers how much of the picture the smoke covers)
+		blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+		blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+	}
 	d.NumRenderTargets = 1;
-	d.RTVFormats[0] = kSceneColorFormat;
+	d.RTVFormats[0] = smokeTarget ? DXGI_FORMAT_R16G16B16A16_FLOAT : kSceneColorFormat;
 	d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	d.SampleDesc.Count = 1;
-	HRESULT hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&particlePipeline_));
+	HRESULT hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pipeline));
 	if (FAILED(hr)) {
 		Log::Get().Write(Severity::Error, "SceneRenderer", "E_PIPELINE_STATE", "The particle pipeline state could not be created: no particles", {}, {{"hresult", HrToString(hr)}});
-		particlePipeline_.Reset();
+		pipeline.Reset();
 		particlePipelineFailed_ = true;
 	}
-	return particlePipeline_.Get();
+	return pipeline.Get();
 }
 
 ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI_FORMAT format) {
@@ -641,6 +648,17 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI
 		blend.BlendOp = D3D12_BLEND_OP_ADD;
 		blend.SrcBlendAlpha = D3D12_BLEND_ONE;
 		blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	}
+	if (kind == kFullscreenSmokeApply) {
+		// the smoke over the picture (premultiplied; a: how much of the picture it covers)
+		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
+		blend.BlendEnable = TRUE;
+		blend.SrcBlend = D3D12_BLEND_ONE;
+		blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+		blend.BlendOp = D3D12_BLEND_OP_ADD;
+		blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+		blend.DestBlendAlpha = D3D12_BLEND_ONE;
 		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 	}
 	if (kind == kFullscreenSsr) {
@@ -1296,6 +1314,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	taa_ = settings.antialiasing;
 	// (the host mixes the picture with its bloom pyramid by the control value itself: at 1 the picture is the pyramid)
 	bloomMix_ = settings.bloom && f.bloomIntensity > 0 ? std::min(f.bloomIntensity * settings.bloomStrength, 1.0f) : 0.0f;
+	lensFlare_ = settings.lensFlare && settings.lensFlareStrength > 0.0f && target.width >= 64 && target.height >= 64;
+	lensFlareStrength_ = settings.lensFlareStrength;
 	bloomScatter_ = 0.05f + 0.9f * std::min(std::max(f.bloomScatter, 0.0f), 1.0f);
 	motionBlur_ = settings.motionBlur ? std::max(f.motionBlurIntensity * settings.motionBlurStrength, 0.0f) : 0.0f;
 	if (f.cameraId != historyCamera_) {
@@ -1391,11 +1411,11 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		fc.giParams[0] = kGiSpacing;
 		fc.giParams[1] = kGiSpacingY;
 		fc.giParams[2] = float(frame_ % 4096);
-		fc.giParams[3] = float(punctualCount_);
 		giHistory_ = true;
 	} else {
 		giHistory_ = false;
 	}
+	fc.giParams[3] = float(punctualCount_); // (also read by the particles: with or without the probes)
 	indirect_ = settings.indirectLight && settings.ssao && taa_ && historyValid_;
 	fc.qualityParams[2] = indirect_ ? settings.indirectStrength : 0.0f;
 	memcpy(fc.prevViewProj, prevViewProj_.m, 64);
@@ -1422,9 +1442,10 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	for (size_t i = 0; i < cascades_.size() && i < 4; ++i) {
 		fc.cascadeTexel[i] = cascades_[i].texelWorld;
 	}
-	aoActive_ = settings.ssao && f.aoIntensity > 0.0f && f.aoRadius > 0.0f;
-	fc.aoParams[0] = f.aoIntensity;
-	fc.aoParams[1] = f.aoRadius;
+	// (Aether's own strength and radius: the scene's volume is not asked any more)
+	aoActive_ = settings.ssao && settings.aoStrength > 0.0f;
+	fc.aoParams[0] = settings.aoStrength;
+	fc.aoParams[1] = settings.aoRadius;
 	fc.aoParams[2] = f.aoDirectStrength;
 	fc.aoParams[3] = aoActive_ ? 1.0f : 0.0f;
 	memcpy(fc.smh[0], f.smhShadows, sizeof(f.smhShadows));
@@ -2448,6 +2469,73 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	}
 	// ---- particles (the game's particle systems, tyre smoke): over everything drawn so far
 	particlesDrawn_ = 0;
+	// ---- the tyre smoke: big soft puffs that cover every pixel many times over. Drawn at half the picture's size
+	// (a quarter of the pixels) into a target of their own, which is then laid over the picture. (At full size a
+	// camera inside a cloud of smoke took over 3 ms more per frame at 3840 x 2054.)
+	auto isSmoke = [](const AeParticleBatch& batch) { return batch.texture == 0 && (batch.flags & (kAeParticleLit | kAeParticleDisc)) == (kAeParticleLit | kAeParticleDisc) && batch.count > 0; };
+	bool smokeHalf = false;
+	for (const AeParticleBatch& batch : particleBatches_) {
+		smokeHalf = smokeHalf || isSmoke(batch);
+	}
+	smokeHalf = smokeHalf && particlesVa_ != 0 && target.width >= 64 && target.height >= 64;
+	if (smokeHalf) {
+		GpuTextureDesc smokeDesc = colorDesc;
+		smokeDesc.width = (target.width + 1) / 2;
+		smokeDesc.height = (target.height + 1) / 2;
+		smokeDesc.format = smokeDesc.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		const RenderGraph::ResourceId smoke = graph_.CreateTransient("SceneSmoke", smokeDesc, ResourceCategory::RenderTarget);
+		graph_.AddPass("Smoke", true, [&, smoke, depth](RenderGraph::Builder& b) {
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(smoke, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			if (shadow != RenderGraph::kInvalid) {
+				b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			if (skyLight) {
+				b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+		}, [&, smoke, depth, isSmoke](RenderGraph::PassContext& ctx) {
+			ID3D12PipelineState* pso = ParticlePipeline(true);
+			GpuTexture* out = ctx.Texture(smoke);
+			D3D12_CPU_DESCRIPTOR_HANDLE rtv = gpu.RtvCpu(out->target);
+			const float nothing[4] = {0, 0, 0, 0};
+			ctx.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+			ctx.list->ClearRenderTargetView(rtv, nothing, 0, nullptr);
+			if (!pso) {
+				ctx.note = "no pipeline";
+				return;
+			}
+			const D3D12_VIEWPORT half = {0, 0, float(out->desc.width), float(out->desc.height), 0, 1};
+			const D3D12_RECT halfRect = {0, 0, LONG(out->desc.width), LONG(out->desc.height)};
+			ctx.list->RSSetViewports(1, &half);
+			ctx.list->RSSetScissorRects(1, &halfRect);
+			BindCommon(ctx.list, true);
+			ctx.list->SetGraphicsRootShaderResourceView(2, particlesVa_);
+			ctx.list->SetPipelineState(pso);
+			uint32_t drawn = 0;
+			for (const AeParticleBatch& batch : particleBatches_) {
+				if (!isSmoke(batch) || postNext_ >= kPostTables) {
+					continue;
+				}
+				const uint32_t table = postTable_ + kPostTableSize * postNext_++;
+				gpu.CopySrv(table + 1, ctx.Texture(depth)->srv);
+				ctx.list->SetGraphicsRootDescriptorTable(9, gpu.SrvGpu(table));
+				const uint32_t constants[4] = {batch.first, 0, 2 /* a pixel here is two of the picture's */, batch.flags};
+				ctx.list->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+				ctx.list->DrawInstanced(6, batch.count, 0, 0);
+				ctx.drawCalls += 1;
+				ctx.triangles += batch.count * 2;
+				drawn += batch.count;
+			}
+			particlesDrawn_ += drawn;
+			ctx.note = Format("%u puffs at half size", drawn);
+		});
+		graph_.AddPass("SmokeApply", true, [&, smoke, color](RenderGraph::Builder& b) {
+			b.Read(smoke, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, smoke, color](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenSmokeApply, ctx.Texture(color), ctx.Texture(smoke));
+		});
+	}
 	graph_.AddPass("Particles", particlesVa_ != 0 && !particleBatches_.empty(), [&, color, depth](RenderGraph::Builder& b) {
 		b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2457,7 +2545,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		if (skyLight) {
 			b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		}
-	}, [&, color, depth](RenderGraph::PassContext& ctx) {
+	}, [&, color, depth, smokeHalf, isSmoke](RenderGraph::PassContext& ctx) {
 		ID3D12PipelineState* pso = ParticlePipeline();
 		if (!pso) {
 			ctx.note = "no pipeline";
@@ -2471,7 +2559,7 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		ctx.list->SetGraphicsRootShaderResourceView(2, particlesVa_); // (the particle buffer takes the instance buffer's place)
 		ctx.list->SetPipelineState(pso);
 		for (const AeParticleBatch& batch : particleBatches_) {
-			if (batch.count == 0 || postNext_ >= kPostTables) {
+			if (batch.count == 0 || postNext_ >= kPostTables || (smokeHalf && isSmoke(batch))) {
 				continue;
 			}
 			const uint32_t table = postTable_ + kPostTableSize * postNext_++;
@@ -2553,7 +2641,8 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	// bloom: the picture scaled down level by level, then added up again from the smallest (the host's scheme: every
 	// level is the level below it scaled up, mixed with its own by the scatter value)
 	RenderGraph::ResourceId bloom = RenderGraph::kInvalid;
-	if (bloomMix_ > 0.0f && target.width >= 64 && target.height >= 64) {
+	RenderGraph::ResourceId flareSource = RenderGraph::kInvalid; // (the picture at an eighth of its size, blurred: what the lens flare's ghosts are made of)
+	if ((bloomMix_ > 0.0f || lensFlare_) && target.width >= 64 && target.height >= 64) {
 		RenderGraph::ResourceId down[kBloomLevels], up[kBloomLevels];
 		for (uint32_t i = 0; i < kBloomLevels; ++i) {
 			GpuTextureDesc d = colorDesc;
@@ -2585,7 +2674,10 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 				Fullscreen(ctx, kFullscreenBloomUp, out, lowTexture, ctx.Texture(high), nullptr, params);
 			});
 		}
-		bloom = up[0];
+		if (bloomMix_ > 0.0f) {
+			bloom = up[0];
+		}
+		flareSource = down[2];
 	}
 	// ---- Aether's own exposure: the scene's mean luminance into a 1 x 1 target (when the host's is not available)
 	GpuTextureDesc exposureDesc;
@@ -2634,7 +2726,28 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		ctx.triangles = 1;
 		ctx.note = Format("metered, EV100 %.2f .. %.2f, compensation %.2f", scene.frame.exposureMinEV, scene.frame.exposureMaxEV, scene.frame.exposureCompensation);
 	});
-	graph_.AddPass("Composite", true, [&, post, bloom](RenderGraph::Builder& b) {
+	// ---- lens flare: what a camera's lens adds round the sun and bright lamps, at half the picture's size; the
+	// composite adds it (after the temporal history was taken: it must not be carried into the next frame)
+	RenderGraph::ResourceId flare = RenderGraph::kInvalid;
+	if (lensFlare_ && flareSource != RenderGraph::kInvalid) {
+		GpuTextureDesc d = colorDesc;
+		d.width = std::max(1u, target.width / 2);
+		d.height = std::max(1u, target.height / 2);
+		flare = graph_.CreateTransient("LensFlare", d, ResourceCategory::RenderTarget);
+		graph_.AddPass("LensFlare", true, [&, flare, flareSource, ownExposure, exposureTarget](RenderGraph::Builder& b) {
+			b.Read(flareSource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			if (ownExposure) {
+				b.Read(exposureTarget, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			b.Write(flare, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, flare, flareSource, ownExposure, exposureTarget](RenderGraph::PassContext& ctx) {
+			GpuTexture* out = ctx.Texture(flare);
+			const float params[4] = {lensFlareStrength_, 0, 1.0f / float(out->desc.width), 1.0f / float(out->desc.height)};
+			Fullscreen(ctx, kFullscreenLensFlare, out, ctx.Texture(flareSource), ctx.Texture(depth), ownExposure ? ctx.Texture(exposureTarget) : nullptr, params);
+		});
+	}
+	graph_.AddPass("Composite", true, [&, post, bloom, flare](RenderGraph::Builder& b) {
 		b.Read(post, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		if (ownExposure) {
 			b.Read(exposureTarget, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -2642,8 +2755,11 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		if (bloom != RenderGraph::kInvalid) {
 			b.Read(bloom, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		}
+		if (flare != RenderGraph::kInvalid) {
+			b.Read(flare, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
 		b.Write(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET);
-	}, [&, post, bloom, ownExposure, exposureTarget](RenderGraph::PassContext& ctx) {
+	}, [&, post, bloom, flare, ownExposure, exposureTarget](RenderGraph::PassContext& ctx) {
 		const RenderGraph::ResourceId color = post;
 		ID3D12PipelineState* pso = FullscreenPipeline(kFullscreenComposite, target.backBufferFormat);
 		if (!pso) {
@@ -2657,6 +2773,9 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		}
 		if (bloom != RenderGraph::kInvalid) {
 			gpu.CopySrv(compositeTable + 3, ctx.Texture(bloom)->srv);
+		}
+		if (flare != RenderGraph::kInvalid) {
+			gpu.CopySrv(compositeTable + 1, ctx.Texture(flare)->srv);
 		}
 		ctx.list->OMSetRenderTargets(1, &target.backBufferRtv, FALSE, nullptr);
 		ctx.list->RSSetViewports(1, &viewport);

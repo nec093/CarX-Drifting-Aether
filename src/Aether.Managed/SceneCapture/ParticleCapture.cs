@@ -16,6 +16,8 @@ namespace Aether {
 	/// </summary>
 	internal sealed class ParticleCapture {
 		private const int MaxParticles = 24000;
+		/// <summary>The mod's config folder (development files are looked for there).</summary>
+		public static string ConfigDir;
 
 		private AeParticle[] particles_ = new AeParticle[4096];
 		private int count_;
@@ -62,6 +64,25 @@ namespace Aether {
 			}
 			particles_[count_++] = new AeParticle { position = position, size = size, color = color, rotation = rotation, stretch = stretch, uv = uv };
 			return true;
+		}
+
+		/// <summary>Room for up to `n` more particles at the end of the list, for a source that fills them itself: the
+		/// array (they start at Count) or null when there is no room for all of them. Commit says how many were written.</summary>
+		public AeParticle[] Reserve(int n, out int first) {
+			first = count_;
+			if (count_ + n > MaxParticles) {
+				return null;
+			}
+			if (count_ + n > particles_.Length) {
+				Array.Resize(ref particles_, Mathf.NextPowerOfTwo(count_ + n));
+			}
+			return particles_;
+		}
+
+		public int Count => count_;
+
+		public void Commit(int n) {
+			count_ += n;
 		}
 
 		public void EndBatch() {

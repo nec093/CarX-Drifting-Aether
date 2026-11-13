@@ -8,7 +8,7 @@
 namespace aether {
 
 static const std::vector<std::string> kQualities = {"low", "medium", "high", "ultra"};
-static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections", "followSceneNight", "probeGi"};
+static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections", "followSceneNight", "probeGi", "lensFlare"};
 static const std::vector<std::string> kRenderModes = {"hdrp", "aether", "compare", "standalone"};
 static const std::vector<std::string> kSkyModes = {"physical", "scene"};
 static const std::vector<std::string> kTonemaps = {"host", "agx", "aces", "neutral", "none"};
@@ -48,6 +48,7 @@ static json ToJsonData(const SettingsData& d) {
 		{"indirectLight", d.indirectLight},
 		{"reflectionProbe", d.reflectionProbe},
 		{"probeGi", d.probeGi},
+		{"lensFlare", d.lensFlare},
 		{"followSceneNight", d.followSceneNight},
 		{"rayTracedReflections", d.rayTracedReflections},
 		{"indirectStrength", d.indirectStrength},
@@ -68,6 +69,9 @@ static json ToJsonData(const SettingsData& d) {
 		{"shadowSoftness", d.shadowSoftness},
 		{"motionBlurStrength", d.motionBlurStrength},
 		{"bloomStrength", d.bloomStrength},
+		{"aoStrength", d.aoStrength},
+		{"aoRadius", d.aoRadius},
+		{"lensFlareStrength", d.lensFlareStrength},
 		{"smokeOpacity", d.smokeOpacity},
 		{"lodBias", d.lodBias},
 		{"anisotropicLevel", d.anisotropicLevel},
@@ -97,6 +101,7 @@ json Settings::Schema() {
 		{"indirectLight", {{"type", "boolean"}, {"description", "Light bounced off nearby surfaces (screen space)"}}},
 		{"reflectionProbe", {{"type", "boolean"}, {"description", "Reflections of the surroundings, also of what is off screen: a cube drawn around the camera every frame"}}},
 		{"followSceneNight", {{"type", "boolean"}, {"description", "The physical sky turns to night (about midnight, moon up) while the game's own day / night switch is on night"}}},
+		{"lensFlare", {{"type", "boolean"}, {"description", "Lens flare: ghosts, a halo and rays from the sun and from bright lamps"}}},
 		{"probeGi", {{"type", "boolean"}, {"description", "Indirect light from a grid of probes around the camera: each traces rays through the scene's triangles every frame (roofs shut out the sky, lit surfaces light their surroundings)"}}},
 		{"rayTracedReflections", {{"type", "boolean"}, {"description", "Reflections on smooth surfaces from rays traced through the scene's triangles (what is off screen too)"}}},
 		{"moonlight", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "The moon's light at night, as a factor"}}},
@@ -113,6 +118,9 @@ json Settings::Schema() {
 		{"sunHeading", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 360.0}, {"description", "Turns the sun's path about the up axis, in degrees (physical sky)"}}},
 		{"shadowSoftness", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "How far the sun's shadow edges are blurred, in shadow map texels (0 = hard)"}}},
 		{"motionBlurStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 2.0}, {"description", "Motion blur strength, as a factor on what the scene asks for"}}},
+		{"aoStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 2.0}, {"description", "Ambient occlusion strength (1: as measured)"}}},
+		{"aoRadius", {{"type", "number"}, {"minimum", 0.2}, {"maximum", 4.0}, {"description", "Ambient occlusion radius in metres"}}},
+		{"lensFlareStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 3.0}, {"description", "Factor on the lens flare"}}},
 		{"bloomStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 2.0}, {"description", "Bloom strength, as a factor on what the scene asks for"}}},
 		{"smokeOpacity", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 2.0}, {"description", "Tyre smoke opacity factor"}}},
 		{"lodBias", {{"type", "number"}, {"minimum", 0.3}, {"maximum", 8.0}, {"description", "Unity's LOD bias: higher keeps detailed models up to a greater distance"}}},
@@ -193,6 +201,7 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 	if (key == "indirectLight") return wantBool(d.indirectLight);
 	if (key == "reflectionProbe") return wantBool(d.reflectionProbe);
 	if (key == "probeGi") return wantBool(d.probeGi);
+	if (key == "lensFlare") return wantBool(d.lensFlare);
 	if (key == "followSceneNight") return wantBool(d.followSceneNight);
 	if (key == "rayTracedReflections") return wantBool(d.rayTracedReflections);
 	if (key == "skinnedRayUpdates") {
@@ -260,6 +269,27 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 			return "motionBlurStrength must be a number between 0.0 and 2.0";
 		}
 		d.motionBlurStrength = float(value.get<double>());
+		return {};
+	}
+	if (key == "aoStrength") {
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= 2.0)) {
+			return "aoStrength must be a number between 0.0 and 2.0";
+		}
+		d.aoStrength = float(value.get<double>());
+		return {};
+	}
+	if (key == "aoRadius") {
+		if (!value.is_number() || !(value.get<double>() >= 0.2 && value.get<double>() <= 4.0)) {
+			return "aoRadius must be a number between 0.2 and 4.0";
+		}
+		d.aoRadius = float(value.get<double>());
+		return {};
+	}
+	if (key == "lensFlareStrength") {
+		if (!value.is_number() || !(value.get<double>() >= 0.0 && value.get<double>() <= 3.0)) {
+			return "lensFlareStrength must be a number between 0.0 and 3.0";
+		}
+		d.lensFlareStrength = float(value.get<double>());
 		return {};
 	}
 	if (key == "bloomStrength") {

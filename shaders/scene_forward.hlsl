@@ -557,7 +557,11 @@ float4 ShadeForward(VSOutput input, bool frontFace, out float4 surface) {
 		sunLight *= directAo;
 	}
 	float reflectionOcclusion = SpecularOcclusion(NoV, visibility, s.clearCoat > 0.0 ? s.clearCoatRoughness : s.roughness);
-	float3 ambient = ambientDiffuse * visibility + ambientSpecular * SpecularOcclusion(NoV, visibility, s.roughness) + bounced;
+	// (Light bounces about inside a hollow too: the brighter the surface, the less of the measured occlusion shows.
+	// Jimenez et al. 2016, the fit for many bounces. Without it white paint and pale concrete got grey, dirty creases.)
+	float3 bounceA = 2.0404 * s.albedo - 0.3324, bounceB = -4.7951 * s.albedo + 0.6417, bounceC = 2.7552 * s.albedo + 0.6903;
+	float3 diffuseVisibility = max(visibility, ((visibility * bounceA + bounceB) * visibility + bounceC) * visibility);
+	float3 ambient = ambientDiffuse * diffuseVisibility + ambientSpecular * SpecularOcclusion(NoV, visibility, s.roughness) + bounced;
 	if (s.clearCoat > 0.0) {
 		float Fc = (s.coatF0 + (1.0 - s.coatF0) * pow(1.0 - NoV, 5.0)) * s.clearCoat;
 		ambient = ambient * (1.0 - Fc) + EnvironmentSpecular(input.worldPos, reflect(-V, s.coatNormal), s.clearCoatRoughness) * Fc * reflectionOcclusion;

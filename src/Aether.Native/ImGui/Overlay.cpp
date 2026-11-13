@@ -779,7 +779,7 @@ void SettingsTab() {
 		{"antialiasing", "Antialiasing (temporal)", s.antialiasing}, {"shadows", "Sun shadows", s.shadows}, {"ssao", "Ambient occlusion", s.ssao},
 		{"ssr", "Screen space reflections", s.ssr}, {"bloom", "Bloom", s.bloom}, {"motionBlur", "Motion blur", s.motionBlur},
 		{"particles", "Particles and tyre smoke", s.particles}, {"volumetricFog", "Volumetric fog (light shafts)", s.volumetricFog},
-		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections}, {"probeGi", "Global illumination (probe grid, ray traced)", s.probeGi}, {"followSceneNight", "Night when the game's scene is at night", s.followSceneNight},
+		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections}, {"probeGi", "Global illumination (probe grid, ray traced)", s.probeGi}, {"lensFlare", "Lens flare", s.lensFlare}, {"followSceneNight", "Night when the game's scene is at night", s.followSceneNight},
 	};
 	for (Toggle& t : toggles) {
 		if (ImGui::Checkbox(t.label, &t.value)) {
@@ -795,6 +795,9 @@ void SettingsTab() {
 		{"skinnedRayUpdates", "Skinned poses read per frame (reflections)", s.skinnedRayUpdates, 0.0f, 4.0f, "%.0f"},
 		{"motionBlurStrength", "Motion blur strength", s.motionBlurStrength, 0.0f, 2.0f, "%.2f"},
 		{"bloomStrength", "Bloom strength", s.bloomStrength, 0.0f, 2.0f, "%.2f"},
+		{"lensFlareStrength", "Lens flare strength", s.lensFlareStrength, 0.0f, 3.0f, "%.2f"},
+		{"aoStrength", "Ambient occlusion strength", s.aoStrength, 0.0f, 2.0f, "%.2f"},
+		{"aoRadius", "Ambient occlusion radius (m)", s.aoRadius, 0.2f, 4.0f, "%.2f"},
 		{"smokeOpacity", "Tyre smoke opacity", s.smokeOpacity, 0.0f, 2.0f, "%.2f"},
 		{"exposureEV", "Exposure bias (stops)", s.exposureEV, -3.0f, 3.0f, "%.2f"},
 		{"lodBias", "Level of detail bias", s.lodBias, 0.3f, 8.0f, "%.1f"},
