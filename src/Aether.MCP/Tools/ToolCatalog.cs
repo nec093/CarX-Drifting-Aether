@@ -104,7 +104,7 @@ public static class ToolCatalog {
 			Control: true, TimeoutSeconds: ControlTimeout),
 
 		new("set_graphics_option",
-			"[control] Sets one of Aether's own graphics options (the ones in the overlay's Settings tab): skyMode (physical | scene), timeOfDay (hours), sunHeading (degrees), shadowSoftness, motionBlurStrength, bloomStrength, smokeOpacity, lodBias, anisotropicLevel, vsync, exposureEV, tonemap, reflectionDenoiser (nrd | off). get_settings shows the values and their ranges. Needs --allow-control and the game's permission.",
+			"[control] Sets one of Aether's own graphics options (the ones in the overlay's Settings tab): skyMode (physical | scene), timeOfDay (hours), sunHeading (degrees), shadowSoftness, motionBlurStrength, bloomStrength, smokeOpacity, lodBias, anisotropicLevel, vsync, exposureEV, tonemap, reflectionDenoiser (nrd | off), pathTracing (off | freeCamera | always), pathTracingBounces, pathTracingMaxSamples, freeCameraSpeed, freeCameraSensitivity. get_settings shows the values and their ranges. Needs --allow-control and the game's permission.",
 			"""{"type":"object","properties":{"option":{"type":"string","description":"The option's name, e.g. timeOfDay."},"value":{"type":["number","string"],"description":"The new value."}},"required":["option","value"],"additionalProperties":false}""",
 			"""{"type":"object","properties":{"option":{"type":"string"},"value":{"type":["number","string"]}},"required":["option","value"]}""",
 			Control: true, TimeoutSeconds: ControlTimeout),

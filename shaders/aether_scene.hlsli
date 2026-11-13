@@ -429,6 +429,7 @@ static const float3 kGiCounts = float3(24.0, 8.0, 24.0);
 static const float kGiTile = 8.0;
 static bool s_NoSkyFallback = false; // set by the pass whose rays bring the sky themselves: no unoccluded sky in AmbientLight
 static bool s_GiOff = false; // set by the pass that must not read the probes (they hold nothing yet)
+static bool s_RcTracing = false; // set by PSRcTrace: the light per normal it reads is the frame before's (RcIrradiance)
 
 float3 GiStorage(float3 cell) {
 	return cell - kGiCounts * floor(cell / kGiCounts);
@@ -454,7 +455,7 @@ float2 GiTileUv(float3 cell, float3 dir) {
 // A probe counts by how near it is, less when it is behind the surface, and hardly when it does not see the place:
 // when the place is further from it than what the probe sees in that direction (walls between them).
 float4 GiDiffuse(float3 P, float3 n) {
-	if (g_GiGrid.w < 0.5 || s_GiOff) {
+	if (g_GiGrid.w < 0.5 || g_GiGrid.w > 1.5 || s_GiOff) {
 		return 0.0;
 	}
 	float3 spacing = g_GiParams.xyx;
@@ -500,9 +501,122 @@ float4 GiDiffuse(float3 P, float3 n) {
 	return float4(sum / max(weight, 1e-8), fade);
 }
 
-// The light that reaches a surface from all round it, not straight from a lamp: the probes where they stand, the
-// open sky beyond them.
+// ---- radiance cascades (setting radianceCascades): the light at any place in the world, without the probe
+// grid's edge. Five levels of probes round the camera, all over the same volume (96 x 32 x 96 m): level i has probes
+// 2 * 2^i m apart, (4 * 2^i)^2 directions each (octahedral tiles), and its rays look only at the stretch from
+// kRcStart[i] to kRcEnd[i] metres. Where a ray gets through its stretch, what lies beyond comes from the next level's
+// probes round it (the frame before: the levels are merged one frame at a time). Level 0 then holds the light
+// arriving from every distance; PSRcIrradiance turns that into the diffuse light per normal, which RcIrradiance reads
+// anywhere. Storage: one atlas per frame (two in turn), the levels side by side, a probe's tile at its cell modulo
+// the counts (the probes stay where they are in the world when the volume follows the camera). rgb is the light
+// times a: how much of it came from outside of things (a ray that met the inside of a wall knows nothing).
+// g_GiGrid: xyz the camera's position this frame, w 2 = on; g_GiPrev: the same the frame before, w 1 = history.
+static const int kRcLevels = 5;
+static const int3 kRcCounts0 = int3(48, 16, 48);
+static const float kRcSpacing0 = 2.0;
+static const float2 kRcAtlasSize = float2(5952.0, 192.0);
+static const int kRcOffset[5] = {0, 3072, 4608, 5376, 5760};
+static const float kRcStart[5] = {0.0, 2.0, 8.0, 32.0, 128.0};
+static const float kRcEnd[5] = {2.0, 8.0, 32.0, 128.0, 1000.0};
+// How far each texel steps towards this frame's rays (PSRcTrace). The rays are the same every frame, so this only damps
+// the light the levels pass to each other a frame late and the bounces (a ray's hit is lit by the cascades too).
+static const float kRcBlend = 0.5;
+// The levels whose texels take four rays (PSRcTrace); the ones above take one, at the texel's middle. (Measured in the
+// garage against the long run mean of random rays: one ray everywhere was 7.2 off on average, four on level 0 4.1,
+// on levels 0 and 1 2.8, on all levels 2.7; RcTrace 0.26 / 0.57 / 0.78 / 0.87 ms.)
+static const int kRcFineLevels = 2;
+
+int3 RcCounts(int level) { return max(kRcCounts0 >> level, int3(1, 1, 1)); }
+float RcSpacing(int level) { return kRcSpacing0 * float(1 << level); }
+int RcTile(int level) { return 4 << level; }
+
+// The cell of the volume's lowest corner at a level, for a camera at `camera`.
+float3 RcOrigin(int level, float3 camera) {
+	return floor(camera / RcSpacing(level) - 0.5) - float3(RcCounts(level) / 2) + 1.0;
+}
+
+float3 RcStorage(int level, float3 cell) {
+	float3 counts = float3(RcCounts(level));
+	return cell - counts * floor(cell / counts);
+}
+
+// Whether a cell lies in the volume of a level for a camera at `camera`.
+bool RcInside(int level, float3 cell, float3 camera) {
+	float3 rel = cell - RcOrigin(level, camera);
+	return all(rel >= 0.0) && all(rel < float3(RcCounts(level)));
+}
+
+// How far each level 0 probe sees round it (PSRcDepth): per probe a tile of 8 x 8 directions in g_GiDepth, r the mean
+// distance (capped at 4 m), g its square. The tile of a cell, at the texel of a direction.
+static const float kRcDepthTile = 8.0;
+float2 RcDepthUv(float3 cell, float3 dir) {
+	float3 s = RcStorage(0, cell);
+	float2 tile = float2(s.x + s.y * float(kRcCounts0.x), s.z);
+	float2 inTile = clamp(OctEncode(dir) * kRcDepthTile, 0.5, kRcDepthTile - 0.5);
+	return (tile * kRcDepthTile + inTile) / (float2(kRcCounts0.x * kRcCounts0.y, kRcCounts0.z) * kRcDepthTile);
+}
+
+// A probe's tile in the atlas: its corner in texels.
+float2 RcTileCorner(int level, float3 cell) {
+	int3 counts = RcCounts(level);
+	float3 s = RcStorage(level, cell);
+	return float2(float(kRcOffset[level]) + (s.x + s.y * float(counts.x)) * float(RcTile(level)), s.z * float(RcTile(level)));
+}
+
+// The diffuse light at P facing n (irradiance / PI, like AmbientDiffuse): the eight level 0 probes round it, each
+// by how near it is, less when it is behind the surface, and hardly when it does not see the place (further from it
+// than what the probe sees that way: a wall or a roof between them; without this a room took the sky from the probes
+// above its roof); beyond the volume the probes at its edge.
+float3 RcIrradiance(float3 P, float3 n) {
+	float3 camera = g_GiGrid.xyz;
+	float3 biased = P + n * 0.3; // (off the surface: a place on a wall is not behind that wall for the probe)
+	float3 g = biased / kRcSpacing0 - 0.5;
+	float3 origin = RcOrigin(0, camera);
+	g = clamp(g - origin, 0.0, float3(kRcCounts0) - 1.001) + origin;
+	if (s_RcTracing) {
+		// (the light per normal is the frame before's, stored for the volume round the camera of then: a cell that
+		// came into the volume this frame still holds the one it took the place of, 96 m away. Only the cells in both
+		// volumes; the distances are this frame's.)
+		float3 before = RcOrigin(0, g_GiPrev.xyz);
+		g = clamp(g - before, 0.0, float3(kRcCounts0) - 1.001) + before;
+	}
+	biased = (g + 0.5) * kRcSpacing0;
+	float3 base = floor(g);
+	float3 f = g - base;
+	float4 sum = 0.0;
+	for (int i = 0; i < 8; ++i) {
+		float3 o = float3(i & 1, (i >> 1) & 1, i >> 2);
+		float3 cell = base + o;
+		float3 probe = (cell + 0.5) * kRcSpacing0;
+		float3 tri = lerp(1.0 - f, f, o);
+		float wrap = (dot(normalize(probe - P + 1e-4), n) + 1.0) * 0.5;
+		float w = (tri.x * tri.y * tri.z + 0.001) * (wrap * wrap + 0.05);
+		float3 pd = biased - probe;
+		float r = length(pd);
+		float2 m = g_GiDepth.SampleLevel(s_LinearClamp, RcDepthUv(cell, pd / max(r, 1e-4)), 0.0).rg;
+		if (r > m.x) {
+			// (Chebyshev: the share of what the probe sees that way that lies at least this far)
+			float variance = abs(m.y - m.x * m.x);
+			float c = variance / (variance + (r - m.x) * (r - m.x));
+			w *= max(c * c * c, 0.0);
+		}
+		w = max(w, 1e-6);
+		if (w < 0.2) {
+			w *= w * w * 25.0; // (small shares are made smaller still: a probe that hardly counts should not tint)
+		}
+		float2 inTile = clamp(OctEncode(n) * 4.0, 0.5, 3.5);
+		sum += g_GiIrradiance.SampleLevel(s_LinearClamp, (RcTileCorner(0, cell) + inTile) / float2(3072.0, 192.0), 0.0) * w;
+	}
+	return sum.a > 1e-5 ? max(sum.rgb / sum.a, 0.0) : 0.0;
+}
+
+// The light that reaches a surface from all round it, not straight from a lamp: the radiance cascades where they
+// run; else the probes where they stand, the open sky beyond them.
 float3 AmbientLight(float3 P, float3 n) {
+	if (g_GiGrid.w > 1.5) {
+		// (until the cascades hold something: the sky, or nothing for the rays that bring the sky themselves)
+		return g_GiPrev.w > 0.5 && !s_GiOff ? RcIrradiance(P, n) : s_NoSkyFallback ? 0.0 : AmbientDiffuse(n) * g_Misc.w;
+	}
 	float3 sky = AmbientDiffuse(n) * g_Misc.w;
 	float4 gi = GiDiffuse(P, n);
 	if (s_NoSkyFallback) {

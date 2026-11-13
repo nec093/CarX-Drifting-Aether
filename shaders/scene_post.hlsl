@@ -1237,6 +1237,144 @@ float4 PSGiDepth(FullscreenOutput input) : SV_Target {
 	return float4(far, far * far, 0.0, GiFresh(cell) ? 1.0 : 0.1);
 }
 
+// ---- radiance cascades (aether_scene.hlsli: RcIrradiance): one ray per texel of every level's tiles, through that
+// level's stretch; where it gets through, the next level's probes round it (the frame before) say what lies beyond.
+// g_SceneColor: the atlas of the frame before.
+float4 PSRcTrace(FullscreenOutput input) : SV_Target {
+	int2 p = int2(input.position.xy);
+	int level = 0;
+	[unroll] for (int k = 1; k < kRcLevels; ++k) {
+		level = p.x >= kRcOffset[k] ? k : level;
+	}
+	const int S = RcTile(level);
+	const int3 counts = RcCounts(level);
+	const int lx = p.x - kRcOffset[level];
+	const int2 tile = int2(lx / S, p.y / S);
+	const int2 texel = int2(lx % S, p.y % S);
+	const float3 camera = g_GiGrid.xyz;
+	const float3 origin = RcOrigin(level, camera);
+	const float3 storage = float3(tile.x % counts.x, tile.x / counts.x, tile.y);
+	const float3 cell = origin + RcStorage(level, storage - origin);
+	const float spacing = RcSpacing(level);
+	const float3 probe = (cell + 0.5) * spacing;
+
+	const bool history = g_GiPrev.w > 0.5;
+	s_GiOff = !history;
+	s_RcTracing = true;
+	// (The stretch reaches on past the next level's start by twice that level's probe spacing. The next level's
+	// probes stand up to 0.87 of it from this one, and their stretch starts that much off: without the overlap, a
+	// ceiling between this probe and where the next level's rays start was in nobody's stretch, and a workshop under a
+	// roof was lit by the sky through it, three times as bright as rays from its own surfaces found. Measured there:
+	// 0.87 of the spacing took off most of it, twice the spacing a little more.)
+	const float stretchEnd = level == kRcLevels - 1 ? kRcEnd[level] : kRcEnd[level] + RcSpacing(level + 1) * 2.0;
+	const float start = max(kRcStart[level], 0.05);
+	// Four rays per texel, at the middles of its 2 x 2 quarters: the same directions every frame. (One ray at a
+	// random place in the texel each frame made the light flicker: a texel is 50 degrees wide at level 0, and with
+	// the overlap its rays reach five times as far as that width suits, so whether a ray met a lamp's pool on a wall
+	// or the bright side of a container changed from frame to frame. Measured in the garage, still camera: the
+	// flicker of the picture fell to what it is with the cascades frozen.)
+	const int rays = level < kRcFineLevels ? 4 : 1;
+	float4 sum = 0.0;    // rgb light * a, a 1 = seen from outside of things; summed over the rays
+	float through = 0.0; // how many of them got through the stretch
+	[loop] for (int s = 0; s < rays; ++s) {
+		const float2 at = rays == 4 ? float2(float(s & 1), float(s >> 1)) * 0.5 + 0.25 : 0.5;
+		const float3 d = OctDecode((float2(texel) + at) / float(S));
+		BvhHit hit = BvhTraceEx(probe + d * start, d, stretchEnd - start, false, true);
+		if (hit.t < 0.0) {
+			if (level == kRcLevels - 1) {
+				sum += float4(min(SkyRadiance(d, 0.0) * g_Misc.w, 60000.0), 1.0);
+			} else {
+				through += 1.0;
+			}
+		} else if (hit.back == 0u) {
+			float3 P = probe + d * (start + hit.t);
+			float4 surface = BvhHitSurfaceLit(P, hit, kRcStart[level] + hit.t, d, true);
+			// (alpha tested away: taken as open, the next level answers)
+			if (surface.a > 0.5) {
+				sum += float4(min(surface.rgb, 60000.0), 1.0);
+			} else if (level != kRcLevels - 1) {
+				through += 1.0;
+			}
+		}
+	}
+	float4 result = sum;
+	if (through > 0.5) {
+		// the next level's eight probes round this one, each the mean of its four directions within this texel's
+		// (the 2 x 2 block: one bilinear read at its middle)
+		float4 beyond = 0.0;
+		if (history) {
+			const int up = level + 1;
+			const float upSpacing = RcSpacing(up);
+			float3 g = probe / upSpacing - 0.5;
+			float3 upOrigin = RcOrigin(up, g_GiPrev.xyz);
+			g = clamp(g - upOrigin, 0.0, float3(RcCounts(up)) - 1.001) + upOrigin;
+			float3 base = floor(g);
+			float3 f = g - base;
+			for (int i = 0; i < 8; ++i) {
+				float3 o = float3(i & 1, (i >> 1) & 1, i >> 2);
+				float3 c = base + o;
+				float3 tri = lerp(1.0 - f, f, o);
+				float2 at = RcTileCorner(up, c) + float2(texel) * 2.0 + 1.0;
+				beyond += g_SceneColor.SampleLevel(s_LinearClamp, at / kRcAtlasSize, 0.0) * (tri.x * tri.y * tri.z);
+			}
+		}
+		result += (beyond.a > 1e-4 ? float4(beyond.rgb / beyond.a, 1.0) : float4(0.0, 0.0, 0.0, 0.0)) * through;
+	}
+	result /= float(rays);
+	// a step towards it from what this texel held (the same probe the frame before, when it was in the volume): only
+	// to damp the levels' passing of light to each other and the bounces, not to average noise (there is none)
+	if (history && RcInside(level, cell, g_GiPrev.xyz)) {
+		float4 before = g_SceneColor.Load(int3(p, 0));
+		result = lerp(before, result, kRcBlend);
+	}
+	return result;
+}
+
+// How far each level 0 probe sees in 8 x 8 directions (for RcIrradiance's test of whether a probe sees a place): per
+// texel the mean of four rays at the middles of its quarters (the same every frame) and the mean of their squares.
+// A quarter of the probes each frame, and the ones new in the volume, written whole (a: 1 = replace, 0 = keep).
+// (One ray at a random place in the texel, stepped 3 % towards each frame, kept the distances shaking: they decide
+// how much each probe counts for a place, steeply, and the light of a lamp's pool on a wall flickered with them.)
+// A ray that meets the inside of something counts a fifth of its length (a probe in a wall must not be believed).
+float4 PSRcDepth(FullscreenOutput input) : SV_Target {
+	int2 p = int2(input.position.xy);
+	int2 tile = p / 8;
+	float3 storage = float3(tile.x % kRcCounts0.x, tile.x / kRcCounts0.x, tile.y);
+	float3 origin = RcOrigin(0, g_GiGrid.xyz);
+	float3 cell = origin + RcStorage(0, storage - origin);
+	bool fresh = g_GiPrev.w < 0.5 || !RcInside(0, cell, g_GiPrev.xyz);
+	if (!fresh && ((int(cell.z) + int(g_GiParams.z)) & 3) != 0) {
+		return 0.0; // (kept)
+	}
+	float3 probe = (cell + 0.5) * kRcSpacing0;
+	float2 m = 0.0;
+	[unroll] for (int s = 0; s < 4; ++s) {
+		float3 d = OctDecode((float2(p % 8) + float2(float(s & 1), float(s >> 1)) * 0.5 + 0.25) / 8.0);
+		BvhHit hit = BvhTraceEx(probe, d, 4.0, false, true);
+		float far = hit.t < 0.0 ? 4.0 : hit.back != 0u ? hit.t * 0.2 : hit.t;
+		m += float2(far, far * far) * 0.25;
+	}
+	return float4(m, 0.0, 1.0);
+}
+
+// Level 0's light per normal: per probe a tile of 4 x 4 normals, the cosine weighted mean of its 16 directions
+// (rgb times a: a how much of it was seen from outside of things). g_SceneColor: this frame's atlas.
+float4 PSRcIrradiance(FullscreenOutput input) : SV_Target {
+	int2 p = int2(input.position.xy);
+	int2 origin = p - p % 4;
+	float3 n = OctDecode((float2(p % 4) + 0.5) / 4.0);
+	float4 sum = 0.0;
+	float weight = 0.0;
+	for (int y = 0; y < 4; ++y) {
+		for (int x = 0; x < 4; ++x) {
+			float w = saturate(dot(n, OctDecode((float2(x, y) + 0.5) / 4.0)));
+			sum += g_SceneColor.Load(int3(origin + int2(x, y), 0)) * w;
+			weight += w;
+		}
+	}
+	return sum / max(weight, 1e-4);
+}
+
 // ---- lens flare: what the glass of a camera's lens adds to a picture with something very bright in it. Kept
 // faint, the way a good coated lens shows it: light reflected between the lens's surfaces lands again as "ghosts",
 // small soft copies of the aperture (a seven bladed iris) on the line through the middle of the picture, each a
@@ -1326,4 +1464,335 @@ float4 PSLensFlare(FullscreenOutput input) : SV_Target {
 // The tyre smoke, drawn at half size into a target of its own (scene_particles.hlsl), over the picture.
 float4 PSSmokeApply(FullscreenOutput input) : SV_Target {
 	return g_SceneColor.SampleLevel(s_LinearClamp, input.uv, 0.0);
+}
+
+// ---- path tracing (setting pathTracing): the opaque scene traced through the ray tracing geometry, a sample per
+// pixel each frame, averaged over the frames while nothing changes (SceneRenderer starts the average anew when the
+// camera, the sun, a setting or the lamps change). Each path: from the eye through a random place in the pixel, then
+// at every surface the sun (a random point of its disc) and one of the lamps (at random) with a shadow ray each, and
+// on in a direction drawn from the surface's lobes (diffuse, the metal's or base's GGX, the lacquer's GGX) until
+// the bounces run out, the sky takes it, or it is dropped (Russian roulette).
+// What the ray tracing geometry does not hold (people and other skinned meshes, glass, particles) is the rasterised
+// picture's: a sample whose first hit disagrees with the depth buffer counts nothing (a: 0), and PSPathTraceApply lays
+// the average over the picture by a. The first hit takes the rasterised normal (smooth, with its normal map) where
+// the two agree; further hits have the triangle's own.
+// g_SceneColor: the average so far, g_PostDepth: the scene depth, g_PostAux: the surface target (normal).
+// g_PassParams: x samples so far (0: start anew), y bounces, w a number that changes every frame.
+static uint s_PtState;
+
+uint PtHash(uint x) {
+	x ^= x >> 16;
+	x *= 0x7feb352du;
+	x ^= x >> 15;
+	x *= 0x846ca68bu;
+	x ^= x >> 16;
+	return x;
+}
+
+float PtRandom() {
+	s_PtState = s_PtState * 747796405u + 2891336453u;
+	uint w = ((s_PtState >> ((s_PtState >> 28u) + 4u)) ^ s_PtState) * 277803737u;
+	w = (w >> 22u) ^ w;
+	return float(w >> 8) * (1.0 / 16777216.0);
+}
+
+float3x3 PtBasis(float3 n) {
+	float3 t = abs(n.y) < 0.999 ? normalize(cross(float3(0.0, 1.0, 0.0), n)) : float3(1.0, 0.0, 0.0);
+	return float3x3(t, cross(n, t), n); // rows: tangent, bitangent, normal
+}
+
+// GGX (Trowbridge-Reitz) with Smith's masking; alpha = roughness squared
+float PtD(float NoH, float a) {
+	float a2 = a * a;
+	float d = NoH * NoH * (a2 - 1.0) + 1.0;
+	return a2 / max(PI * d * d, 1e-12);
+}
+
+float PtG1(float NoX, float a) {
+	float a2 = a * a;
+	return 2.0 * NoX / max(NoX + sqrt(a2 + (1.0 - a2) * NoX * NoX), 1e-8);
+}
+
+float3 PtFresnel(float3 f0, float VoH) {
+	return f0 + (1.0 - f0) * pow(saturate(1.0 - VoH), 5.0);
+}
+
+// A half vector from the GGX lobe's visible normals (Heitz 2018), in the basis' space; V there too.
+float3 PtSampleVndf(float3 V, float a, float2 u) {
+	float3 Vh = normalize(float3(a * V.x, a * V.y, V.z));
+	float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+	float3 T1 = lensq > 0.0 ? float3(-Vh.y, Vh.x, 0.0) * rsqrt(lensq) : float3(1.0, 0.0, 0.0);
+	float3 T2 = cross(Vh, T1);
+	float r = sqrt(u.x);
+	float phi = 2.0 * PI * u.y;
+	float t1 = r * cos(phi), t2 = r * sin(phi);
+	float s = 0.5 * (1.0 + Vh.z);
+	t2 = (1.0 - s) * sqrt(1.0 - t1 * t1) + s * t2;
+	float3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+	return normalize(float3(a * Nh.x, a * Nh.y, max(0.0, Nh.z)));
+}
+
+struct PtSurface {
+	float3 diffuse;  // diffuse colour
+	float3 f0;       // the base's specular reflectance head on
+	float roughness; // the base's (perceptual)
+	float coat;      // lacquer over it: 0 .. 1
+	float coatF0;
+	float coatRoughness;
+	float3 emission; // light it gives off itself (unlit materials: screens, signs)
+};
+
+// The surface of a hit, as the forward shader makes it (the finer points left out: no mask, normal or emission maps).
+// `primary`: seen from the eye (the base texture's finest level: the samples' random places in the pixel filter it).
+PtSurface PtMaterial(BvhHit hit, float t, bool primary, out bool solid) {
+	MaterialData mat;
+	float4 colour = BvhHitAlbedoLevel(hit, primary ? 0.0 : 1.0 + 0.7 * log2(max(t, 1.0)), mat);
+	solid = colour.a > 0.5;
+	uint cls = (uint)mat.params2.z;
+	float3 albedo = saturate(colour.rgb);
+	float metallic = saturate(mat.emissiveMetallic.a);
+	PtSurface s;
+	s.roughness = clamp(mat.params.x, 0.03, 1.0);
+	s.coat = 0.0;
+	s.coatF0 = 0.04;
+	s.coatRoughness = 0.03;
+	s.f0 = lerp(0.04, albedo, metallic);
+	s.diffuse = albedo * (1.0 - metallic);
+	s.emission = 0.0;
+	if (cls == CLASS_UNLIT) {
+		// (as the forward shader: an unlit surface shows its colour, it is not lit; its emission map cannot be read here)
+		s.emission = colour.rgb;
+		s.diffuse = 0.0;
+		s.f0 = 0.0;
+		return s;
+	}
+	if (cls == CLASS_VEHICLE_PAINT) {
+		// the forward shader's paint: chrome, matt, or lacquered pigment with aluminium flakes in it
+		float mirror = smoothstep(0.8, 0.95, metallic) * (1.0 - smoothstep(0.1, 0.3, s.roughness));
+		float lacquered = max(saturate(mat.params2.x * 4.0), 1.0 - smoothstep(0.25, 0.45, s.roughness));
+		float flakes = metallic * (1.0 - mirror);
+		s.coat = lacquered * (1.0 - mirror);
+		s.coatF0 = 0.14; // (as the forward shader: the user's choice of a glossier car)
+		s.f0 = lerp(albedo * flakes + 0.04 * (1.0 - s.coat) * (1.0 - flakes), max(albedo, 0.5) * float3(0.62, 0.63, 0.65), mirror);
+		s.diffuse = albedo * (1.0 - 0.85 * flakes) * (1.0 - mirror);
+		s.roughness = max(s.roughness, lerp(0.03, 0.17, saturate(flakes * 4.0)));
+	} else if (cls == CLASS_VEHICLE_RIM && metallic > 0.5) {
+		float chrome = smoothstep(0.6, 0.95, min(albedo.r, min(albedo.g, albedo.b))) * metallic;
+		s.f0 = lerp(s.f0, float3(0.55, 0.56, 0.58), chrome);
+		s.roughness = lerp(s.roughness, min(s.roughness, 0.06), chrome);
+	} else if (cls == CLASS_VEHICLE_STITCHES) {
+		s.diffuse = 0.01;
+		s.f0 = 0.0;
+		s.roughness = 1.0;
+	} else if (mat.params2.x > 0.0) {
+		s.coat = saturate(mat.params2.x);
+		s.coatRoughness = clamp(mat.params2.y, 0.03, 1.0);
+	}
+	if (cls != CLASS_VEHICLE_PAINT && mat.params3.y > 0.5) {
+		// (the mask map, which rays cannot read, scales the roughness: HDRP's smoothness in its alpha, the game's pack
+		// maps' roughness in red. Taken at a middling value: without it concrete and asphalt came out wet and glossy.)
+		s.roughness = mat.params3.x < 1.5 ? 1.0 - (1.0 - s.roughness) * 0.5 : s.roughness * 0.7;
+		s.roughness = clamp(s.roughness, 0.03, 1.0);
+	}
+	return s;
+}
+
+// How often each lobe is chosen for the next direction: diffuse, base specular, coat (they add up to 1).
+float3 PtLobeWeights(PtSurface s, float NoV) {
+	float coat = s.coat * (s.coatF0 + (1.0 - s.coatF0) * pow(1.0 - NoV, 5.0));
+	float3 spec = PtFresnel(s.f0, NoV);
+	float wd = dot(s.diffuse, 1.0 / 3.0) * (1.0 - coat) * (1.0 - dot(spec, 1.0 / 3.0));
+	float ws = dot(spec, 1.0 / 3.0) * (1.0 - coat);
+	float wc = coat;
+	float sum = wd + ws + wc;
+	return sum > 1e-6 ? float3(wd, ws, wc) / sum : float3(1.0, 0.0, 0.0);
+}
+
+// The surface's response from L towards V (times nothing: the caller multiplies by N.L), and the probability density
+// with which PtSampleLobe would have picked L.
+float3 PtEvaluate(PtSurface s, float3 N, float3 V, float3 L, float3 weights, out float pdf) {
+	pdf = 0.0;
+	float NoL = dot(N, L), NoV = max(dot(N, V), 1e-4);
+	if (NoL <= 0.0) {
+		return 0.0;
+	}
+	float3 H = normalize(V + L);
+	float NoH = saturate(dot(N, H)), VoH = saturate(dot(V, H));
+	float a = s.roughness * s.roughness, ac = s.coatRoughness * s.coatRoughness;
+	float Da = PtD(NoH, a), Dc = PtD(NoH, ac);
+	float3 spec = Da * PtG1(NoV, a) * PtG1(NoL, a) * PtFresnel(s.f0, VoH) / (4.0 * NoV * NoL);
+	float3 diffuse = s.diffuse / PI * (1.0 - PtFresnel(s.f0, NoV));
+	float coatF = s.coat * (s.coatF0 + (1.0 - s.coatF0) * pow(1.0 - VoH, 5.0));
+	float coatSpec = Dc * PtG1(NoV, ac) * PtG1(NoL, ac) * coatF / (4.0 * NoV * NoL);
+	float coatView = s.coat * (s.coatF0 + (1.0 - s.coatF0) * pow(1.0 - NoV, 5.0));
+	pdf = weights.x * NoL / PI + weights.y * Da * PtG1(NoV, a) / (4.0 * NoV) + weights.z * Dc * PtG1(NoV, ac) / (4.0 * NoV);
+	return (diffuse + spec) * (1.0 - coatView) + coatSpec;
+}
+
+// A direction for the next ray, drawn from one of the lobes.
+float3 PtSampleLobe(PtSurface s, float3 N, float3 V, float3 weights) {
+	float3x3 basis = PtBasis(N);
+	float choice = PtRandom();
+	float2 u = float2(PtRandom(), PtRandom());
+	if (choice < weights.x) {
+		float r = sqrt(u.x), phi = 2.0 * PI * u.y;
+		float3 l = float3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u.x)));
+		return normalize(mul(l, basis));
+	}
+	float a = choice < weights.x + weights.y ? s.roughness * s.roughness : s.coatRoughness * s.coatRoughness;
+	float3 Vl = mul(basis, V);
+	float3 H = mul(PtSampleVndf(Vl, max(a, 1e-4), u), basis);
+	return reflect(-V, normalize(H));
+}
+
+// The nearest solid surface along o + d t: passes what the textures' alpha cuts away (a few times).
+BvhHit PtTrace(float3 o, float3 d, out float travelled) {
+	travelled = 0.0;
+	BvhHit hit;
+	for (int attempt = 0; attempt < 4; ++attempt) {
+		hit = BvhTrace(o, d, 5000.0, false);
+		if (hit.t < 0.0) {
+			return hit;
+		}
+		travelled += hit.t;
+		if (BvhHitSolid(hit, travelled)) {
+			hit.t = travelled;
+			return hit;
+		}
+		o += d * (hit.t + 0.01);
+		travelled += 0.01;
+	}
+	hit.t = -1.0;
+	return hit;
+}
+
+// The light arriving at P (normal N, geometric normal Ng) from the sun and from one of the lamps, reflected towards V.
+float3 PtDirect(PtSurface s, float3 P, float3 N, float3 Ng, float3 V, float3 weights) {
+	float3 light = 0.0;
+	float3 origin = P + Ng * (0.002 + 1e-4 * length(P - g_CameraPos.xyz));
+	float pdf;
+	if (g_SunDirection.w > 0.5) {
+		// a point of the sun's disc
+		float cosMax = cos(atan(max(g_RayParams.z, 1e-4)));
+		float u1 = PtRandom(), u2 = PtRandom();
+		float cosT = 1.0 - u1 * (1.0 - cosMax), sinT = sqrt(max(0.0, 1.0 - cosT * cosT)), phi = 2.0 * PI * u2;
+		float3 L = normalize(mul(float3(sinT * cos(phi), sinT * sin(phi), cosT), PtBasis(g_SunDirection.xyz)));
+		float NoL = dot(N, L);
+		if (NoL > 0.0 && dot(Ng, L) > 0.0 && BvhOccluderDistance(origin, L, 5000.0) < 0.0) {
+			light += PtEvaluate(s, N, V, L, weights, pdf) * NoL * g_SunColor.rgb * CloudShadow(P);
+		}
+	}
+	uint count = min((uint)g_GiParams.w, 128u);
+	if (count > 0u) {
+		LightData lamp = g_Lights[min(uint(PtRandom() * float(count)), count - 1u)];
+		float3 toLight = lamp.positionRange.xyz - P;
+		float d2 = dot(toLight, toLight);
+		float range = lamp.positionRange.w;
+		if (d2 < range * range) {
+			float dist = sqrt(d2);
+			float3 L = toLight / max(dist, 1e-4);
+			float NoL = dot(N, L);
+			float w = saturate(1.0 - (d2 * d2) / (range * range * range * range));
+			float attenuation = w * w / max(d2, 0.01);
+			if (lamp.typeFlags.x > 1.5) {
+				float outer = lamp.directionOuter.w, inner = lamp.colorInner.w;
+				attenuation *= smoothstep(outer, max(inner, outer + 1e-4), dot(-L, lamp.directionOuter.xyz));
+				if (lamp.typeFlags.z > 0.5) {
+					attenuation *= 0.15; // (a head lamp's cone is wide and mostly dim: see HeadlampBeam)
+				}
+			}
+			if (NoL > 0.0 && dot(Ng, L) > 0.0 && attenuation > 0.0) {
+				float blocker = BvhOccluderDistance(origin, L, max(dist - 0.05, 0.0));
+				if (blocker < 0.0) {
+					light += PtEvaluate(s, N, V, L, weights, pdf) * NoL * lamp.colorInner.rgb * attenuation * float(count);
+				}
+			}
+		}
+	}
+	return light;
+}
+
+float4 PSPathTrace(FullscreenOutput input) : SV_Target {
+	int2 p = int2(input.position.xy);
+	const uint sampleIndex = uint(g_PassParams.x);
+	const int bounces = int(g_PassParams.y);
+	float4 before = sampleIndex > 0u ? g_SceneColor.Load(int3(p, 0)) : 0.0;
+	s_PtState = PtHash(uint(p.x) + PtHash(uint(p.y) + PtHash(sampleIndex * 9781u + uint(g_PassParams.w))));
+
+	float4 sample = 0.0; // rgb: the light (times a), a: 1 = the path traced picture answers for this sample
+	float depth = g_PostDepth.Load(int3(p, 0)).r;
+	if (depth > 0.0) {
+		// where the depth buffer has the surface (the pixel's middle), and the eye's ray through a random place in the pixel
+		float2 ndcMid = (float2(p) + 0.5) * g_ScreenSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
+		float4 hm = mul(g_InvViewProj, float4(ndcMid, depth, 1.0));
+		float rasterDistance = length(hm.xyz / hm.w - g_CameraPos.xyz);
+		float2 ndc = (float2(p) + float2(PtRandom(), PtRandom())) * g_ScreenSize.zw * float2(2.0, -2.0) + float2(-1.0, 1.0);
+		float4 hf = mul(g_InvViewProj, float4(ndc, 0.5, 1.0));
+		float3 d = normalize(hf.xyz / hf.w - g_CameraPos.xyz);
+		float t;
+		BvhHit hit = PtTrace(g_CameraPos.xyz, d, t);
+		// (the depth buffer has something the rays do not: a person, glass, something drawn but not in the geometry)
+		bool agrees = hit.t >= 0.0 && t < rasterDistance * 1.05 + 0.05;
+		if (agrees) {
+			float3 radiance = 0.0, throughput = 1.0;
+			float3 o = g_CameraPos.xyz;
+			bool rasterNormal = abs(t - rasterDistance) < rasterDistance * 0.02 + 0.02;
+			[loop] for (int bounce = 0; bounce <= bounces; ++bounce) {
+				float3 P = o + d * t;
+				float3 Ng = hit.normal;
+				float3 N = Ng;
+				if (bounce == 0 && rasterNormal) {
+					float3 shading = OctDecode(g_PostAux.Load(int3(p, 0)).xy);
+					N = dot(shading, -d) > 0.0 ? shading : Ng;
+				}
+				float3 V = -d;
+				bool solid;
+				PtSurface s = PtMaterial(hit, t, bounce == 0, solid);
+				radiance += throughput * s.emission;
+				if (any(s.emission > 0.0)) {
+					break;
+				}
+				if (bounce == 0 && rasterNormal && s.coat <= 0.0) {
+					s.roughness = clamp(g_PostAux.Load(int3(p, 0)).z, 0.03, 1.0); // (the rasterised roughness: with the mask map)
+				}
+				float3 weights = PtLobeWeights(s, max(dot(N, V), 1e-4));
+				radiance += throughput * PtDirect(s, P, N, Ng, V, weights);
+				if (bounce == bounces) {
+					break;
+				}
+				float3 L = PtSampleLobe(s, N, V, weights);
+				float pdf;
+				float3 f = PtEvaluate(s, N, V, L, weights, pdf);
+				float NoL = dot(N, L);
+				if (pdf <= 1e-6 || NoL <= 0.0 || dot(Ng, L) <= 0.0) {
+					break;
+				}
+				throughput *= min(f * NoL / pdf, 8.0);
+				if (bounce >= 2) {
+					float keep = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+					if (PtRandom() > keep) {
+						break;
+					}
+					throughput /= keep;
+				}
+				o = P + Ng * (0.002 + 1e-4 * t);
+				d = L;
+				hit = PtTrace(o, d, t);
+				if (hit.t < 0.0) {
+					radiance += throughput * SkyRadiance(d, 0.0) * g_Misc.w; // (the sun's disc is in PtDirect)
+					break;
+				}
+			}
+			sample = float4(SafeColor(radiance), 1.0);
+		}
+	}
+	// the running average
+	return before + (sample - before) / float(sampleIndex + 1u);
+}
+
+// The path traced average over the rasterised picture, by how much of it the paths answered for (blend: a).
+// g_SceneColor: the average.
+float4 PSPathTraceApply(FullscreenOutput input) : SV_Target {
+	float4 average = g_SceneColor.Load(int3(input.position.xy, 0));
+	return average.a > 1e-4 ? float4(average.rgb / average.a, average.a) : 0.0;
 }

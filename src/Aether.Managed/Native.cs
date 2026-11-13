@@ -6,7 +6,7 @@ using System.Text;
 namespace Aether {
 	/// <summary>The C interface of AetherNative.dll (src/Aether.Native/include/AetherApi.h).</summary>
 	internal static class Native {
-		public const int ApiVersion = 7;
+		public const int ApiVersion = 8;
 		public const string Dll = "AetherNative";
 
 		public const int EventFrameBegin = 1;
@@ -41,6 +41,7 @@ namespace Aether {
 		[DllImport(Dll)] public static extern void Aether_SetOverlayVisible(int visible);
 		[DllImport(Dll)] public static extern int Aether_OverlayWantsInput();
 		[DllImport(Dll)] public static extern int Aether_OverlayInputFlags();
+		[DllImport(Dll)] public static extern int Aether_FreeCamera(float fovDegrees, [Out] float[] input);
 		[DllImport(Dll)] public static extern int Aether_BenchmarkWantsUncapped();
 
 		// the scene data contract (SceneCapture/Contract.cs)

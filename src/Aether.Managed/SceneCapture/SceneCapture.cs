@@ -1881,14 +1881,12 @@ namespace Aether {
 						case LightType.Spot: type = AeConst.LightSpot; break;
 						default: continue; // area lights are not part of the contract yet
 						}
-						// The game's lights carry a second component with the settings of its own pipeline. It is the game's
-						// switch as well: a light whose component is disabled is off (the garage's lamps by day), whatever the
-						// Light itself says. Its dimmer and its fade with the distance from the camera apply too.
+						// The game's lights carry a second component with the settings of its own pipeline: its dimmer and its
+						// fade with the distance from the camera apply. (Whether that component is enabled does not matter: HDRP
+						// draws the light all the same. The garage's lamps have it disabled and light the workshop bays in the
+						// game's own picture; Aether, which took them for off, left the bays without them.)
 						float dimmer = 1;
 						if (l.TryGetComponent(out UnityEngine.Rendering.HighDefinition.HDAdditionalLightData data)) {
-							if (!data.isActiveAndEnabled) {
-								continue;
-							}
 							dimmer = data.lightDimmer;
 							if (type != AeConst.LightDirectional && camera != null && data.fadeDistance > 0) {
 								float distance = Vector3.Distance(camera.transform.position, l.transform.position);

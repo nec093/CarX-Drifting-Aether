@@ -22,8 +22,18 @@ public:
 	void Toggle() { SetVisible(!visible_.load()); }
 	bool WantsFrame() const;  // visible, or an approval prompt is waiting
 	bool WantsInput() const { return WantsFrame() && (wantsMouse_.load() || wantsKeyboard_.load()); }
-	// bit 0: the overlay uses the mouse, bit 1: the keyboard
-	int InputFlags() const { return WantsFrame() ? (wantsMouse_.load() ? 1 : 0) | (wantsKeyboard_.load() ? 2 : 0) : 0; }
+	// bit 0: the overlay uses the mouse, bit 1: the keyboard (the free camera takes both while its input is live)
+	int InputFlags() const;
+	// ---- free camera (the game window's procedure switches it with its hotkey and gathers its input)
+	bool FreeCamera() const { return freeCamera_.load(); }
+	// the free camera has the mouse and keyboard: on, and the overlay closed
+	bool FreeCameraLive() const { return freeCamera_.load() && !visible_.load(); }
+	// Main thread (managed, once a frame): the input gathered since the last call. Returns bit 0 on, bit 1 live, bits
+	// 8.. the keys held (FreeCameraKey). out: mouse x, mouse y (counts), wheel (notches), speed, sensitivity.
+	// `fovDegrees`: the camera's field of view, for the display.
+	int TakeFreeCameraInput(float fovDegrees, float out[5]);
+	void FreeCameraStatus(); // (render thread, inside the overlay's UI: its state and the path tracing's samples)
+	enum FreeCameraKey { kKeyForward = 1 << 8, kKeyLeft = 1 << 9, kKeyBack = 1 << 10, kKeyRight = 1 << 11, kKeyDown = 1 << 12, kKeyUp = 1 << 13, kKeyFast = 1 << 14, kKeySlow = 1 << 15, kKeyResetFov = 1 << 16 };
 
 	// ---- main thread: subclass the game window for input and the hotkey (restored by DetachWindow)
 	void AttachWindow(HWND hwnd);
@@ -45,6 +55,7 @@ private:
 	bool EnsureContext(const HostGfx& host, HWND hwnd, DXGI_FORMAT rtvFormat);
 	void ShutdownBackends();
 	void BuildUi(UINT width, UINT height);
+	bool HandleFreeCamera(UINT msg, WPARAM wParam, LPARAM lParam); // true = taken from the game
 	static void SrvAlloc(::ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu);
 	static void SrvFree(::ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu);
 
@@ -53,6 +64,15 @@ private:
 	std::atomic<bool> visible_{false};
 	std::atomic<bool> wantsMouse_{false}, wantsKeyboard_{false};
 	std::atomic<int> hotkey_{0x79};
+	std::atomic<int> freeCameraHotkey_{0x7A};
+	std::atomic<bool> freeCamera_{false};
+	std::atomic<uint32_t> freeCameraKeys_{0};
+	std::atomic<int> mouseX_{0}, mouseY_{0}, wheel_{0};
+	std::atomic<bool> rawMouse_{false}; // raw mouse input arrives (WM_INPUT): its relative motion is used, not the cursor's
+	std::atomic<float> freeCameraFov_{0};
+	int lastCursorX_ = INT_MIN, lastCursorY_ = INT_MIN; // (main thread)
+	bool cursorCentred_ = false; // (main thread) the cursor was put in the window's middle last frame
+	bool loggedInput_ = false;
 
 	std::mutex queueMutex_;
 	std::vector<Message> queue_;

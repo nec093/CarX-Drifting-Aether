@@ -84,7 +84,7 @@ Unity の `Renderer.isVisible` は、カメラが見ている物について LOD
 ## ライト
 
 - 平行光源、点光源、スポットライト。エリアライトは送らない。強さが 0 以下のものも送らない。
-- `HDAdditionalLightData` が無効なライトは消えているものとして扱う（`Light.enabled` に関係なく）。`lightDimmer` を掛け、点光源とスポットライトは `fadeDistance` の最後の 2 割でカメラからの距離に応じて弱める。
+- ライトは `Light` が有効なら使う。`HDAdditionalLightData` が無効でも HDRP は描くので、Aether も使う（ガレージの作業場の灯りがそう。消えているものとして扱っていたときは、ゲームの絵にある灯りが Aether に無かった）。`lightDimmer` を掛け、点光源とスポットライトは `fadeDistance` の最後の 2 割でカメラからの距離に応じて弱める。
 - 色は線形の色 × 強さ（平行光源は lux、他は candela）。色温度を使うライトはその色を掛ける。
 - 名前に `headlight`、`head_light`、`frontlight` を含むスポットライトはヘッドライト（`kAeLightHeadlamp`）。
 - ゲームのパイプラインアセットがライトレイヤーを使う場合、ライトのレイヤーは `Light.renderingLayerMask` の下位 8 ビット。使わない場合はすべてのビット。

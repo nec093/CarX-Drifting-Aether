@@ -11,6 +11,14 @@ struct SettingsData {
 	int overlayHotkey = 0x79;        // VK_F10
 	bool overlayVisibleAtStart = false;
 	float overlayScale = 1.0f;       // 0.5 .. 3
+	// free camera (its hotkey switches it on and off; the game's camera is overridden while it is on)
+	int freeCameraHotkey = 0x7A;     // VK_F11
+	float freeCameraSpeed = 4.0f;    // 0.2 .. 100 m/s (Shift x5, Ctrl x0.2)
+	float freeCameraSensitivity = 0.08f; // 0.01 .. 1 degrees per mouse count
+	// path tracing: off | freeCamera (while the free camera is on) | always
+	std::string pathTracing = "freeCamera";
+	int pathTracingBounces = 4;      // 1 .. 12
+	int pathTracingMaxSamples = 4096; // 1 .. 100000 per pixel; the picture stays as it is after that
 	// renderer
 	std::string quality = "high";    // low | medium | high | ultra
 	bool testTriangle = true;        // Phase 1 PoC pass
@@ -28,10 +36,11 @@ struct SettingsData {
 	bool ssr = true;                 // screen space reflections as the game's volumes set them
 	bool volumetricFog = true;       // fog lit by the sun through the shadow map (light shafts), where the scene has fog
 	bool followSceneNight = true;    // the physical sky turns to night when the game's scene does (its day / night switch)
-	bool rayTracedGi = true;         // the ambient light per pixel from long rays (with rayTracedLighting); the probe grid stops meanwhile
+	bool radianceCascades = true;    // the indirect light everywhere from radiance cascades (needs the ray tracing geometry); off: the probe grid
+	bool rayTracedGi = false;        // the opaque surfaces' ambient light per pixel from long rays (with rayTracedLighting) instead of the cascades or the probes
 	bool rayTracedLighting = true;   // the sun's shadow and the ambient occlusion from rays (NRD SIGMA, REBLUR); off: shadow map and screen space occlusion
 	bool lensFlare = true;           // ghosts, a halo and rays from the sun and from bright lamps, as a camera's lens makes them
-	bool probeGi = true;             // indirect light from a grid of probes around the camera that trace rays (needs the ray tracing geometry; not while rayTracedGi runs)
+	bool probeGi = true;             // indirect light from a grid of probes around the camera that trace rays (needs the ray tracing geometry; only when radianceCascades is off)
 	bool reflectionProbe = true;     // the surroundings drawn into a cube around the camera every frame, for reflections
 	bool rayTracedReflections = true; // smooth surfaces mirror what rays through the scene's triangles find (also off screen)
 	bool indirectLight = true;       // light bounced off nearby surfaces (screen space, with the ambient occlusion pass)
@@ -54,7 +63,7 @@ struct SettingsData {
 	// after about 45 s forty of Aether's 48 command lists wait for it and most frames are skipped: the picture flickers).
 	float skinnedRayUpdates = 0.0f;
 	float moonlight = 0.5f;        // 0 .. 4: the moon's light at night, as a factor (1: a night one can see the yard in; 0.25: nearly black)
-	float fogStrength = 1.0f;      // 0 .. 20: factor on the scene's fog density
+	float fogStrength = 1.0f;      // 0 .. 20: factor on the fog density (physical sky: the air's own haze; else the scene's fog)
 	float smokeOpacity = 1.0f; // Tyre smoke opacity factor
 	float lodBias = 2.8f; // Unity's LOD bias: higher keeps detailed models up to a greater distance
 	int anisotropicLevel = 9; // Anisotropic texture filtering level

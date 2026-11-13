@@ -10,8 +10,12 @@
 static const float kAtmoGround = 6360.0;
 static const float kAtmoTop = 6460.0;
 static const float3 kRayleighScattering = float3(5.802e-3, 13.558e-3, 33.1e-3);
-static const float kMieScattering = 3.996e-3;
-static const float kMieAbsorption = 4.40e-3;
+// The haze (aerosols) of an ordinary clear day: an optical depth of 0.1 at 550 nm (about the world's mean, AERONET),
+// a scale height of 1.2 km, and a single scattering albedo of 0.92 (they mostly scatter). (The paper's values, 3.996e-3
+// and 4.40e-3, are an optical depth of 0.01 that absorbs more than it scatters: a sky far cleaner than real air, which
+// gave the ground some 0.6 of the diffuse light a real clear sky gives, and shade too dark.)
+static const float kMieScattering = 7.67e-2;
+static const float kMieAbsorption = 6.7e-3;
 static const float3 kOzoneAbsorption = float3(0.650e-3, 1.881e-3, 0.085e-3);
 static const float3 kGroundAlbedo = float3(0.18, 0.17, 0.16);
 
@@ -82,7 +86,7 @@ float RayleighPhase(float c) {
 }
 
 float MiePhase(float c) {
-	const float g = 0.8;
+	const float g = 0.75; // (continental haze: 0.7 to 0.8)
 	float k = 3.0 / (8.0 * PI) * (1.0 - g * g) / (2.0 + g * g);
 	return k * (1.0 + c * c) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
 }

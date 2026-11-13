@@ -102,19 +102,20 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 | `motionBlur` | モーションブラー（強さはゲームの設定に従う） |
 | `ssr` | 画面空間反射（ゲームのボリュームで有効な所だけ。テンポラルアンチエイリアスが要る） |
 | `particles` | パーティクル（ゲームのパーティクルシステムとタイヤスモーク） |
-| `volumetricFog` | シャドウマップを通した太陽光で照らす霧（光の筋）。シーンに霧がある所だけ |
+| `volumetricFog` | シャドウマップを通した太陽光で照らす霧（光の筋）。物理の空では空気そのものの霞、シーンの空ではシーンの霧 |
 | `indirectLight` | 近くの面からの照り返し（画面空間） |
 | `reflectionProbe` | 毎フレーム、カメラの周りにキューブを描いて、画面外も含めた周囲の映り込みにする |
 | `rayTracedReflections` | シーンの三角形にレイを飛ばした、滑らかな面の反射（画面外も映る） |
 | `followSceneNight` | ゲームの昼夜の切り替えが夜の間、物理的な空も夜（真夜中ごろ、月が出る）にする |
-| `rayTracedGi` | 画素ごとのレイトレース間接光（最大 60 m、NRD REBLUR）。`rayTracedLighting` が必要。動いている間は `probeGi` の格子を止める |
-| `probeGi` | カメラの周りのプローブの格子からの間接光（各プローブが毎フレーム、シーンの三角形にレイを飛ばす）。`rayTracedGi` が動かないときに使う |
+| `radianceCascades` | Radiance Cascades の間接光（既定オン）。画面、光線が当たった面、ガラス、煙、反射プローブのすべてが使う。`probeGi` の代わり |
+| `rayTracedGi` | 不透明面の環境光を画素ごとのレイトレース（最大 60 m、NRD REBLUR）で求める（既定オフ）。`rayTracedLighting` が必要 |
+| `probeGi` | カメラの周りのプローブの格子からの間接光（各プローブが毎フレーム、シーンの三角形にレイを飛ばす）。`radianceCascades` がオフのときに使う |
 | `lensFlare` | 太陽と明るいランプからのレンズフレア |
 | `rayTracedLighting` | レイトレースの太陽の影と AO（NVIDIA NRD の SIGMA、REBLUR でノイズ除去）。オフ：シャドウマップと SSAO。状態は `get_scene_info` の `lightingDenoiser` |
 
 ### set_graphics_option のオプション
 
-受け付けるのは次の 21 個です（`Api.cpp` の `kOptions`）。範囲の検証は設定と同じ（`src/Aether.Native/Core/Config.cpp`）です。
+受け付けるのは次の 27 個です（`Api.cpp` の `kOptions`）。範囲の検証は設定と同じ（`src/Aether.Native/Core/Config.cpp`）です。
 
 | オプション | 値 | 内容 |
 |---|---|---|
@@ -125,7 +126,7 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 | `cloudSpeed` | 0〜4 | 雲の流れる速さ |
 | `shadowSoftness` | 0〜4 | 太陽の影の縁のぼかし（シャドウマップのテクセル数。0 で硬い影） |
 | `indirectStrength` | 0〜3 | 照り返しの係数 |
-| `fogStrength` | 0〜20 | シーンの霧の濃さの係数 |
+| `fogStrength` | 0〜20 | 霧の濃さの係数（物理の空では空気の霞、シーンの空ではシーンの霧に掛かる） |
 | `moonlight` | 0〜4 | 夜の月の光の係数 |
 | `skinnedRayUpdates` | 0〜4 | レイトレースの反射のために、毎フレーム GPU から姿勢を読み戻すスキンメッシュの数（既定 0。毎フレームの読み戻しは、しばらくするとゲームがフレームを飛ばす原因になる） |
 | `motionBlurStrength` | 0〜2 | モーションブラーの強さ（シーンの値への係数） |
@@ -139,6 +140,11 @@ Aether.MCP.exe [--allow-control] [--pipe <name>] [--list-tools]
 | `vsync` | 0〜2（整数） | 垂直同期：0 オフ、1 毎リフレッシュ、2 1 回おき |
 | `exposureEV` | −10〜10 | シーンの露出に足す補正（段） |
 | `tonemap` | `host` / `agx` / `aces` / `neutral` / `none` | トーンマッピングの曲線 |
+| `pathTracing` | `off` / `freeCamera` / `always` | パストレーシング：オフ、フリーカメラ（F11）の間だけ（既定）、常に |
+| `pathTracingBounces` | 1〜12（整数） | パストレーシングの経路のバウンス数（既定 4） |
+| `pathTracingMaxSamples` | 1〜100000（整数） | パストレーシングを重ねる画素あたりのサンプル数の上限（既定 4096） |
+| `freeCameraSpeed` | 0.2〜100 | フリーカメラの速さ（m/s） |
+| `freeCameraSensitivity` | 0.01〜1 | フリーカメラのマウスの感度（度 / カウント） |
 | `reflectionDenoiser` | `nrd` / `off` | 既定 `nrd`：反射の光線を表面のローブからサンプリングし、NVIDIA NRD（REBLUR）でノイズ除去する。`off`：鏡面方向の光線、ノイズ除去なし。状態は `get_scene_info` の `reflectionDenoiser` |
 
 MCP から変えられない設定：`overlayHotkey`、`overlayVisibleAtStart`、`overlayScale`、`vramBudgetMB`、`vramWarnPercent`、`mcpControl`、`mcpApprovalTimeoutSec`、`logLevel`。`quality` は `set_render_quality`、`renderMode` と `debugView` は `set_render_mode` で変えます。

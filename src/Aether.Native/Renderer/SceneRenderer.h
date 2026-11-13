@@ -43,6 +43,9 @@ public:
 	void SetSceneNight(bool night) { sceneNight_.store(night); }
 	// (towards the sun or the moon, as the last frame had it; read without a lock: a torn read is three old or new floats)
 	Vec3 SunDirection() const { return sunDirection_; }
+	// the path traced picture (setting pathTracing): running, and the samples per pixel averaged so far
+	struct PathTraceStatus { bool active = false; uint32_t samples = 0; };
+	PathTraceStatus PathTracing() const { return {ptActiveShown_.load(), ptSamplesShown_.load()}; }
 	json GraphDescription() { return graph_.Describe(); }
 
 private:
@@ -69,7 +72,7 @@ private:
 	void UploadDefaults(ID3D12GraphicsCommandList* list);
 	ID3D12PipelineState* Pipeline(uint32_t layoutId, PassKind kind, uint32_t cull);
 	// full screen passes: one pixel shader each (scene_post.hlsl), named in kFullscreenEntry (SceneRenderer.cpp)
-	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenGiRays, kFullscreenGiIrradiance, kFullscreenGiDepth, kFullscreenLensFlare, kFullscreenSmokeApply, kFullscreenSunRays, kFullscreenAoRays, kFullscreenKindCount };
+	enum FullscreenKind { kFullscreenSky = 0, kFullscreenComposite, kFullscreenAo, kFullscreenAoBlur, kFullscreenExposure, kFullscreenIrradiance, kFullscreenTaa, kFullscreenMotionBlur, kFullscreenBloomDown, kFullscreenBloomUp, kFullscreenSsr, kFullscreenTransmittanceLut, kFullscreenMultiScatterLut, kFullscreenSkyView, kFullscreenCloudNoise, kFullscreenSkyClouds, kFullscreenClouds, kFullscreenFog, kFullscreenFogApply, kFullscreenReflectionBlur, kFullscreenBvhDebug, kFullscreenRayTrace, kFullscreenGiRays, kFullscreenGiIrradiance, kFullscreenGiDepth, kFullscreenLensFlare, kFullscreenSmokeApply, kFullscreenSunRays, kFullscreenAoRays, kFullscreenRcTrace, kFullscreenRcIrradiance, kFullscreenRcDepth, kFullscreenPathTrace, kFullscreenPathTraceApply, kFullscreenKindCount };
 	// draws a full screen pass into `output` (its whole size) with up to three inputs; `params` reach the shader as g_PassParams
 	bool Fullscreen(RenderGraph::PassContext& ctx, FullscreenKind kind, GpuTexture* output, GpuTexture* in0, GpuTexture* in1 = nullptr, GpuTexture* in2 = nullptr, const float* params = nullptr, GpuTexture* in3 = nullptr);
 	uint32_t postNext_ = 0; // the next free table of this frame's post tables
@@ -135,6 +138,21 @@ private:
 	// probe grid GI: this frame's rays, the probes' irradiance and their distances (each probe a tile of 8 x 8)
 	std::shared_ptr<GpuTexture> giRays_, giIrradiance_, giDepth_;
 	bool gi_ = false, giHistory_ = false;
+	// radiance cascades (setting radianceCascades): the atlases of this frame and the frame before (in turn), level
+	// 0's light per normal, and the camera position the atlas of the frame before was made for
+	bool rc_ = false, rcHistory_ = false;
+	std::shared_ptr<GpuTexture> rcAtlas_[2], rcIrradiance_, rcDepth_; // (rcDepth_: how far each level 0 probe sees, 8 x 8 directions)
+	uint32_t rcIndex_ = 0;
+	// path tracing (setting pathTracing): the running average of the samples (two in turn: read the one, write the
+	// other), how many it holds, and what it was made for (when that changes, it starts anew)
+	bool pathTrace_ = false;
+	std::shared_ptr<GpuTexture> ptAccum_[2];
+	uint32_t ptIndex_ = 0, ptSamples_ = 0;
+	int ptResetBy_ = -1; // (which part of the key last started the average anew: for the pass's note)
+	float ptKey_[40] = {};
+	std::atomic<bool> ptActiveShown_{false};
+	std::atomic<uint32_t> ptSamplesShown_{0};
+	float rcCamera_[3] = {0, 0, 0};
 	bool lensFlare_ = false;
 	float lensFlareStrength_ = 0.0f;
 	int giMin_[3] = {0, 0, 0}; // the grid cell of the volume's lowest corner

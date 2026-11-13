@@ -35,8 +35,137 @@ void Overlay::SetVisible(bool visible) {
 	}
 }
 
+static bool IsMouseMessage(UINT msg);
+
 bool Overlay::WantsFrame() const {
 	return visible_.load() || Runtime::Get().ApprovalPending();
+}
+
+int Overlay::InputFlags() const {
+	if (FreeCameraLive()) {
+		return 3; // the free camera has the mouse and the keyboard: the game must not drive or steer the menus with them
+	}
+	return WantsFrame() ? (wantsMouse_.load() ? 1 : 0) | (wantsKeyboard_.load() ? 2 : 0) : 0;
+}
+
+int Overlay::TakeFreeCameraInput(float fovDegrees, float out[5]) {
+	freeCameraFov_.store(fovDegrees);
+	const SettingsData s = Settings::Get().Snapshot();
+	freeCameraHotkey_.store(s.freeCameraHotkey);
+	const bool live = FreeCameraLive();
+	uint32_t keys = freeCameraKeys_.load();
+	if (live && hooked_ && GetForegroundWindow() == hooked_) {
+		// The keys' state and the cursor read directly: the game takes the keyboard and the mouse through raw input
+		// (Rewired), and the letter keys and mouse motion did not all arrive as window messages (the camera did not move).
+		auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+		if (down('W') || down(VK_UP)) keys |= kKeyForward;
+		if (down('A') || down(VK_LEFT)) keys |= kKeyLeft;
+		if (down('S') || down(VK_DOWN)) keys |= kKeyBack;
+		if (down('D') || down(VK_RIGHT)) keys |= kKeyRight;
+		if (down('Q') || down('C')) keys |= kKeyDown;
+		if (down('E') || down(VK_SPACE)) keys |= kKeyUp;
+		if (down(VK_SHIFT)) keys |= kKeyFast;
+		if (down(VK_CONTROL)) keys |= kKeySlow;
+		if (down('R')) keys |= kKeyResetFov;
+		if (!rawMouse_.load()) {
+			// the cursor's way from the window's middle since the last frame, then back to the middle
+			RECT rc;
+			POINT centre = {0, 0}, cursor;
+			if (GetClientRect(hooked_, &rc) && GetCursorPos(&cursor)) {
+				centre = {(rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2};
+				ClientToScreen(hooked_, &centre);
+				if (cursorCentred_) {
+					mouseX_.fetch_add(cursor.x - centre.x);
+					mouseY_.fetch_add(cursor.y - centre.y);
+				}
+				SetCursorPos(centre.x, centre.y);
+				cursorCentred_ = true;
+			}
+		}
+	} else {
+		cursorCentred_ = false;
+	}
+	if (live && keys != 0 && !loggedInput_) {
+		loggedInput_ = true;
+		AE_LOG(Info, "Overlay", "Free camera: keys arrive (0x%X)", keys);
+	}
+	const int mx = mouseX_.exchange(0), my = mouseY_.exchange(0), wheel = wheel_.exchange(0);
+	out[0] = live ? float(mx) : 0.0f;
+	out[1] = live ? float(my) : 0.0f;
+	out[2] = live ? float(wheel) / float(WHEEL_DELTA) : 0.0f;
+	out[3] = s.freeCameraSpeed;
+	out[4] = s.freeCameraSensitivity;
+	int result = (freeCamera_.load() ? 1 : 0) | (live ? 2 : 0);
+	if (live) {
+		result |= int(keys);
+	}
+	return result;
+}
+
+// The free camera's input, while it has it (on, the overlay closed): every key and mouse message is kept from the
+// game. Keys held are remembered, the mouse's motion and wheel are added up for TakeFreeCameraInput.
+bool Overlay::HandleFreeCamera(UINT msg, WPARAM wParam, LPARAM lParam) {
+	auto keyBit = [](WPARAM vk) -> uint32_t {
+		switch (vk) {
+		case 'W': case VK_UP: return kKeyForward;
+		case 'A': case VK_LEFT: return kKeyLeft;
+		case 'S': case VK_DOWN: return kKeyBack;
+		case 'D': case VK_RIGHT: return kKeyRight;
+		case 'Q': case 'C': return kKeyDown;
+		case 'E': case VK_SPACE: return kKeyUp;
+		case VK_SHIFT: return kKeyFast;
+		case VK_CONTROL: return kKeySlow;
+		case 'R': return kKeyResetFov;
+		default: return 0;
+		}
+	};
+	switch (msg) {
+	case WM_KEYDOWN:
+	case WM_SYSKEYDOWN:
+		freeCameraKeys_.fetch_or(keyBit(wParam));
+		return true;
+	case WM_KEYUP:
+	case WM_SYSKEYUP:
+		freeCameraKeys_.fetch_and(~keyBit(wParam));
+		return true;
+	case WM_CHAR:
+	case WM_SYSCHAR:
+	case WM_DEADCHAR:
+		return true;
+	case WM_KILLFOCUS:
+		freeCameraKeys_.store(0); // (a key let go in another window never comes back as a key up)
+		return false;
+	case WM_INPUT: {
+		// relative motion straight from the mouse (the game registered for raw input): not stopped by the screen's edge
+		UINT size = 0;
+		GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER));
+		alignas(8) BYTE buffer[256];
+		if (size > 0 && size <= sizeof(buffer) && GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, buffer, &size, sizeof(RAWINPUTHEADER)) == size) {
+			const RAWINPUT* raw = reinterpret_cast<const RAWINPUT*>(buffer);
+			if (raw->header.dwType == RIM_TYPEMOUSE && (raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+				mouseX_.fetch_add(raw->data.mouse.lLastX);
+				mouseY_.fetch_add(raw->data.mouse.lLastY);
+				if (!rawMouse_.exchange(true)) {
+					AE_LOG(Info, "Overlay", "Free camera: the mouse's raw input is used for looking round");
+				}
+			}
+		}
+		return true;
+	}
+	case WM_MOUSEMOVE: {
+		// (without raw input: the cursor's motion, ignoring jumps such as the game putting it back in the middle)
+		const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+		// (without raw input the cursor is read and put back in the middle once a frame: TakeFreeCameraInput)
+		lastCursorX_ = x;
+		lastCursorY_ = y;
+		return true;
+	}
+	case WM_MOUSEWHEEL:
+		wheel_.fetch_add(GET_WHEEL_DELTA_WPARAM(wParam));
+		return true;
+	default:
+		return IsMouseMessage(msg) && msg != WM_MOUSELEAVE && msg != WM_NCMOUSELEAVE && msg != WM_NCMOUSEMOVE;
+	}
 }
 
 // ------------------------------------------------------------------------------------------------ window procedure
@@ -57,6 +186,11 @@ void Overlay::AttachWindow(HWND hwnd) {
 	}
 	previousProc_ = reinterpret_cast<WNDPROC>(previous);
 	hooked_ = hwnd;
+	{
+		const SettingsData s = Settings::Get().Snapshot();
+		hotkey_.store(s.overlayHotkey);
+		freeCameraHotkey_.store(s.freeCameraHotkey);
+	}
 	AE_LOG(Info, "Overlay", "Input attached to the game window (hotkey: virtual key %d)", hotkey_.load());
 }
 
@@ -103,7 +237,27 @@ LRESULT Overlay::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		}
 		return 0;
 	}
-	if (!WantsFrame()) {
+	if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && int(wParam) == freeCameraHotkey_.load()) {
+		if (!(lParam & (1 << 30))) {
+			const bool on = !freeCamera_.load();
+			freeCameraKeys_.store(0);
+			mouseX_.store(0);
+			mouseY_.store(0);
+			wheel_.store(0);
+			lastCursorX_ = lastCursorY_ = INT_MIN;
+			cursorCentred_ = false;
+			freeCamera_.store(on);
+			AE_LOG(Info, "Overlay", "Free camera %s", on ? "on" : "off");
+		}
+		return 0;
+	}
+	if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && (int(wParam) == hotkey_.load() || int(wParam) == freeCameraHotkey_.load())) {
+		return 0;
+	}
+	if (FreeCameraLive() && HandleFreeCamera(msg, wParam, lParam)) {
+		return msg == WM_INPUT ? DefWindowProcW(hwnd, msg, wParam, lParam) : 0; // (raw input must still be cleaned up)
+	}
+	if (!visible_.load() && !Runtime::Get().ApprovalPending()) {
 		return CallWindowProcW(next, hwnd, msg, wParam, lParam);
 	}
 	const bool mouse = IsMouseMessage(msg), keyboard = IsKeyboardMessage(msg);
@@ -283,7 +437,9 @@ bool Overlay::Draw(const HostGfx& host, HWND hwnd, DXGI_FORMAT rtvFormat, UINT w
 
 	SettingsData s = Settings::Get().Snapshot();
 	hotkey_.store(s.overlayHotkey);
+	freeCameraHotkey_.store(s.freeCameraHotkey);
 	ImGuiIO& io = ImGui::GetIO();
+	io.MouseDrawCursor = visible_.load(); // (the game hides the system cursor while driving; no cursor over the free camera's view)
 	if (appliedScale_ != s.overlayScale) {
 		ImGuiStyle style;
 		ImGui::StyleColorsDark(&style);
@@ -779,7 +935,7 @@ void SettingsTab() {
 		{"antialiasing", "Antialiasing (temporal)", s.antialiasing}, {"shadows", "Sun shadows", s.shadows}, {"ssao", "Ambient occlusion", s.ssao},
 		{"ssr", "Screen space reflections", s.ssr}, {"bloom", "Bloom", s.bloom}, {"motionBlur", "Motion blur", s.motionBlur},
 		{"particles", "Particles and tyre smoke", s.particles}, {"volumetricFog", "Volumetric fog (light shafts)", s.volumetricFog},
-		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections}, {"probeGi", "Global illumination (probe grid; when per pixel is off)", s.probeGi}, {"lensFlare", "Lens flare", s.lensFlare}, {"rayTracedLighting", "Ray traced shadows and ambient occlusion (NVIDIA NRD)", s.rayTracedLighting}, {"rayTracedGi", "Ray traced ambient light per pixel (NVIDIA NRD)", s.rayTracedGi}, {"followSceneNight", "Night when the game's scene is at night", s.followSceneNight},
+		{"indirectLight", "Indirect light (bounced, screen space)", s.indirectLight}, {"reflectionProbe", "Reflection probes", s.reflectionProbe}, {"rayTracedReflections", "Ray traced reflections", s.rayTracedReflections}, {"probeGi", "Global illumination (probe grid; when cascades are off)", s.probeGi}, {"lensFlare", "Lens flare", s.lensFlare}, {"rayTracedLighting", "Ray traced shadows and ambient occlusion (NVIDIA NRD)", s.rayTracedLighting}, {"rayTracedGi", "Ambient light per pixel from long rays (NVIDIA NRD)", s.rayTracedGi}, {"radianceCascades", "Global illumination (radiance cascades)", s.radianceCascades}, {"followSceneNight", "Night when the game's scene is at night", s.followSceneNight},
 	};
 	for (Toggle& t : toggles) {
 		if (ImGui::Checkbox(t.label, &t.value)) {
@@ -819,6 +975,31 @@ void SettingsTab() {
 	int vsync = s.vsync;
 	if (ImGui::Combo("Vertical sync", &vsync, vsyncText, 3)) {
 		settings.Set("vsync", vsync, "overlay");
+	}
+	ImGui::SeparatorText("Free camera and path tracing");
+	ImGui::TextDisabled("F11 (\"freeCameraHotkey\") switches the free camera on and off; the game's UI is hidden while it is on.");
+	Overlay::Get().FreeCameraStatus();
+	static const char* ptModes[] = {"off", "freeCamera", "always"};
+	static const char* ptText[] = {"Off", "While the free camera is on", "Always"};
+	int ptMode = s.pathTracing == "off" ? 0 : s.pathTracing == "always" ? 2 : 1;
+	if (ImGui::Combo("Path tracing", &ptMode, ptText, 3)) {
+		settings.Set("pathTracing", ptModes[ptMode], "overlay");
+	}
+	int bounces = s.pathTracingBounces;
+	if (ImGui::SliderInt("Path tracing bounces", &bounces, 1, 12)) {
+		settings.Set("pathTracingBounces", bounces, "overlay");
+	}
+	int maxSamples = s.pathTracingMaxSamples;
+	if (ImGui::InputInt("Path tracing samples per pixel", &maxSamples, 256, 4096)) {
+		settings.Set("pathTracingMaxSamples", std::min(std::max(maxSamples, 1), 100000), "overlay");
+	}
+	float camSpeed = s.freeCameraSpeed;
+	if (ImGui::SliderFloat("Free camera speed (m/s)", &camSpeed, 0.2f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic)) {
+		settings.Set("freeCameraSpeed", camSpeed, "overlay");
+	}
+	float camLook = s.freeCameraSensitivity;
+	if (ImGui::SliderFloat("Free camera mouse sensitivity", &camLook, 0.01f, 1.0f, "%.2f", ImGuiSliderFlags_Logarithmic)) {
+		settings.Set("freeCameraSensitivity", camLook, "overlay");
 	}
 	ImGui::SeparatorText("AI agent (MCP)");
 	static const char* modes[] = {"deny", "ask", "allow"};
@@ -897,6 +1078,23 @@ void ApprovalWindow(UINT width, UINT height) {
 }
 
 } // namespace
+
+// The free camera's state in the overlay (nothing is drawn over the picture while it is on: the UI is hidden then).
+void Overlay::FreeCameraStatus() {
+	const SettingsData s = Settings::Get().Snapshot();
+	if (freeCamera_.load()) {
+		ImGui::Text("Free camera on (field of view %.0f deg), held while the overlay is open", freeCameraFov_.load());
+	} else {
+		ImGui::TextDisabled("Free camera off");
+	}
+	ImGui::TextDisabled("WASD / arrows move, E / Space up, Q / C down, mouse looks, wheel zooms, R resets the zoom, Shift faster, Ctrl slower.");
+	const SceneRenderer::PathTraceStatus pt = SceneRenderer::Get().PathTracing();
+	if (pt.active) {
+		ImGui::Text("Path tracing: %u / %d samples per pixel%s", pt.samples, s.pathTracingMaxSamples, pt.samples >= uint32_t(s.pathTracingMaxSamples) ? " (done)" : "");
+	} else if (s.pathTracing != "off" && (freeCamera_.load() || s.pathTracing == "always")) {
+		ImGui::TextDisabled("Path tracing not running (it needs DXR 1.1 and the scene's ray tracing geometry)");
+	}
+}
 
 void Overlay::BuildUi(UINT width, UINT height) {
 	ApprovalWindow(width, height);

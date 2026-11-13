@@ -8,9 +8,10 @@
 namespace aether {
 
 static const std::vector<std::string> kQualities = {"low", "medium", "high", "ultra"};
-static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections", "followSceneNight", "probeGi", "lensFlare", "rayTracedLighting", "rayTracedGi"};
+static const std::vector<std::string> kFeatures = {"testTriangle", "gpuTiming", "shadows", "sky", "ssao", "antialiasing", "bloom", "motionBlur", "ssr", "particles", "volumetricFog", "indirectLight", "reflectionProbe", "rayTracedReflections", "followSceneNight", "probeGi", "lensFlare", "rayTracedLighting", "rayTracedGi", "radianceCascades"};
 static const std::vector<std::string> kRenderModes = {"hdrp", "aether", "compare", "standalone"};
 static const std::vector<std::string> kSkyModes = {"physical", "scene"};
+static const std::vector<std::string> kPathTracingModes = {"off", "freeCamera", "always"};
 static const std::vector<std::string> kTonemaps = {"host", "agx", "aces", "neutral", "none"};
 static const std::vector<std::string> kReflectionDenoisers = {"off", "nrd"};
 static const std::vector<std::string> kControlModes = {"deny", "ask", "allow"};
@@ -32,6 +33,12 @@ static json ToJsonData(const SettingsData& d) {
 		{"overlayHotkey", d.overlayHotkey},
 		{"overlayVisibleAtStart", d.overlayVisibleAtStart},
 		{"overlayScale", d.overlayScale},
+		{"freeCameraHotkey", d.freeCameraHotkey},
+		{"freeCameraSpeed", d.freeCameraSpeed},
+		{"freeCameraSensitivity", d.freeCameraSensitivity},
+		{"pathTracing", d.pathTracing},
+		{"pathTracingBounces", d.pathTracingBounces},
+		{"pathTracingMaxSamples", d.pathTracingMaxSamples},
 		{"quality", d.quality},
 		{"testTriangle", d.testTriangle},
 		{"gpuTiming", d.gpuTiming},
@@ -52,6 +59,7 @@ static json ToJsonData(const SettingsData& d) {
 		{"lensFlare", d.lensFlare},
 		{"rayTracedLighting", d.rayTracedLighting},
 		{"rayTracedGi", d.rayTracedGi},
+		{"radianceCascades", d.radianceCascades},
 		{"followSceneNight", d.followSceneNight},
 		{"rayTracedReflections", d.rayTracedReflections},
 		{"indirectStrength", d.indirectStrength},
@@ -90,6 +98,12 @@ json Settings::Schema() {
 		{"overlayHotkey", {{"type", "integer"}, {"minimum", 8}, {"maximum", 254}, {"description", "Windows virtual key code that shows / hides the overlay (default 121 = F10)"}}},
 		{"overlayVisibleAtStart", {{"type", "boolean"}, {"description", "Show the overlay when the game starts"}}},
 		{"overlayScale", {{"type", "number"}, {"minimum", 0.5}, {"maximum", 3.0}, {"description", "Overlay UI scale"}}},
+		{"freeCameraHotkey", {{"type", "integer"}, {"minimum", 8}, {"maximum", 254}, {"description", "Windows virtual key code that switches the free camera on and off (default 122 = F11)"}}},
+		{"freeCameraSpeed", {{"type", "number"}, {"minimum", 0.2}, {"maximum", 100.0}, {"description", "Free camera speed in m/s (Shift: five times, Ctrl: a fifth)"}}},
+		{"freeCameraSensitivity", {{"type", "number"}, {"minimum", 0.01}, {"maximum", 1.0}, {"description", "Free camera mouse look, degrees per mouse count"}}},
+		{"pathTracing", oneOf(kPathTracingModes, "Path traced picture: off, freeCamera (while the free camera is on), always. The opaque scene is traced with the sun, the sky and the lamps over several bounces and averaged over the frames while nothing changes. Needs DXR 1.1")},
+		{"pathTracingBounces", {{"type", "integer"}, {"minimum", 1}, {"maximum", 12}, {"description", "Bounces of each path traced ray"}}},
+		{"pathTracingMaxSamples", {{"type", "integer"}, {"minimum", 1}, {"maximum", 100000}, {"description", "Samples per pixel after which the path traced picture stops being refined"}}},
 		{"quality", oneOf(kQualities, "Render quality preset")},
 		{"testTriangle", {{"type", "boolean"}, {"description", "Draw the DX12 integration test triangle"}}},
 		{"gpuTiming", {{"type", "boolean"}, {"description", "Measure GPU time with timestamp queries"}}},
@@ -107,11 +121,12 @@ json Settings::Schema() {
 		{"followSceneNight", {{"type", "boolean"}, {"description", "The physical sky turns to night (about midnight, moon up) while the game's own day / night switch is on night"}}},
 		{"lensFlare", {{"type", "boolean"}, {"description", "Lens flare: ghosts, a halo and rays from the sun and from bright lamps"}}},
 		{"rayTracedLighting", {{"type", "boolean"}, {"description", "The sun's shadow and the ambient occlusion (with the light bounced off nearby surfaces) from rays, denoised by NVIDIA NRD (SIGMA, REBLUR); off: the shadow map and screen space occlusion. Needs DXR 1.1"}}},
-		{"rayTracedGi", {{"type", "boolean"}, {"description", "The ambient light per pixel from rays up to 60 m (the sky where they get out, the lit surface where they meet one), denoised with the occlusion (NRD REBLUR). Needs rayTracedLighting; while it runs the probe grid (probeGi) stops"}}},
-		{"probeGi", {{"type", "boolean"}, {"description", "Indirect light from a grid of probes around the camera: each traces rays through the scene's triangles every frame (roofs shut out the sky, lit surfaces light their surroundings). Used when rayTracedGi does not run"}}},
+		{"rayTracedGi", {{"type", "boolean"}, {"description", "The opaque surfaces' ambient light per pixel from rays up to 60 m (the sky where they get out, the lit surface where they meet one), denoised with the occlusion (NRD REBLUR), instead of the cascades or the probes. Needs rayTracedLighting"}}},
+		{"radianceCascades", {{"type", "boolean"}, {"description", "The indirect light everywhere (the picture, what rays meet, glass, smoke, the reflection probes) from radiance cascades: five levels of probes round the camera over 96 x 32 x 96 m, merged into the light from every distance; no edge where the sky takes over. Replaces probeGi. Needs DXR 1.1"}}},
+		{"probeGi", {{"type", "boolean"}, {"description", "Indirect light from a grid of probes around the camera: each traces rays through the scene's triangles every frame (roofs shut out the sky, lit surfaces light their surroundings). Used when radianceCascades is off"}}},
 		{"rayTracedReflections", {{"type", "boolean"}, {"description", "Reflections on smooth surfaces from rays traced through the scene's triangles (what is off screen too)"}}},
 		{"moonlight", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "The moon's light at night, as a factor"}}},
-		{"fogStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 20.0}, {"description", "Factor on the scene's fog density"}}},
+		{"fogStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 20.0}, {"description", "Factor on the fog density: the air's own haze with the physical sky, else the scene's fog"}}},
 		{"skinnedRayUpdates", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 4.0}, {"description", "Skinned meshes whose pose is read back from the GPU per frame for ray traced reflections (0 = none, the default: reading every frame makes the game skip frames after a while)"}}},
 		{"indirectStrength", {{"type", "number"}, {"minimum", 0.0}, {"maximum", 3.0}, {"description", "Factor on the bounced light"}}},
 		{"particles", {{"type", "boolean"}, {"description", "Particles (the game's particle systems and tyre smoke)"}}},
@@ -191,6 +206,19 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 		d.overlayScale = float(v);
 		return {};
 	}
+	if (key == "freeCameraHotkey") return wantInt(d.freeCameraHotkey, 8, 254);
+	if (key == "freeCameraSpeed" || key == "freeCameraSensitivity") {
+		const bool speed = key == "freeCameraSpeed";
+		const double lo = speed ? 0.2 : 0.01, hi = speed ? 100.0 : 1.0;
+		if (!value.is_number() || !(value.get<double>() >= lo && value.get<double>() <= hi)) {
+			return key + " is out of range";
+		}
+		(speed ? d.freeCameraSpeed : d.freeCameraSensitivity) = float(value.get<double>());
+		return {};
+	}
+	if (key == "pathTracing") return wantEnum(d.pathTracing, kPathTracingModes);
+	if (key == "pathTracingBounces") return wantInt(d.pathTracingBounces, 1, 12);
+	if (key == "pathTracingMaxSamples") return wantInt(d.pathTracingMaxSamples, 1, 100000);
 	if (key == "quality") return wantEnum(d.quality, kQualities);
 	if (key == "testTriangle") return wantBool(d.testTriangle);
 	if (key == "gpuTiming") return wantBool(d.gpuTiming);
@@ -211,6 +239,7 @@ static std::string Apply(SettingsData& d, const std::string& key, const json& va
 	if (key == "lensFlare") return wantBool(d.lensFlare);
 	if (key == "rayTracedLighting") return wantBool(d.rayTracedLighting);
 	if (key == "rayTracedGi") return wantBool(d.rayTracedGi);
+	if (key == "radianceCascades") return wantBool(d.radianceCascades);
 	if (key == "followSceneNight") return wantBool(d.followSceneNight);
 	if (key == "rayTracedReflections") return wantBool(d.rayTracedReflections);
 	if (key == "skinnedRayUpdates") {

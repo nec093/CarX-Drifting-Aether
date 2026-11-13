@@ -232,10 +232,16 @@ namespace Aether {
 			j.EndObject();
 			Array.Sort(lights, (a, b) => b.intensity.CompareTo(a.intensity));
 			j.BeginArray("strongest");
-			for (int i = 0; i < lights.Length && i < 12; ++i) {
+			for (int i = 0; i < lights.Length && i < 48; ++i) {
 				Light l = lights[i];
 				j.BeginObject().Add("path", PathOf(l.transform)).Add("type", l.type.ToString()).Add("intensity", l.intensity).Add("range", l.range)
-					.Add("shadows", l.shadows.ToString()).Add("color", "#" + ColorUtility.ToHtmlStringRGB(l.color)).EndObject();
+					.Add("shadows", l.shadows.ToString()).Add("color", "#" + ColorUtility.ToHtmlStringRGB(l.color)).Add("enabled", l.isActiveAndEnabled)
+					.Add("baked", l.bakingOutput.isBaked).Add("bakeType", l.bakingOutput.lightmapBakeType.ToString());
+				// (HDRP's own component: whether it is enabled (HDRP draws the light either way), its dimmer and fade distance)
+				if (l.TryGetComponent(out HDAdditionalLightData hdLight)) {
+					j.Add("hdEnabled", hdLight.isActiveAndEnabled).Add("hdDimmer", hdLight.lightDimmer).Add("hdFadeDistance", hdLight.fadeDistance);
+				}
+				j.EndObject();
 			}
 			j.EndArray();
 			j.EndObject();

@@ -292,6 +292,14 @@ AETHER_API int Aether_OverlayVisible(void) { return Overlay::Get().Visible() ? 1
 AETHER_API void Aether_SetOverlayVisible(int visible) { Overlay::Get().SetVisible(visible != 0); }
 AETHER_API int Aether_OverlayWantsInput(void) { return Overlay::Get().WantsInput() ? 1 : 0; }
 AETHER_API int Aether_OverlayInputFlags(void) { return Overlay::Get().InputFlags(); }
+AETHER_API int Aether_FreeCamera(float fovDegrees, float* out) {
+	float local[5] = {};
+	int flags = Overlay::Get().TakeFreeCameraInput(fovDegrees, local);
+	if (out) {
+		memcpy(out, local, sizeof(local));
+	}
+	return flags;
+}
 AETHER_API int Aether_BenchmarkWantsUncapped(void) { return Profiler::Get().BenchmarkWantsUncapped() ? 1 : 0; }
 
 // ---- the scene data contract

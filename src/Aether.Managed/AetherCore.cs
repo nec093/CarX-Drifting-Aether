@@ -139,7 +139,9 @@ namespace Aether {
 		// After the game's render pipeline drew a set of cameras (still inside the render loop, before the overlay UI):
 		// when that set holds the game's screen camera, this is where Aether's scene frame goes.
 		private void OnBeginContextRendering(ScriptableRenderContext context, List<Camera> cameras) {
-			DevCamera.Apply(PickScreenCamera(cameras)); // (does nothing without dev-camera.txt)
+			Camera screen = PickScreenCamera(cameras);
+			DevCamera.Apply(screen); // (does nothing without dev-camera.txt)
+			FreeCamera.Apply(screen); // (does nothing while the free camera is off)
 		}
 
 		// (render mode compare only: the game's pipeline draws the frame, Aether's picture goes over half of it)

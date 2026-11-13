@@ -10,7 +10,7 @@
 #define AETHER_API extern "C" __declspec(dllimport)
 #endif
 
-#define AETHER_API_VERSION 7
+#define AETHER_API_VERSION 8
 
 // Render events for GL.IssuePluginEvent(Aether_GetRenderEventFunc(), id)
 #define AETHER_EVENT_FRAME_BEGIN 1 // first thing in the frame (GPU timestamp)
@@ -51,6 +51,10 @@ AETHER_API void Aether_SetOverlayVisible(int visible);
 AETHER_API int Aether_OverlayWantsInput(void);
 // bit 0: the overlay uses the mouse, bit 1: the keyboard (0 while it is hidden)
 AETHER_API int Aether_OverlayInputFlags(void);
+// The free camera (switched by its hotkey in the game window): the input gathered since the last call. Returns bit 0 on,
+// bit 1 its input is live (the overlay closed), bits 8.. the keys held (Overlay::FreeCameraKey). out[5]: mouse x and y
+// (counts), wheel (notches), speed (m/s), sensitivity (degrees per count). fovDegrees: the camera's, for the display.
+AETHER_API int Aether_FreeCamera(float fovDegrees, float* out);
 // 1 while a benchmark that asked for it is running: the managed side switches VSync and the frame rate cap off, and back after.
 AETHER_API int Aether_BenchmarkWantsUncapped(void);
 

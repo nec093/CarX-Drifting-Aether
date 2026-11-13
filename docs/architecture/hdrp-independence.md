@@ -34,7 +34,7 @@
 | カメラごとの機能のスイッチ（フレームセッティング） | `HDAdditionalCameraData` とプロジェクトの既定のフレームセッティングをデータとして読む（`HostFrameSettings`） |
 | 空 | 既定は Aether 自身の物理的な空（`skyMode = physical`）。`skyMode = scene` では、ボリュームの HDRI の空のキューブマップを HDRP の強さと回転の規則で使う。HDRI でない空のときは環境光プローブ |
 | 露出 | ボリュームの値。固定ならその EV と補正、自動ならその範囲と補正で Aether が自分で測光する |
-| ライト | `Light` の値。`HDAdditionalLightData` をデータとして読む（有効か、`lightDimmer`、`fadeDistance`） |
+| ライト | `Light` の値。`HDAdditionalLightData` をデータとして読む（`lightDimmer`、`fadeDistance`。有効かどうかは見ない：無効でも HDRP は描く） |
 | ライトレイヤー | ゲームのパイプラインアセットの設定をデータとして読む |
 | 反射プローブ | プローブ自身のキューブマップのテクスチャー。加えて Aether 自身の反射プローブ（`reflectionProbe`） |
 | UI | 上の `DrawRenderers` と Unity のオーバーレイのキャンバス |
@@ -92,5 +92,5 @@
 - Unity の `VolumeManager` は動いているパイプラインが起動・終了し、動いているパイプラインのアセットの型に対応すると宣言したコンポーネント型しか読み込まない。Aether のパイプラインでは Aether が `Initialize` を呼び、ゲームのパイプラインの型を読み込ませ（内部の `LoadBaseTypes`）、既定の状態を作り直す（内部の `EvaluateVolumeDefaultState`）。ゲームのスクリプトが `VolumeManager.instance.stack` で読む既定のスタックも作り直す。既定のプロファイルは、ゲームのパイプラインが動いていた間に覚えたもの、無ければゲームの設定アセットから読んだもの。カスタムの既定プロファイルも戻す。
 - Aether のパイプラインが破棄されるとボリュームマネージャーを終了する（ゲームのパイプラインは自分で起動し直す）。起動し直す前に作ったボリュームスタックは使えない。`PipelineSwitch.VolumeGeneration` がそれを示し、キャプチャはスタックを作り直す。
 - 実行中にゲームのパイプラインへ戻すときは、HDRP の静的なカメラのキャッシュを消す（`HDCamera.ClearAll`）。Aether のパイプラインの間に作られた、使えなくなったボリュームスタックを持っているため。
-- `HDAdditionalLightData` が無効なライトは、`Light.enabled` に関係なくゲームでは消えている。
+- `HDAdditionalLightData` が無効でも、`Light` が有効ならゲーム（HDRP）はそのライトを描く（ガレージの作業場の灯り：昼でもリアルタイムのスポットライトで照らしている）。
 - ゲームのパイプラインのカスタムパスが DX12 で例外を出す問題は `GameDx12Workarounds` が扱う（[dx12-integration.md](dx12-integration.md)）。

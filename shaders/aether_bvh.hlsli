@@ -175,21 +175,23 @@ float RaySunShadow(float3 P, float3 n) {
 // `t`: how far the ray went (the further, the coarser the texture level read: there are no derivatives here).
 // `d`: the ray's direction.
 // `punctual`: lit by the scene's lamps as well (all of them that reach it, without shadows): for the GI probes.
-float4 BvhHitSurfaceLit(float3 P, BvhHit hit, float t, float3 d, bool punctual) {
+// A hit's material and colour, the way the forward shader reads each kind of material (without the finer points: no
+// mask, normal or emission maps here). a: 0 = alpha tested away there (leaves, fences), else 1. `level`: the base
+// texture's mip level to read.
+float4 BvhHitAlbedoLevel(BvhHit hit, float level, out MaterialData mat) {
 	TlasInstance inst = g_TlasInstances[hit.instance];
 	BvhTri tri = g_BvhTris[hit.tri];
 	uint2 entry = BvhHitMaterial(inst, tri);
-	MaterialData mat = g_Materials[entry.x];
+	mat = g_Materials[entry.x];
 	uint cls = (uint)mat.params2.z;
 	float4 tex = 1.0;
 	if (entry.y != 0xFFFFFFFFu) {
 		float2 uv = (float2(tri.uvU, tri.uvV) + tri.duv1 * hit.bary.x + tri.duv2 * hit.bary.y) * mat.uvScaleOffset.xy + mat.uvScaleOffset.zw;
-		tex = g_SceneTextures[NonUniformResourceIndex(entry.y)].SampleLevel(s_Aniso, uv, 1.0 + 0.7 * log2(max(t, 1.0)));
+		tex = g_SceneTextures[NonUniformResourceIndex(entry.y)].SampleLevel(s_Aniso, uv, level);
 	}
 	if (mat.params.z >= 0.0 && tex.a * mat.baseColor.a < mat.params.z) {
-		return 0.0; // alpha tested away (leaves, fences)
+		return 0.0;
 	}
-	// the colour, the way the forward shader reads each kind of material (without the finer points)
 	float3 albedo;
 	if (cls == CLASS_VEHICLE_PAINT) {
 		albedo = mat.baseColor.a > 0.5 ? lerp(mat.baseColor.rgb, tex.rgb, tex.a) : mat.baseColor.rgb; // (the texture is the livery)
@@ -200,6 +202,22 @@ float4 BvhHitSurfaceLit(float3 P, BvhHit hit, float t, float3 d, bool punctual) 
 	} else {
 		albedo = tex.rgb * mat.baseColor.rgb;
 	}
+	return float4(albedo, 1.0);
+}
+
+// The same, `t` how far the ray went (the further, the coarser the texture level read: there are no derivatives here).
+float4 BvhHitAlbedo(BvhHit hit, float t, out MaterialData mat) {
+	return BvhHitAlbedoLevel(hit, 1.0 + 0.7 * log2(max(t, 1.0)), mat);
+}
+
+float4 BvhHitSurfaceLit(float3 P, BvhHit hit, float t, float3 d, bool punctual) {
+	MaterialData mat;
+	float4 colour = BvhHitAlbedo(hit, t, mat);
+	if (colour.a < 0.5) {
+		return 0.0; // alpha tested away (leaves, fences)
+	}
+	uint cls = (uint)mat.params2.z;
+	float3 albedo = colour.rgb;
 	float3 n = hit.normal;
 	float3 light = AmbientLight(P, n);
 	float sun = 0.0;

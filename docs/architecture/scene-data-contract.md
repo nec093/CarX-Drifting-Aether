@@ -3,7 +3,7 @@
 マネージド側（Unity、`src/Aether.Managed/SceneCapture`）と Aether のネイティブレンダラー（`src/Aether.Native/Scene/SceneStore`、レイトレース用の形状は `Renderer/Bvh`）の間の取り決め。
 
 - 構造体の配置は `src/Aether.Native/include/SceneContract.h`。`SceneCapture/Contract.cs` がフィールド単位で同じ配置を持つ。
-- 関数は `src/Aether.Native/include/AetherApi.h`（API 版 7、`AETHER_API_VERSION` と `Native.ApiVersion`）。
+- 関数は `src/Aether.Native/include/AetherApi.h`（API 版 8、`AETHER_API_VERSION` と `Native.ApiVersion`）。
 - 契約の版は `AE_SCENE_CONTRACT_VERSION`（ネイティブ）と `AeConst.ContractVersion`（マネージド）。現在はどちらも 7。
 
 ## 規則

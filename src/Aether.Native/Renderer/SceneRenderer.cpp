@@ -3,6 +3,7 @@
 #include "LightingDenoiser.h"
 #include "SceneRenderer.h"
 #include "../Core/Log.h"
+#include "../ImGui/Overlay.h"
 #include "../Resources/GpuResources.h"
 #include "../Shaders/ShaderManager.h"
 
@@ -25,7 +26,7 @@ const uint32_t kPostTableSize = 4;    // per full screen pass: colour / main inp
 const float kExposureAdaptationRate = 2.0f; // per second: the automatic exposure covers 63 % of a change in half a second
 const uint32_t kPostTables = 64;     // 0..3: ambient occlusion, its blur, composite, exposure metering; the rest handed out per pass (Fullscreen)
 const uint32_t kIrradianceSize = 32;  // octahedral map of the sky's diffuse light
-const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace", "PSGiRays", "PSGiIrradiance", "PSGiDepth", "PSLensFlare", "PSSmokeApply", "PSSunRays", "PSAoRays"};
+const char* const kFullscreenEntry[] = {"PSSky", "PSComposite", "PSAmbientOcclusion", "PSAmbientOcclusionBlur", "PSExposure", "PSIrradiance", "PSTaa", "PSMotionBlur", "PSBloomDown", "PSBloomUp", "PSSsr", "PSTransmittanceLut", "PSMultiScatterLut", "PSSkyViewLut", "PSCloudNoise", "PSSkyCloudsLut", "PSClouds", "PSVolumetricFog", "PSVolumetricFogApply", "PSReflectionBlur", "PSBvhDebug", "PSRayTrace", "PSGiRays", "PSGiIrradiance", "PSGiDepth", "PSLensFlare", "PSSmokeApply", "PSSunRays", "PSAoRays", "PSRcTrace", "PSRcIrradiance", "PSRcDepth", "PSPathTrace", "PSPathTraceApply"};
 // reflection probes: each is six square tiles (3 x 2: +X -X +Y | -Y +Z -Z); the atlas holds them 4 x 2
 const uint32_t kProbeFace = 128, kProbeBlurFace = 32;
 const float kProbeCell = 12.0f;      // the grid's spacing on the ground (m)
@@ -653,7 +654,7 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI
 		blend.DestBlendAlpha = D3D12_BLEND_ONE;
 		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 	}
-	if (kind == kFullscreenGiIrradiance || kind == kFullscreenGiDepth) {
+	if (kind == kFullscreenGiIrradiance || kind == kFullscreenGiDepth || kind == kFullscreenRcDepth) {
 		// what the probes held, moved a step towards this frame's rays (the shader gives the step in a: 1 = start anew)
 		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
 		blend.BlendEnable = TRUE;
@@ -662,6 +663,17 @@ ID3D12PipelineState* SceneRenderer::FullscreenPipeline(FullscreenKind kind, DXGI
 		blend.BlendOp = D3D12_BLEND_OP_ADD;
 		blend.SrcBlendAlpha = D3D12_BLEND_ONE;
 		blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	}
+	if (kind == kFullscreenPathTraceApply) {
+		// the path traced average over the rasterised picture, by how much of it the paths answered for (a)
+		D3D12_RENDER_TARGET_BLEND_DESC& blend = d.BlendState.RenderTarget[0];
+		blend.BlendEnable = TRUE;
+		blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+		blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+		blend.BlendOp = D3D12_BLEND_OP_ADD;
+		blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+		blend.DestBlendAlpha = D3D12_BLEND_ONE;
 		blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
 	}
 	if (kind == kFullscreenSmokeApply) {
@@ -1076,7 +1088,7 @@ static Vec3 AtmosphereTransmittance(float cosZenith) {
 		const double densityR = std::exp(-h / 8.0), densityM = std::exp(-h / 1.2), ozone = std::max(0.0, 1.0 - std::abs(h - 25.0) / 15.0);
 		const double rayleigh[3] = {5.802e-3, 13.558e-3, 33.1e-3}, absorb[3] = {0.650e-3, 1.881e-3, 0.085e-3};
 		for (int k = 0; k < 3; ++k) {
-			depth[k] += (rayleigh[k] * densityR + (3.996e-3 + 4.40e-3) * densityM + absorb[k] * ozone) * end / steps;
+			depth[k] += (rayleigh[k] * densityR + (7.67e-2 + 6.7e-3) * densityM /* the haze: aether_atmosphere.hlsli kMie* */ + absorb[k] * ozone) * end / steps;
 		}
 	}
 	return {float(std::exp(-depth[0])), float(std::exp(-depth[1])), float(std::exp(-depth[2]))};
@@ -1343,13 +1355,13 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	nrdProj_ = proj; // (before the jitter below)
 	// ---- post-processing as the host has it (frame), where Aether's own switches allow it
 	// (Aether's own switch: which antialiasing the game's graphics menu is set to is not looked at)
-	taa_ = settings.antialiasing;
+	taa_ = settings.antialiasing && !pathTrace_; // (the path traced average is antialiased by the paths' random places in the pixel)
 	// (the host mixes the picture with its bloom pyramid by the control value itself: at 1 the picture is the pyramid)
 	bloomMix_ = settings.bloom && f.bloomIntensity > 0 ? std::min(f.bloomIntensity * settings.bloomStrength, 1.0f) : 0.0f;
 	lensFlare_ = settings.lensFlare && settings.lensFlareStrength > 0.0f && target.width >= 64 && target.height >= 64;
 	lensFlareStrength_ = settings.lensFlareStrength;
 	bloomScatter_ = 0.05f + 0.9f * std::min(std::max(f.bloomScatter, 0.0f), 1.0f);
-	motionBlur_ = settings.motionBlur ? std::max(f.motionBlurIntensity * settings.motionBlurStrength, 0.0f) : 0.0f;
+	motionBlur_ = settings.motionBlur && !pathTrace_ ? std::max(f.motionBlurIntensity * settings.motionBlurStrength, 0.0f) : 0.0f;
 	if (f.cameraId != historyCamera_) {
 		historyValid_ = false; // another camera: nothing of the frame before applies
 		historyCamera_ = f.cameraId;
@@ -1372,8 +1384,14 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.ssrParams[2] = std::max(f.ssrSmoothnessFadeStart, f.ssrMinSmoothness);
 	fc.ssrParams[3] = f.ssrScreenFadeDistance;
 	fc.qualityParams[0] = settings.shadowSoftness;
-	// volumetric fog: where there is fog and a sun to light it
-	volumetricFog_ = settings.volumetricFog && f.fogDensity * settings.fogStrength > 0.0f;
+	// volumetric fog: where there is fog and a sun to light it. With the physical sky the fog is the air's own: the
+	// extinction of the atmosphere's air and haze at the ground (aether_atmosphere.hlsli: Rayleigh 0.0116 / km and the
+	// haze's 0.0834 / km at 550 nm: a mean free path of 10.5 km, some 40 km of visibility), thinning with the haze's
+	// 1.2 km scale height. (The scene's fog, a mean free path of 300 m in the garage, is a misty day's: it laid a
+	// veil over everything a few tens of metres away, the shade of a workshop 15 m off among it.)
+	const float kAirExtinction = 9.5e-5f; // per metre
+	const float fogDensity = physicalSky_ ? kAirExtinction : f.fogDensity;
+	volumetricFog_ = settings.volumetricFog && fogDensity * settings.fogStrength > 0.0f;
 	fc.qualityParams[1] = volumetricFog_ ? 1.0f : 0.0f;
 	fc.qualityParams[3] = rayReflections_ ? 1.0f : 0.0f; // (smooth surfaces mirror what rays through the scene find)
 	// bounced light: read from the picture of the frame before, so only with the temporal history
@@ -1418,7 +1436,25 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	// ---- probe grid GI: the volume follows the camera a whole cell at a time (the probes stay where they are in the
 	// world, and each keeps its place in the textures: its cell modulo the counts)
 	// (not while the ambient light comes per pixel from rays: rtGi_. What read the probes then reads the sky.)
-	gi_ = bvhReady_ && settings.probeGi && !rtGi_;
+	// ---- radiance cascades: the atlas layout is fixed in the shaders (aether_scene.hlsli, kRc*)
+	rc_ = bvhReady_ && settings.radianceCascades;
+	if (rc_ && (!rcIrradiance_ || !rcDepth_)) {
+		GpuTextureDesc g;
+		g.width = 5952;
+		g.height = 192;
+		g.format = g.targetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		g.renderTarget = true;
+		rcAtlas_[0] = gpu.CreateTexture(g, "Rc.Atlas0", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		rcAtlas_[1] = gpu.CreateTexture(g, "Rc.Atlas1", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		g.width = 3072;
+		rcIrradiance_ = gpu.CreateTexture(g, "Rc.Irradiance", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		g.width = 48 * 16 * 8;
+		g.height = 48 * 8;
+		rcDepth_ = gpu.CreateTexture(g, "Rc.Distance", ResourceCategory::RenderTarget, Lifetime::Persistent, frame_);
+		rcHistory_ = false;
+	}
+	rc_ = rc_ && rcAtlas_[0] && rcAtlas_[1] && rcIrradiance_ && rcDepth_;
+	gi_ = bvhReady_ && settings.probeGi && !rtGi_ && !rc_;
 	if (gi_ && !giRays_) {
 		GpuTextureDesc g;
 		g.width = uint32_t(kGiCounts[0] * kGiCounts[1]) * kGiTile;
@@ -1447,6 +1483,20 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		giHistory_ = true;
 	} else {
 		giHistory_ = false;
+	}
+	if (rc_) {
+		rcIndex_ ^= 1u;
+		for (int k = 0; k < 3; ++k) {
+			fc.giGrid[k] = scene.frame.cameraPosition[k];
+			fc.giPrev[k] = rcHistory_ ? rcCamera_[k] : scene.frame.cameraPosition[k];
+			rcCamera_[k] = scene.frame.cameraPosition[k];
+		}
+		fc.giGrid[3] = 2.0f;
+		fc.giPrev[3] = rcHistory_ ? 1.0f : 0.0f;
+		fc.giParams[2] = float(frame_ % 4096);
+		rcHistory_ = true;
+	} else {
+		rcHistory_ = false;
 	}
 	fc.giParams[3] = float(punctualCount_); // (also read by the particles: with or without the probes)
 	fc.rayParams[0] = bvhReady_ ? 1.0f : 0.0f;
@@ -1639,13 +1689,23 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	fc.skyParams[1] = std::cos(f.skyRotation);
 	fc.skyParams[2] = std::sin(f.skyRotation);
 	const bool fogFromSky = (f.fogFlags & kAeFogColorFromSky) != 0;
-	memcpy(fc.fog, fogFromSky ? f.fogTint : f.fogColor, sizeof(f.fogColor));
-	fc.fog[3] = f.fogDensity * settings.fogStrength;
-	fc.fogHeight[0] = f.fogBaseHeight;
-	// HDRP's height fog: the layer's depth times 0.144765 is the height over which the density falls to 1 / e
-	fc.fogHeight[1] = 1.0f / (std::max(0.01f, f.fogMaxHeight - f.fogBaseHeight) * 0.144765f);
-	fc.fogHeight[2] = f.fogMaxDistance;
-	fc.fogHeight[3] = fogFromSky ? 1.0f : 0.0f;
+	if (physicalSky_) {
+		// the air's own haze (see volumetricFog_ above): white, lit by the sun and the sky, from the ground up
+		fc.fog[0] = fc.fog[1] = fc.fog[2] = 1.0f;
+		fc.fog[3] = fogDensity * settings.fogStrength;
+		fc.fogHeight[0] = 0.0f;
+		fc.fogHeight[1] = 1.0f / 1200.0f;
+		fc.fogHeight[2] = 0.0f;
+		fc.fogHeight[3] = 1.0f;
+	} else {
+		memcpy(fc.fog, fogFromSky ? f.fogTint : f.fogColor, sizeof(f.fogColor));
+		fc.fog[3] = f.fogDensity * settings.fogStrength;
+		fc.fogHeight[0] = f.fogBaseHeight;
+		// HDRP's height fog: the layer's depth times 0.144765 is the height over which the density falls to 1 / e
+		fc.fogHeight[1] = 1.0f / (std::max(0.01f, f.fogMaxHeight - f.fogBaseHeight) * 0.144765f);
+		fc.fogHeight[2] = f.fogMaxDistance;
+		fc.fogHeight[3] = fogFromSky ? 1.0f : 0.0f;
+	}
 
 	auto upload = [&](const void* data, size_t bytes, size_t align) -> D3D12_GPU_VIRTUAL_ADDRESS {
 		UploadAllocation a = gpu.Upload(std::max<size_t>(bytes, 16), align);
@@ -1782,8 +1842,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 	gpu.CopySrv(globalsTable_ + 8, reflection_ && reflectionAtlas_[0] ? reflectionAtlas_[0]->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 9, reflection_ && reflectionAtlas_[1] ? reflectionAtlas_[1]->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 10, reflection_ && reflectionDepth_ ? reflectionDepth_->srv : nullTextureSrv_);
-	gpu.CopySrv(globalsTable_ + 11, gi_ ? giIrradiance_->srv : nullTextureSrv_);
-	gpu.CopySrv(globalsTable_ + 12, gi_ ? giDepth_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 11, rc_ ? rcIrradiance_->srv : gi_ ? giIrradiance_->srv : nullTextureSrv_);
+	gpu.CopySrv(globalsTable_ + 12, rc_ ? rcDepth_->srv : gi_ ? giDepth_->srv : nullTextureSrv_);
 	gpu.CopySrv(globalsTable_ + 13, nullTextureSrv_); // (the opaque pass puts the ray traced sun shadow here)
 	gpu.CopySrv(globalsTable_ + 14, nullTextureSrv_); // (... and the untraced casters' shadow map)
 	// (the table the cube's own faces are drawn with: the same, without the cube and without screen space occlusion)
@@ -1800,8 +1860,8 @@ bool SceneRenderer::UploadFrameData(const SceneFrame& scene, const Target& targe
 		for (uint32_t i = 0; i < 3; ++i) {
 			gpu.CopySrv(probeGlobalsTable_ + 8 + i, nullTextureSrv_);
 		}
-		gpu.CopySrv(probeGlobalsTable_ + 11, gi_ ? giIrradiance_->srv : nullTextureSrv_);
-		gpu.CopySrv(probeGlobalsTable_ + 12, gi_ ? giDepth_->srv : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 11, rc_ ? rcIrradiance_->srv : gi_ ? giIrradiance_->srv : nullTextureSrv_);
+		gpu.CopySrv(probeGlobalsTable_ + 12, rc_ ? rcDepth_->srv : gi_ ? giDepth_->srv : nullTextureSrv_);
 		// (the ray traced sun shadow and the untraced casters' shadow map are the screen's, not a probe face's: empty here.
 		// Left uninitialised, these two slots held whatever an earlier view had been, a texture destroyed with a car
 		// among them, and drawing a probe face after a car was switched hung the GPU.)
@@ -2051,12 +2111,64 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 	}
 	// ---- ray tracing: the trees that arrived; the tree over this frame's instances is filled while the draw lists are
 	// built (the same walk over the instances) and built after it
-	raysWanted_ = settings.rayTracedReflections || settings.probeGi || settings.rayTracedLighting || settings.debugView == "bvh";
+	const bool pathTraceWanted = settings.pathTracing == "always" || (settings.pathTracing == "freeCamera" && Overlay::Get().FreeCamera());
+	raysWanted_ = settings.rayTracedReflections || settings.probeGi || settings.rayTracedLighting || settings.radianceCascades || settings.debugView == "bvh" || pathTraceWanted;
 	SceneBvh::Get().BeginFrame(device_, list, retireFence, frame);
 	SceneBvh::Get().BeginInstances();
 	raysWanted_ = raysWanted_ && SceneBvh::Get().HasGeometry() && raysSupported_;
 	BuildDrawLists(scene, frame);
 	bvhReady_ = raysWanted_ && SceneBvh::Get().EndInstances(device_, list, retireFence);
+	pathTrace_ = pathTraceWanted && bvhReady_;
+	if (pathTrace_) {
+		// the running average: full size, 32 bit floats (a 16 bit average stops changing after a few hundred samples)
+		bool fresh = false;
+		for (auto& t : ptAccum_) {
+			if (t && (t->desc.width != target.width || t->desc.height != target.height)) {
+				gpu.RetireTexture(std::move(t), retireFence, frame);
+			}
+			if (!t) {
+				GpuTextureDesc d;
+				d.width = target.width;
+				d.height = target.height;
+				d.format = d.targetFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
+				d.renderTarget = true;
+				t = gpu.CreateTexture(d, "Scene.PathTrace", ResourceCategory::RenderTarget, Lifetime::Persistent, frame);
+				fresh = true;
+			}
+		}
+		pathTrace_ = ptAccum_[0] && ptAccum_[1];
+		// what the average was made for: the camera, the sun, the lamps, the settings
+		float key[40] = {};
+		memcpy(key, scene.frame.view, sizeof(float) * 16);
+		memcpy(key + 16, scene.frame.proj, sizeof(float) * 16);
+		key[32] = sunDirection_.x;
+		key[33] = sunDirection_.y;
+		key[34] = sunDirection_.z;
+		key[35] = float(scene.lights.size());
+		key[36] = float(Settings::Get().Revision() % 1000000u);
+		key[37] = float(target.width);
+		key[38] = float(target.height);
+		bool changed = fresh;
+		for (int i = 0; i < 40; ++i) {
+			// (the camera to a tenth of a millimetre: a camera under the game's moving rig, put back at the same place every
+			// frame, comes out a few millionths different each time from the rounding of the rig's transforms)
+			if (std::abs(key[i] - ptKey_[i]) > (i < 32 ? 1e-4f : 1e-6f) * std::max(1.0f, std::abs(key[i]))) {
+				changed = true;
+				ptResetBy_ = i;
+			}
+		}
+		if (changed) {
+			memcpy(ptKey_, key, sizeof(key));
+			ptSamples_ = 0;
+		}
+	} else {
+		for (auto& t : ptAccum_) {
+			if (t) {
+				gpu.RetireTexture(std::move(t), retireFence, frame);
+			}
+		}
+		ptSamples_ = 0;
+	}
 	rayReflections_ = bvhReady_ && settings.rayTracedReflections;
 	nrdFrame_ = rayReflections_ && settings.reflectionDenoiser == "nrd" && ReflectionDenoiser::Available();
 	rtLighting_ = bvhReady_ && settings.rayTracedLighting && LightingDenoiser::Available() && LightingDenoiser::Get().Prepare(device_, target.width, target.height, retireFence, frame);
@@ -2314,6 +2426,42 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		graph_.AddPass("GiReady", true, [&, giIrradiance, giDepth](RenderGraph::Builder& b) {
 			b.Read(giIrradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 			b.Read(giDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}, [](RenderGraph::PassContext&) {});
+	}
+	// ---- radiance cascades: every level's rays, merged with the next level of the frame before; then level 0's
+	// light per normal, which everything that asks for the light at a place reads (AmbientLight)
+	if (rc_) {
+		const RenderGraph::ResourceId rcNow = graph_.Import(rcAtlas_[rcIndex_]), rcBefore = graph_.Import(rcAtlas_[rcIndex_ ^ 1u]), rcIrradiance = graph_.Import(rcIrradiance_);
+		const RenderGraph::ResourceId rcDepth = graph_.Import(rcDepth_);
+		graph_.AddPass("RcDistance", true, [&, rcDepth](RenderGraph::Builder& b) {
+			b.Write(rcDepth, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, rcDepth](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenRcDepth, ctx.Texture(rcDepth), nullptr);
+		});
+		graph_.AddPass("RcTrace", true, [&, rcNow, rcBefore, rcIrradiance, rcDepth](RenderGraph::Builder& b) {
+			b.Read(rcBefore, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(rcDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(rcIrradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); // (what rays meet is lit by the frame before's)
+			if (shadow != RenderGraph::kInvalid) {
+				b.Read(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			if (skyLight) {
+				b.Read(irradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			}
+			b.Write(rcNow, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, rcNow, rcBefore](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenRcTrace, ctx.Texture(rcNow), ctx.Texture(rcBefore));
+			ctx.note = "5 levels, 1142784 rays";
+		});
+		graph_.AddPass("RcIrradiance", true, [&, rcNow, rcIrradiance](RenderGraph::Builder& b) {
+			b.Read(rcNow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(rcIrradiance, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, rcNow, rcIrradiance](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenRcIrradiance, ctx.Texture(rcIrradiance), ctx.Texture(rcNow));
+		});
+		graph_.AddPass("RcReady", true, [&, rcIrradiance, rcDepth](RenderGraph::Builder& b) {
+			b.Read(rcIrradiance, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Read(rcDepth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		}, [](RenderGraph::PassContext&) {});
 	}
 	// ---- reflection probes: this frame's faces, then the blurred copy of the atlas
@@ -2612,7 +2760,36 @@ bool SceneRenderer::Render(const HostGfx& host, ID3D12GraphicsCommandList* list,
 		ctx.triangles = 1;
 	});
 	// ---- decal boxes (the cars' blob shadows): they darken whatever opaque surface lies inside them, found from the depth
-	graph_.AddPass("Decals", !decals_.empty(), [&](RenderGraph::Builder& b) {
+	// ---- path tracing: a sample per pixel into the running average, then the average over the picture (before what is
+	// blended over it: glass, fog, smoke and particles are the rasterised picture's)
+	if (pathTrace_) {
+		const bool trace = ptSamples_ < uint32_t(settings.pathTracingMaxSamples);
+		const RenderGraph::ResourceId accumBefore = graph_.Import(ptAccum_[ptIndex_]), accumNow = graph_.Import(ptAccum_[ptIndex_ ^ 1u]);
+		if (trace) {
+			const float ptParams[4] = {float(ptSamples_), float(settings.pathTracingBounces), 0.0f, float(frame % 65536)};
+			graph_.AddPass("PathTrace", true, [&, accumBefore, accumNow](RenderGraph::Builder& b) {
+				b.Read(accumBefore, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Read(surface, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				b.Write(accumNow, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			}, [&, accumBefore, accumNow, ptParams](RenderGraph::PassContext& ctx) {
+				Fullscreen(ctx, kFullscreenPathTrace, ctx.Texture(accumNow), ctx.Texture(accumBefore), ctx.Texture(depth), ctx.Texture(surface), ptParams);
+				ctx.note = Format("sample %u, %d bounces (last started anew by key %d)", uint32_t(ptParams[0]) + 1, settings.pathTracingBounces, ptResetBy_);
+			});
+			ptIndex_ ^= 1u;
+			++ptSamples_;
+		}
+		const RenderGraph::ResourceId average = trace ? accumNow : accumBefore;
+		graph_.AddPass("PathTraceApply", true, [&, average](RenderGraph::Builder& b) {
+			b.Read(average, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		}, [&, average](RenderGraph::PassContext& ctx) {
+			Fullscreen(ctx, kFullscreenPathTraceApply, ctx.Texture(color), ctx.Texture(average));
+		});
+	}
+	ptActiveShown_.store(pathTrace_);
+	ptSamplesShown_.store(ptSamples_);
+	graph_.AddPass("Decals", !decals_.empty() && !pathTrace_, [&](RenderGraph::Builder& b) {
 		b.Read(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		b.Write(color, D3D12_RESOURCE_STATE_RENDER_TARGET);
 	}, [&, color, depth](RenderGraph::PassContext& ctx) {
@@ -3136,6 +3313,16 @@ void SceneRenderer::Release(bool leak) {
 	giIrradiance_.reset();
 	giDepth_.reset();
 	gi_ = giHistory_ = false;
+	rcAtlas_[0].reset();
+	rcAtlas_[1].reset();
+	rcIrradiance_.reset();
+	rcDepth_.reset();
+	rc_ = rcHistory_ = false;
+	ptAccum_[0].reset();
+	ptAccum_[1].reset();
+	pathTrace_ = false;
+	ptSamples_ = 0;
+	ptActiveShown_.store(false);
 	skyCloudsLut_.reset();
 	for (auto& t : reflectionAtlas_) {
 		t.reset();

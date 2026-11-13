@@ -311,7 +311,7 @@ json HandleRequest(const json& request) {
 	}
 	if (method == "set_graphics_option") {
 		// one of Aether's own graphics options (the same ones the overlay's Settings tab shows)
-		static const char* const kOptions[] = {"skyMode", "timeOfDay", "sunHeading", "cloudCoverage", "cloudSpeed", "shadowSoftness", "indirectStrength", "fogStrength", "moonlight", "skinnedRayUpdates", "motionBlurStrength", "bloomStrength", "aoStrength", "aoRadius", "lensFlareStrength", "smokeOpacity", "lodBias", "anisotropicLevel", "vsync", "exposureEV", "tonemap", "reflectionDenoiser"};
+		static const char* const kOptions[] = {"skyMode", "timeOfDay", "sunHeading", "cloudCoverage", "cloudSpeed", "shadowSoftness", "indirectStrength", "fogStrength", "moonlight", "skinnedRayUpdates", "motionBlurStrength", "bloomStrength", "aoStrength", "aoRadius", "lensFlareStrength", "smokeOpacity", "lodBias", "anisotropicLevel", "vsync", "exposureEV", "tonemap", "reflectionDenoiser", "pathTracing", "pathTracingBounces", "pathTracingMaxSamples", "freeCameraSpeed", "freeCameraSensitivity"};
 		std::string option;
 		if (!GetString(params, "option", "", option, error)) {
 			return Fail(id, error);
