@@ -1291,7 +1291,7 @@ namespace Aether {
 		/// Keeps the native side's objects in step with the scene: scans, material checks and the native pointer queries.
 		/// Called from Update, never from inside the render loop: Mesh.GetNative*BufferPtr and Texture.GetNativeTexturePtr
 		/// make the main thread wait for the render thread, and doing that while the render pipeline is in the middle of
-		/// recording a frame (graphics jobs) upset Unity's own texture uploads (docs/development/stability-investigation.md).
+		/// recording a frame (graphics jobs) upset Unity's own texture uploads (docs/architecture/dx12-integration.md).
 		/// </summary>
 		// ---- what the capture costs on the main thread (milliseconds; the window restarts every few seconds)
 		private struct Cost {

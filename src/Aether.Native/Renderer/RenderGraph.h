@@ -1,7 +1,7 @@
 // Aether's render graph: a frame is a list of passes that declare which resources they read and write and in which
 // D3D12 state. The graph validates the declarations, works out each resource's lifetime, gives transient resources a
 // physical texture from a pool (two transients whose lifetimes do not overlap share one), records the state
-// transitions in front of each pass and runs the passes in order. docs/architecture/render-graph.md
+// transitions in front of each pass and runs the passes in order. docs/architecture/renderer.md
 //
 // Deliberately simple: passes run in the order they were added (the order is validated, not searched for), and one
 // command list carries the whole frame. Render thread only, except Describe().

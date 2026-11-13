@@ -1,48 +1,54 @@
 # Aether
 
-CarX Drift Racing Online（moddable ブランチ、Unity 2023.2.22f1 / HDRP 16）向けのグラフィックオーバーホール Mod です。
-最終的には HDRP に頼らない独自の DirectX 12 レンダラーでゲームを描画し、VRAM 使用量・描画性能・画質を改善することを目指します。
+CarX Drift Racing Online（moddable ブランチ、Unity 2023.2.22f1）向けのグラフィックオーバーホール Mod です。
+ゲームのレンダラー（HDRP）を使わず、Aether 自身の DirectX 12 レンダラーでゲームを描画します。
 
 - 描画 API は **DirectX 12 のみ**（DX11 / Vulkan のバックエンドもフォールバックもありません）。
 - NVIDIA / AMD / Intel 共通の経路を基本とし、ベンダー固有機能は実行時判定のオプションにします。
-- Mod ローダーは KSL Loader。ゲーム内 GUI は Dear ImGui。AI エージェントとは MCP で連携します。
+- Mod ローダーは BepInEx 5（KSL 用の入口もあります）。ゲーム内 GUI は Dear ImGui。AI エージェントとは MCP で連携します。
+- ゲームのロジック、物理、シーン管理、入力はそのままです。Aether が受け持つのは描画と計測・診断です。
 
-## 現在の状態（Phase 1：基盤・DX12 統合・診断環境）
+## できること
 
-| 項目 | 状態 |
+| 分野 | 内容 |
 |---|---|
-| KSL からのロード、Unity の D3D12 デバイス／キューの取得（`IUnityGraphicsD3D12v7`） | ゲーム内で確認済み |
-| DX12 テスト描画（三角形）、ゲームのバックバッファーへの合成 | ゲーム内で確認済み |
-| GPU 情報、D3D12 機能判定、VRAM／性能計測、GPU タイムスタンプ | ゲーム内で確認済み |
-| Dear ImGui オーバーレイ（F10） | 表示と合成はゲーム内で確認済み。マウス・キーボードの実操作は未確認（手動確認項目は phase1-report の 4 章） |
-| MCP サーバー（19 ツール） | テストホストで全ツール、ゲーム内で主要ツールを確認済み |
-| 終了時の解放 | ゲーム内で確認済み（リークなし、プロセスも正常終了） |
-| HDRP の DX12 対応（コンピュートシェーダーの差し替え、ゲーム独自パスの回避） | ゲーム内で確認済み（ガレージが正常に表示される）。DX12 ではゲームの GPU カリングとパーティクルのカスタムパスを無効化している |
+| レンダラー | Unity のレンダーパイプラインとして動作（HDRP は生成されない）。クラスタード・フォワード、カスケードシャドウ、レンダーグラフ |
+| 空と光 | 物理ベースの大気、時刻による太陽と月、星、ボリュームのある雲と雲の影、ゲームの昼夜との同期 |
+| マテリアル | 車の塗装（クリア層、フレーク、クローム）、ホイール、ランプ、ロービーム配光のヘッドライト |
+| 反射 | 画面内の反射、ソフトウェア BVH によるレイトレース反射（DXR 不要）、反射プローブ |
+| 間接光 | レイトレースのプローブ格子、画面内の照り返し、アンビエントオクルージョン |
+| 効果 | ボリュメトリックフォグ、タイヤスモーク（独自の運動モデル）、ブルーム、レンズフレア、モーションブラー、TAA、自動露出、トーンマップ |
+| 計測・診断 | VRAM の内訳、GPU タイムスタンプ、ベンチマーク、フレームキャプチャ、オーバーレイ（F10）、MCP サーバー |
 
-確認の詳細、基準ベンチマーク、未確認事項は [docs/development/phase1-report.md](docs/development/phase1-report.md)。
-描画そのものはまだ HDRP（ゲームのレンダラー）が行い、Aether はその上に自分のパスを合成します。独自レンダラーは Phase 2 からです。
+各機能の仕組みと設定は [docs/architecture/rendering-features.md](docs/architecture/rendering-features.md)。
 
-> ゲームは DX12 だけでは描画できません（HDRP のコンピュートシェーダーに DX12 のカーネルが無い）。Aether がそれを補っています。
-> 経緯と仕組みは [docs/architecture/dx12-integration.md](docs/architecture/dx12-integration.md)。
+設定は F10 のオーバーレイにあります。ゲームのグラフィック設定は読みません。
 
 ## 構成
 
 ```
-src/Aether.Managed/   KSL Mod（C#, net472）。ネイティブのロード、描画イベント、Unity 側の統計・シーン情報、HDRP の DX12 修正
+src/Aether.Managed/   C# の Mod（net472）
+  Loaders/            BepInEx / KSL の入口
+  Pipeline/           Unity のレンダーパイプライン（AetherPipeline）
+  SceneCapture/       シーンの読み取り（メッシュ、マテリアル、ライト、パーティクル、タイヤスモーク）
+  GameIntegration/    ゲーム固有の対応（DX12 の回避策、品質設定、昼夜）
+  Diagnostics/        開発用の補助
 src/Aether.Native/    ネイティブランタイム（C++20, D3D12）。AetherNative.dll とテストホスト AetherHost.exe
   Device/             Unity との境界（UnityBridge）、ホストの抽象（Host.h）、GPU 情報
-  Renderer/           フレーム（コマンドリスト、テスト三角形、キャプチャ、GPU タイムスタンプ）
-  Resources/          GPU リソースの登録簿（VRAM の内訳の元）
+  Renderer/           フレーム、シーンレンダラー、レンダーグラフ、BVH、煙の運動、GPU タイムスタンプ
+  Scene/              シーンデータの保管
+  Resources/          GPU リソースの管理（VRAM の内訳の元）
   Profiler/           フレーム統計、ベンチマーク
   Shaders/            HLSL の実行時コンパイルとエラーの保持
   ImGui/              オーバーレイ
   Ipc/                名前付きパイプと API
+  Core/               設定、ログ、共通
 src/Aether.MCP/       MCP サーバー（C#, net10、stdio ⇔ 名前付きパイプ）
 shaders/              HLSL
-unity/                HDRP の DX12 用コンピュートシェーダーのバンドルを作るエディタースクリプト
+unity/                HDRP の DX12 用コンピュートシェーダーのバンドルを作るエディタースクリプト（参照用の hdrp モード向け）
 scripts/              ビルド、配置、起動、テスト
 tests/host/           テストホスト（ゲームなしでランタイムを動かす）
-third_party/          Dear ImGui 1.93.0、nlohmann/json 3.12.0（どちらも MIT）
+third_party/          Dear ImGui、nlohmann/json、XeGTAO
 docs/                 設計と手順
 ```
 
@@ -51,17 +57,16 @@ docs/                 設計と手順
 手順の詳細は [docs/development/build.md](docs/development/build.md)。
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-native.ps1          # AetherNative.dll, AetherHost.exe
-dotnet build src\Aether.MCP\Aether.MCP.csproj -c Release                              # MCP サーバー
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-hdrp-bundle.ps1     # HDRP の DX12 用バンドル（初回のみ、長い）
-dotnet build src\Aether.Managed\Aether.Managed.csproj -c Release                      # Aether.ksm（署名。kino\mods へ）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\deploy.ps1                # ゲームへ配置（ゲームを閉じて）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\launch-game.ps1           # Steam 経由で -force-d3d12 起動
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-native.ps1     # AetherNative.dll, AetherHost.exe
+dotnet build src\Aether.MCP\Aether.MCP.csproj -c Release                         # MCP サーバー
+dotnet build src\Aether.Managed\Aether.Managed.csproj -c Release -p:Loader=BepInEx "-p:GameDir=<ゲームのフォルダー>"   # C# の Mod
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\deploy.ps1           # ゲームへ配置（ゲームを閉じて）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\launch-game.ps1      # Steam 経由で -force-d3d12 起動
 ```
 
 - ゲームは **`-force-d3d12`** で起動します（Steam の起動オプション、または `scripts\launch-game.ps1`）。DX11 で起動した場合、Aether は何もせずその旨をログに出します。
-- **F10** でオーバーレイを開閉します（`kino\config\Aether\aether.json` の `overlayHotkey`）。
-- ログ・キャプチャ・ベンチマーク結果は `kino\mods\Aether\`（`logs\aether.jsonl`、`captures\`、`benchmarks\`）。
+- **F10** でオーバーレイを開閉します。
+- ログ・キャプチャ・ベンチマーク結果は `<ゲーム>\BepInEx\plugins\Aether\`（`logs\aether.jsonl`、`captures\`、`benchmarks\`）、設定は `<ゲーム>\BepInEx\config\Aether\aether.json`。
 
 ## AI 連携（MCP）
 
@@ -78,15 +83,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\launch-game.ps1     
 
 | 文書 | 内容 |
 |---|---|
-| [docs/development/build.md](docs/development/build.md) | 必要なもの、ビルド、配置、テスト |
-| [docs/architecture/overview.md](docs/architecture/overview.md) | 全体構成、スレッド、フェーズの計画と現状 |
-| [docs/architecture/dx12-integration.md](docs/architecture/dx12-integration.md) | Unity の D3D12 デバイスとの統合方式、PoC の結果、守っている規則 |
-| [docs/architecture/renderer.md](docs/architecture/renderer.md) | レンダラーの現状と Phase 2 の設計方針 |
-| [docs/architecture/gpu-resources.md](docs/architecture/gpu-resources.md) | GPU リソースの追跡と VRAM の内訳 |
+| [docs/development/build.md](docs/development/build.md) | 必要なもの、ビルド、配置、テスト、開発用の補助 |
+| [docs/architecture/overview.md](docs/architecture/overview.md) | 全体構成、スレッド、フレームの流れ |
+| [docs/architecture/dx12-integration.md](docs/architecture/dx12-integration.md) | Unity の D3D12 デバイスとの統合方式、守っている規則 |
+| [docs/architecture/hdrp-independence.md](docs/architecture/hdrp-independence.md) | ゲームのレンダーパイプラインの置き換え、レンダーモード |
+| [docs/architecture/renderer.md](docs/architecture/renderer.md) | レンダラーの骨組み（レンダーグラフ、パス、バインド、ライティング） |
+| [docs/architecture/rendering-features.md](docs/architecture/rendering-features.md) | 描画機能（空、雲、マテリアル、反射、間接光、煙、ポストプロセス）と設定 |
+| [docs/architecture/scene-capture.md](docs/architecture/scene-capture.md) | シーンの読み取り |
+| [docs/architecture/scene-data-contract.md](docs/architecture/scene-data-contract.md) | C# とネイティブの間のシーンデータの取り決め |
+| [docs/architecture/material-translation.md](docs/architecture/material-translation.md) | ゲームのマテリアルの読み替え |
+| [docs/architecture/gpu-resources.md](docs/architecture/gpu-resources.md) | GPU リソースの管理と VRAM の内訳 |
 | [docs/diagnostics/mcp-api.md](docs/diagnostics/mcp-api.md) | MCP ツールのリファレンス |
 | [docs/diagnostics/troubleshooting.md](docs/diagnostics/troubleshooting.md) | うまく動かないとき |
+| [AGENT.md](AGENT.md) | このリポジトリで作業するエージェントへの指示 |
 
 ## 第三者のソフトウェア
 
-Dear ImGui（MIT）、nlohmann/json（MIT）を `third_party/` に同梱しています。Unity Native Plugin API のヘッダー（Unity Companion License）はリポジトリに含めず、Unity エディターのものを参照します。
+Dear ImGui（MIT）、nlohmann/json（MIT）、Intel XeGTAO（MIT）を `third_party/` に同梱しています。Unity Native Plugin API のヘッダー（Unity Companion License）はリポジトリに含めず、Unity エディターのものを参照します。
 Aether は非公式の Mod であり、CarX Technologies、Unity Technologies が作成・支援・推奨しているものではありません。

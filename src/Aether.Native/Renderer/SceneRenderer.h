@@ -1,7 +1,7 @@
 // Aether's scene renderer: a clustered forward ("forward+") pipeline over the scene store's data.
 //   ShadowCascades -> DepthPrepass -> (light clustering on the CPU) -> Opaque -> Sky -> Transparent -> Composite
 // Everything is recorded into the one command list the caller hands in; the passes are declared in the render graph.
-// docs/architecture/forward-plus.md. Render thread only, except Stats().
+// docs/architecture/renderer.md. Render thread only, except Stats().
 #pragma once
 #include <atomic>
 #include <chrono>

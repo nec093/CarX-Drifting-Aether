@@ -1,4 +1,4 @@
-// Switches for controlled experiments on the integration with the host (docs/development/stability-investigation.md).
+// Switches for controlled experiments on the integration with the host (docs/architecture/dx12-integration.md).
 // Read once at start from <config dir>\dev-options.json; without that file everything is at its default and this
 // header changes nothing. Not settings: nothing here is shown in the overlay, saved, or reachable through MCP.
 #pragma once

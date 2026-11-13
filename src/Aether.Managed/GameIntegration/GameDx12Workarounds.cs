@@ -80,7 +80,7 @@ namespace Aether {
 		}
 
 		// ---- video playback on Direct3D 12
-		// docs/development/stability-investigation.md: the game's advertising SDK (Anzu) plays its video adverts with a
+		// docs/architecture/dx12-integration.md: the game's advertising SDK (Anzu) plays its video adverts with a
 		// Unity VideoPlayer. On DX12 (which neither the game nor Anzu's native renderer - D3D9 / D3D11 / OpenGL only -
 		// is made for), when the clip changes Unity uploads a video frame (A8_UNORM, 1080x608) to a plane texture that
 		// was replaced meanwhile: an invalid copy that the debug layer reports and that loses the device or crashes the

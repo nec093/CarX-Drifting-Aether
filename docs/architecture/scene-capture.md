@@ -1,57 +1,179 @@
-# Scene Capture
+# シーンキャプチャ
 
-`src/Aether.Managed/SceneCapture/SceneCapture.cs` turns the live Unity scene into Scene Data Contract calls.
-It runs only while `renderMode` is `aether` or `compare`; in `hdrp` it holds nothing.
+`src/Aether.Managed/SceneCapture/SceneCapture.cs` は、Unity のシーンを読み取り、Scene Data Contract（[scene-data-contract.md](scene-data-contract.md)）の呼び出しに変えてネイティブ側へ渡す。シーンの物は何も書き換えない。
 
-## What it does, and when
+関係するファイル：
 
-| When | What |
+| ファイル | 役割 |
 |---|---|
-| every 0.5 s, and at once after a scene load / unload | **Scan**: `FindObjectsByType<MeshRenderer>` (active only). New renderers are registered, changed ones (mesh or material list) re-sent, vanished ones destroyed. Meshes, materials and textures nothing references any more are destroyed. Lights are listed. HDRP's global `_SkyTexture` and `_ExposureTexture` are tracked. |
-| every 2 s | **Material check**: `Material.ComputeCRC()` of every tracked material; a changed one (the game recolours paint, switches lights) is translated again. |
-| every frame, at most 24 native-pointer queries | **Pending queue**: `GetNativeVertexBufferPtr / IndexBufferPtr / TexturePtr` for new meshes and textures. A mesh Unity has not uploaded yet is retried later. |
-| every frame | **Frame**: camera matrices, one `AeFrameInstance` (world matrix; visible = `enabled`, not `forceRenderingOff`, layer in the camera's culling mask, and `Renderer.isVisible`, i.e. Unity's own culling result incl. the LOD level it picked) per registered renderer, lights, ambient SH, fog, sky / exposure handles → `Aether_SceneSubmitFrame`, then plugin event 4. |
+| `SceneCapture.cs` | レンダラー、メッシュ、マテリアル、テクスチャー、ライト、LOD グループ、反射プローブ、レイトレース用の形状、フレーム |
+| `MaterialTranslator.cs` | マテリアルの変換（[material-translation.md](material-translation.md)） |
+| `ParticleCapture.cs` | パーティクルシステムとタイヤスモークの粒子 |
+| `SmokeSimulation.cs` | タイヤスモークの動き（描き方は [rendering-features.md](rendering-features.md)） |
+| `Contract.cs` | 契約の構造体のマネージド側の写し |
+| `RenderSurvey.cs`、`SceneReporter.cs` | 診断用の調査と公開 |
 
-The frame is submitted from `RenderPipelineManager.endContextRendering` for the camera set that holds the game's
-screen camera (`CameraType.Game`, no target texture, highest depth). Off-screen cameras (icons, previews) are ignored.
+キャプチャは描画モードが `aether`（`standalone`）か `compare` のときだけ動く。`hdrp` では止まり、何も持たない（[hdrp-independence.md](hdrp-independence.md)）。
 
-## Identity and change detection
+## 何を、いつ
 
-- Handles are Unity instance ids. A material seen through a `MaterialPropertyBlock` with `_BaseColor` becomes its own
-  native material (handle = hash of material id and renderer id) so per-renderer colours survive.
-- A texture is re-queried when its `updateCount`, size or loaded mip level changed (texture streaming, resized render
-  textures); the native side is only told when the `ID3D12Resource` really changed.
-- A mesh is identified by the `Mesh` object. A mesh edited in place is **not** detected (see limitations).
+すべてメインスレッド。走査とネイティブポインターの問い合わせは `Update` の中（`AetherCore.UpdateCapture` → `SceneCapture.Tick`）で行い、描画ループの中ではフレームの記述だけを行う。`Mesh.GetNative*BufferPtr` と `Texture.GetNativeTexturePtr` はメインスレッドを描画スレッドに待たせるので、描画ループの中では呼ばない。
 
-## Lifecycle
+| いつ | 何を |
+|---|---|
+| 0.5 秒ごと（レンダラーが 2000 を超えるシーンでは 2 秒ごと）。シーンの読み込み・破棄の直後にも | **走査**。4 段に分け、1 フレームに 1 段ずつ進める（下の表） |
+| 毎フレーム | **見直し**：既知のメッシュレンダラーのうち `max(32, 数 / 30 + 1)` 個を見直す（約 30 フレームで一巡） |
+| 2 秒ごと | **マテリアルの検査**：送ったマテリアルすべての `Material.ComputeCRC()` を比べ、変わったものを変換し直す |
+| 毎フレーム | **プロパティブロックの検査**：レンダラーごとの値を持つマテリアルについて、ゲームが実行中に変える値だけを比べる（「マテリアル」） |
+| 毎フレーム、最大 24 回分 | **保留の処理**：新しいメッシュとテクスチャーのネイティブポインターを問い合わせて登録する |
+| 毎フレーム | **動的メッシュ**、**レイトレース用の形状の読み戻し**、**スキンメッシュの姿勢の読み戻し** |
+| 描画ループの中、毎フレーム | **フレーム**：カメラ、ボリュームの値、パーティクル、インスタンスごとの行列とフラグ、ライト → `Aether_SceneSubmitFrame` |
 
-- **Scene loading**: `SceneManager.sceneLoaded / sceneUnloaded` bump `sceneId` and force a scan on the next frame.
-- **Dynamic objects**: found by the next scan (≤ 0.5 s late); their transforms are read every frame.
-- **Destroyed objects**: Unity's fake-null is checked before every use; the next scan destroys their handles.
-- **Mode switch to hdrp / shutdown**: `Stop()` clears the tables and calls `Aether_SceneClear`; one more scene event
-  lets the render thread retire every Unity reference.
-- **An exception** in the capture stops the capture (logged), never the game's render loop.
+走査の 4 段：
 
-## Cost
+| 段 | 内容 |
+|---|---|
+| 1 | `FindObjectsByType<MeshRenderer>`（有効なものだけ）。新しいレンダラーを登録する |
+| 2 | `FindObjectsByType<SkinnedMeshRenderer>`。新しいものを登録し、既知のものも見直す。見つからなくなったレンダラー（破棄、非アクティブ化）のインスタンスを消す。レンダラーの集合が変わったら LOD グループを読み直す |
+| 3 | どのレンダラーも使わなくなったメッシュとマテリアルを消す |
+| 4 | 使われなくなったテクスチャーを消す。GPU リソースが変わったテクスチャーを問い合わせ直す。反射プローブを読む。ライトを列挙する |
 
-Per frame the capture reads one `localToWorldMatrix` per renderer and copies into reused arrays: no per-frame
-allocation after warm-up. The scan allocates (two `FindObjectsByType` arrays, hash sets) twice a second.
-Measured numbers are in docs/development/phase2-report.md.
+## レンダラー
 
-## Diagnostics
+- 対象は `MeshRenderer`（`MeshFilter.sharedMesh`）と `SkinnedMeshRenderer`（`sharedMesh`）。
+- レンダラーの見直しでは、メッシュ、共有マテリアルの並び、各スロットのプロパティブロックの有無を前回と比べる。違えばインスタンスを送り直す（`Aether_SceneUpsertInstance`）。メッシュが無くなればインスタンスを消す。
+- インスタンスのフラグ：`shadowCastingMode` が Off でなければ影を落とす、`receiveShadows`、`gameObject.isStatic`。レイヤーと `renderingLayerMask` も送る。
+- 動かない物の状態（有効か、影の設定、レイヤー、行列）は見直しの時に読んだ値を毎フレーム使う。毎フレーム Unity に問い合わせるのは「動く物」だけ：スキンメッシュ、`Rigidbody`・`Animator`・`Animation` の下にある物、2 回の見直しの間に行列が変わった物。
 
-`get_status.managed.sceneCapture`, the KSL panel and the overlay show: renderers, meshes / textures (pending),
-materials, lights, skipped skinned renderers, unsupported meshes / textures.
-`get_material_info detail=survey` runs `RenderSurvey` (shaders, property layouts, vertex layouts, lights,
-HDRP globals) — the data the translation was designed from.
+## メッシュ
 
-## Limitations
+- 頂点バッファーとインデックスバッファーは Unity の `ID3D12Resource` をそのまま渡す（複製しない）。
+- ストリームは最大 4。頂点属性は位置、法線、接線、色、uv0、uv1 で、DXGI の形式に直接対応するもの（32 ビット浮動小数、16 ビット浮動小数、8 / 16 ビットの正規化整数）だけを送る。読めない属性は省き、シェーダーの既定値になる。位置が読めないメッシュは描かない（数えて記録する）。
+- 三角形リストでないサブメッシュは空の範囲になる。
+- ストリームが 5 以上、またはサブメッシュが無いメッシュは描かない。
+- ネイティブポインターがまだ無い（Unity が GPU に上げていない）メッシュとテクスチャーは保留のまま残す。失敗したものは 1 秒に 1 回だけ問い合わせ直す。20 回失敗するとログに 1 行出す。
 
-- `SkinnedMeshRenderer`, particle systems, trails, terrain, `Graphics.Draw*` / instanced indirect draws are not
-  captured.
-- All active `MeshRenderer`s of all loaded scenes are registered. Which of them a frame draws relies on
-  `Renderer.isVisible`, which Unity only updates while its own pipeline culls: Aether has no LOD selection or
-  occlusion culling of its own yet (needed before HDRP can be switched off).
-- A mesh whose buffers Unity replaces without replacing the `Mesh` object (dynamic meshes) keeps the old buffers
-  until its renderer changes.
-- New objects appear up to 0.5 s late; material edits up to 2 s late.
+### 動的メッシュ
+
+最初に見た時に頂点が 0（またはストリームが無い）のメッシュは、ゲームが実行中に作る物（タイヤ痕など）として扱う。毎フレーム頂点数とインデックスの総数を比べ、変わったら送り直す。空に戻ったら消す。
+
+### スキンメッシュ
+
+- Unity が GPU でスキニングした頂点バッファー（`SkinnedMeshRenderer.GetVertexBuffer`）をストリーム 0 として、そのレンダラー専用のメッシュを送る。ストリーム 0 は、メッシュ自身のストリーム 0 と同じストライドであるか、位置・法線・接線だけを持つ必要がある。合わないことが 40 回続くと「描けない」と数える（その後も試す）。
+- Unity はレンダラーごとに複数のバッファーへ交互にスキニングする。バッファーごとに別のメッシュハンドルを持ち（最大 4）、毎フレーム、カメラに見えているスキンメッシュのインスタンスをそのフレームのバッファーに向け直す。
+- ワールド行列はルートボーン（無ければレンダラー自身）の `localToWorldMatrix`。有効な `Cloth` を持つ場合は、その位置と回転だけ（スケールなし）。
+- 見えていない（Unity がスキニングしていない）スキンメッシュは登録されないが、不足とは数えない。
+
+## マテリアル
+
+- 変換は `MaterialTranslator.Translate`。結果の `AeMaterialDesc` のバイト列のハッシュを覚え、前回と違うときだけ送る。
+- レンダラーのスロットがプロパティブロックを持つと、そのスロットのマテリアルは専用のネイティブマテリアルになる。ハンドルはマテリアルの id、レンダラーの id、スロット番号のハッシュ。スロットのブロックがレンダラー全体のブロックより優先される（Unity と同じ）。
+- 専用マテリアルは、レンダラーの見直しのたびに変換し直す（違うときだけ送る）。さらに毎フレーム、ブロックの `_BaseColor`、`_SecondaryColor`、`_EmissionIntensity`、`_Roughness`、`_Metalness`、`_Clearcoat`、`_BaseMap` だけを比べ、変われば変換し直す。
+- 共有マテリアルがその場で書き換えられた場合は、2 秒ごとの `ComputeCRC()` で見つける。
+
+## テクスチャー
+
+- 追跡するテクスチャーは、送ったマテリアルの記述が名前を挙げるもの、空のキューブマップ、パーティクルが使うもの、反射プローブのキューブマップ。それ以外は消す。
+- `updateCount`、大きさ、読み込まれたミップ（テクスチャーストリーミング）が変わったら問い合わせ直す。ネイティブ側に伝えるのは `ID3D12Resource` が実際に変わったときだけ。
+- 次元は 2D、キューブ、キューブ配列、2D 配列、3D。それ以外は使わない（数えて記録する）。
+
+## LOD グループ
+
+Unity の `Renderer.isVisible` は、カメラが見ている物について LOD の段を選んだ結果を含む。画面外の影キャスターには使えないので、そのための段は Aether が Unity と同じ規則で選ぶ：グループの画面上の高さ（`LODGroup.size` × 最大スケール ÷ 距離と視野角、× `QualitySettings.lodBias`）を各段の `screenRelativeTransitionHeight` と比べる。`Rigidbody` の下に無いグループの位置と大きさは走査の時に読み、それ以外は毎フレーム読む。
+
+## ライト
+
+- 平行光源、点光源、スポットライト。エリアライトは送らない。強さが 0 以下のものも送らない。
+- `HDAdditionalLightData` が無効なライトは消えているものとして扱う（`Light.enabled` に関係なく）。`lightDimmer` を掛け、点光源とスポットライトは `fadeDistance` の最後の 2 割でカメラからの距離に応じて弱める。
+- 色は線形の色 × 強さ（平行光源は lux、他は candela）。色温度を使うライトはその色を掛ける。
+- 名前に `headlight`、`head_light`、`frontlight` を含むスポットライトはヘッドライト（`kAeLightHeadlamp`）。
+- ゲームのパイプラインアセットがライトレイヤーを使う場合、ライトのレイヤーは `Light.renderingLayerMask` の下位 8 ビット。使わない場合はすべてのビット。
+
+## 反射プローブ
+
+有効な `ReflectionProbe` ごとに、キューブマップ（`HDAdditionalReflectionData.texture`、無ければ `ReflectionProbe.texture`）と影響範囲（箱か球、ブレンド距離、強さ = `multiplier × weight`、無限投影でなければ箱投影）を読む。キューブマップの無いプローブは除く。内容が変わったときだけ、一覧ごと `Aether_SceneSetProbes` で送る。
+
+## レイトレース用の形状
+
+ゲームのメッシュは CPU から読めない（読み取り可能になっていない）ので、GPU から非同期に読み戻す（`AsyncGPUReadback`。メインスレッドは止まらない）。ネイティブ側が受け取った形状から BVH を作る。
+
+- 対象は、登録できた通常のメッシュ。1 メッシュにつき 1 回。同時に読み戻すのは最大 8 件。
+- 読むもの：位置のあるストリーム、インデックスバッファー、uv0。uv0 が位置と別のストリームにあれば、そのストリームも読む（`Aether_SceneMeshUvs`）。
+- 動的メッシュは送らない。
+- キャプチャを止めると世代が変わり、それより前に頼んだ読み戻しの結果は捨てる。
+
+### スキンメッシュの姿勢（`skinnedRayUpdates`）
+
+- `rayTracedReflections` がオンのとき、毎フレーム `skinnedRayUpdates` 個（0〜4、既定 0）のスキンメッシュの頂点を順番に読み戻す。設定は 1 秒に 1 回読む。
+- 対象は、登録済みでカメラに見えているスキンメッシュ。最初の読み戻しの前に `Aether_SceneMeshChanging` を呼び、レンダラーのすべてのバッファーのハンドルを 1 つの木に `Aether_SceneMeshAlias` で結びつける。インデックスは 1 回だけ、頂点は読むたびに送る（2 回目以降は木の作り直しでなく当てはめ直し）。
+- 位置は、スキニングされたバッファーの先頭の 3 つの浮動小数として読む。バッファーのストライドがメッシュのストリーム 0 と同じなら、メッシュの位置属性の場所と形式を使う。uv は送らない。
+- レンダラーが無くなると `Aether_SceneMeshForget` で木を消す。
+- 既定の 0 では、スキンメッシュはレイトレースの形状に入らない。
+
+## パーティクル
+
+`ParticleCapture.Submit` が毎フレーム、フレームの前に `Aether_SceneSubmitParticles` を呼ぶ（粒子が無くても 0 個で呼ぶ）。
+
+- 最初にタイヤスモーク。ゲームのタイヤスモークは DX12 のカーネルが無いコンピュートシェーダーで動くので、Aether がゲームのエミッターから発生のデータ（場所、数、色）を受け取り、動きは自前で計算する（`SmokeSimulation`、ネイティブの `Aether_SmokeStep`）。型が見つからないなどで失敗すると、そのセッションではスモークを止める。
+- 次にパーティクルシステム。`ParticleSystemRenderer` を 1 秒ごとに探し、毎フレーム、有効でカメラのカリングマスクに入るものの生きている粒子を `ParticleSystem.GetParticles` で読む。
+  - テクスチャーは `_MainTex`、`_BaseColorMap`、`_BaseMap` の順に探す。色は `_TintColor` × 2、`_BaseColor`、`_Color` の順。
+  - シェーダー名に `Additive` を含むものは加算、それ以外は光を受ける（`kAeParticleLit`）。
+  - シミュレーション空間がローカルかカスタムなら、その変換でワールドに移す。大きさはその空間の `lossyScale.x` を掛ける。
+  - 引き伸ばしビルボードは、速度と `lengthScale`・`velocityScale` から引き伸ばしのベクトルを作る。
+  - テクスチャーシートアニメーションは、寿命に沿って上の行から順に進むものとして範囲を選ぶ。
+- 1 フレームの上限は 24 000 個。テクスチャーがまだ登録されていないシステムは、テクスチャーなしの丸い煙として描かれ、テクスチャーは保留に入る。
+
+## フレーム
+
+描画ループの中で、画面のカメラについて 1 回だけ記述する。画面のカメラは、`CameraType.Game`、出力先テクスチャーなし、有効、の中で `depth` が最大のもの（`AetherCore.PickScreenCamera`）。他のカメラ（プレビュー、アイコン）は無視する。`aether` では Aether のパイプラインが、`compare` では `RenderPipelineManager.endContextRendering` が呼ぶ。
+
+- カメラ：`worldToCameraMatrix`、`GL.GetGPUProjectionMatrix(nonJitteredProjectionMatrix, false)`、位置、向き、ニア・ファー、画素数。
+- ボリュームとフレームセッティングの値（0.5 秒ごと）：トーンマップ、ポスト露出、フォグ、露出、影、AO、シャドウ・ミッドトーン・ハイライト、ブルーム、モーションブラー、SSR、空。ゲームのボリュームを Unity の `VolumeManager` でカメラの位置について評価し、カメラのフレームセッティング（`HostFrameSettings`）でオフの機能は 0 にする。同じ時に `HostQualitySettings.Apply` も呼ぶ（[hdrp-independence.md](hdrp-independence.md)）。
+- 空：ボリュームの空が HDRI なら、そのキューブマップ、強さ（`skyIntensityMode` に従う）、回転。
+- 環境光：`RenderSettings.ambientProbe` を Unity のシェーダーと同じ 7 つのベクトルにしたもの。
+- インスタンス：登録済みのレンダラーごとに 1 つ。行列（スキンメッシュは上の行列）とフラグ：
+  - 有効で、レイヤーがカメラのカリングマスクに入り、`Renderer.isVisible`（Unity のカリングの結果）が真 → このフレームにある。`ShadowsOnly` なら影だけ。
+  - そうでなくても、有効で、（影を落とし、レイヤーが太陽の `cullingMask` に入る）か（カメラが映すレイヤーで `ShadowsOnly` でない）物は、LOD グループの今の段に含まれれば送る。カメラが映すレイヤーで影専用でない物は反射に使われ、それ以外は影だけ。画面外の影キャスターとして数える。
+  - どちらでもない物はフラグ 0。
+  - 視界、影のカスケード、反射に対するカリングはネイティブ側が行う。
+- ライト：上の「ライト」のとおり。
+
+## 識別と変更の検出
+
+- ハンドルは Unity のインスタンス id。例外は、プロパティブロックを持つスロットのマテリアル（上記）、スキンメッシュのバッファーごとのメッシュ、スキンメッシュの木のハンドル。これらは id を組み合わせたハッシュ。
+- メッシュは `Mesh` オブジェクトで識別する。通常のメッシュをその場で書き換えても検出しない。
+
+## ライフサイクル
+
+- **開始**：描画モードが `hdrp` でなくなった時に `Start()`。
+- **シーンの読み込み・破棄**：`SceneManager.sceneLoaded / sceneUnloaded` で `sceneId` を進め、次の走査をすぐに始める。表は消さない。消えた物は次の走査で消える。
+- **動く物**：次の走査で見つかる。行列は毎フレーム読む。
+- **破棄された物**：使う前に毎回 Unity の null を確かめる。ハンドルは次の走査で消す。
+- **`hdrp` への切り替え、終了**：`Stop()` が表を空にして `Aether_SceneClear` を呼ぶ。次の 1 回の scene イベントで、ネイティブ側が Unity の参照をすべて手放す。
+- **例外**：キャプチャ中の例外はログに残し、キャプチャを止める（ゲームの描画ループは止めない）。そのセッションでは再開しない。
+
+## コスト
+
+- 走査は 4 段に分けて 1 フレームに 1 段。大きなシーンでは間隔を 4 倍にする。
+- 既知のレンダラーの見直しは 1 フレームに一部ずつ。
+- 動かない物は、フレームごとに Unity に問い合わせない。
+- フレームの記述は使い回しの配列に書く。走査は集合を作るので割り当てがある。
+- メインスレッドの時間（走査、毎フレームの更新、フレームの記述、パイプライン）を測り、診断に出す。
+
+## 診断
+
+- `get_status` の `managed.sceneCapture` と、ローダーの状態表示（`AetherCore.DrawStatus`）に `SceneCapture.Status()` が出る：レンダラー、メッシュ（保留）、マテリアル、テクスチャー（保留）、ライト、LOD グループ、画面外の影キャスター、スキンメッシュのバッファー数、動的メッシュ、レイトレース用の形状（読んだスキンメッシュの姿勢、送った数、待ち、読み戻し中、失敗）、描けないスキンメッシュと描けないメッシュ・テクスチャー、パーティクル（うちタイヤスモーク、パーティクルシステム数）、メインスレッドの時間。
+- `get_material_info detail=survey` は `RenderSurvey` を実行する（シェーダー、プロパティの配置、頂点レイアウト、スキンメッシュ、ライト、ボリュームなど）。重い。
+- ログ：描けないメッシュ・テクスチャー、GPU に上がらないままの物、ゲームの空、反射プローブ、カメラのフレームセッティング、スポットライトの判定。
+- 実験用のスイッチ `captureFlags`（`Core/DevOptions.h`、`dev-options.json`）。通常は 0。
+
+## 制限
+
+- 取り込むのは `MeshRenderer`、`SkinnedMeshRenderer`、`ParticleSystemRenderer` だけ。テレイン、`TrailRenderer`・`LineRenderer`、`Graphics.Draw*` やインスタンシングの間接描画は取り込まない。
+- メッシュパーティクルはビルボードとして描く。パーティクルのトレイルは描かない。
+- エリアライトは送らない。
+- 新しい物は最大で走査 1 周分（0.5 秒、大きなシーンでは 2 秒）遅れて現れる。共有マテリアルの書き換えは最大 2 秒遅れる。
+- 通常のメッシュをその場で書き換えても反映しない。動的メッシュは頂点数とインデックス数が変わったときだけ送り直す。
+- 描くのは画面のカメラだけ。
+- スキンメッシュと動的メッシュは、既定ではレイトレースの形状に入らない（スキンメッシュは `skinnedRayUpdates` が 1 以上のとき）。スキンメッシュの形状には uv が無い。
+- ヘッドライトの判定はライトの名前による。
